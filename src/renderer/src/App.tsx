@@ -78,6 +78,32 @@ type SkeletonList = NonNullable<Parameters<typeof convertToExcalidrawElements>[0
 type SceneElementList = ReturnType<Api['getSceneElementsIncludingDeleted']>
 type SceneEl = SceneElementList[number]
 
+const BANNER_HEIGHT = 190 // 确认横幅大约占画布顶部这么高（屏幕像素）
+
+// 把视野移到一批元素上，不改缩放。belowBanner 为 true 时把内容往下让一让，别被顶部的横幅挡住。
+function showElements(api: Api, elements: readonly SceneEl[], belowBanner: boolean): void {
+  if (!elements.length) return
+  if (!belowBanner) {
+    api.scrollToContent(elements, { fitToContent: false, animate: true })
+    return
+  }
+  // 自己算滚动位置：把内容放在横幅下面那块区域的正中间；内容比那块区域还高时，顶部对齐到横幅下沿
+  const minX = Math.min(...elements.map((el) => Math.min(el.x, el.x + el.width)))
+  const maxX = Math.max(...elements.map((el) => Math.max(el.x, el.x + el.width)))
+  const minY = Math.min(...elements.map((el) => Math.min(el.y, el.y + el.height)))
+  const maxY = Math.max(...elements.map((el) => Math.max(el.y, el.y + el.height)))
+  const s = api.getAppState()
+  const zoom = s.zoom.value
+  const room = s.height - BANNER_HEIGHT
+  const top = (maxY - minY) * zoom > room - 40 ? BANNER_HEIGHT + 20 : BANNER_HEIGHT + (room - (maxY - minY) * zoom) / 2
+  api.updateScene({
+    appState: {
+      scrollX: s.width / 2 / zoom - (minX + maxX) / 2,
+      scrollY: top / zoom - minY
+    }
+  })
+}
+
 // agent 画的东西一律用蓝色，和用户画的区分开。还没确认的提议再加上虚线和半透明。
 const AGENT_COLOR = '#1971c2'
 const PROPOSAL_OPACITY = 55
@@ -157,8 +183,7 @@ async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): P
     elements: [...current.map(withArrows), ...fresh.map(withArrows)],
     captureUpdate: CaptureUpdateAction.IMMEDIATELY // 用户可以用撤销去掉 agent 画的这一批
   })
-  // 把视野移到新画的内容上，不改缩放
-  api.scrollToContent(fresh, { fitToContent: false, animate: true })
+  showElements(api, fresh, Boolean(proposalId))
   return { sceneJson: (await snapshot(api, false)).sceneJson }
 }
 
@@ -307,7 +332,30 @@ export default function App() {
     lastSavedVersion.current = elementsVersion(current.getSceneElements())
   }, [])
 
+  // 请求按先来后到一个一个处理，横幅上写明后面还排着几个
   const request = hub.pending[0] ?? null
+  const queued = Math.max(0, hub.pending.length - 1)
+
+  // 轮到一个提议时，把视野移到它上面：画布上可能同时有好几个提议，要让用户知道现在问的是哪一个
+  const requestId = request?.id ?? null
+  const proposalId = request?.kind === 'proposal' ? request.proposalId : null
+  useEffect(() => {
+    if (!api || !proposalId) return
+    // 应用刚启动时画板可能还没载入完，等提议的元素出现了再移
+    let tries = 0
+    const timer = setInterval(() => {
+      const mine = api.getSceneElements().filter((el) => el.customData?.sketchlink?.proposal === proposalId)
+      if (!mine.length && ++tries < 20) return
+      clearInterval(timer)
+      showElements(api, mine, true)
+    }, 250)
+    return () => clearInterval(timer)
+  }, [api, requestId, proposalId])
+
+  // 端到端测试要直接操作画布（模拟用户拖动、改字），只在隔离的测试实例上开放
+  useEffect(() => {
+    if (api && window.sketchlink.testMode) (window as unknown as { __sketchlinkApi?: Api }).__sketchlinkApi = api
+  }, [api])
 
   return (
     <>
@@ -336,6 +384,7 @@ export default function App() {
           key={request.id}
           title="agent 画了它的理解（蓝色虚线部分），可以直接在上面改："
           prompt={request.prompt}
+          queued={queued}
           onSend={(note) => decide(request.id, request.proposalId!, true, note)}
           sendLabel="对，就这样"
           onCancel={(note) => decide(request.id, request.proposalId!, false, note)}
@@ -346,6 +395,7 @@ export default function App() {
           key={request.id}
           title="agent 请你画："
           prompt={request.prompt}
+          queued={queued}
           onSend={(note) => submit(request.id, note)}
           onCancel={() => void window.sketchlink.cancel(request.id)}
           cancelLabel="不画了"
@@ -368,6 +418,7 @@ export default function App() {
 function Banner(props: {
   title: string
   prompt: string
+  queued?: number // 这个请求后面还排着几个
   onSend: (note: string) => Promise<void>
   sendLabel?: string
   onCancel: (note: string) => void | Promise<void>
@@ -391,6 +442,7 @@ function Banner(props: {
     <div className="sl-banner" role="dialog" aria-label={props.title}>
       <div className="sl-banner-title">{props.title}</div>
       <div className="sl-banner-prompt">{props.prompt}</div>
+      {props.queued ? <div className="sl-banner-queued">处理完这个，后面还有 {props.queued} 个请求</div> : null}
       <input
         className="sl-banner-note"
         placeholder="想补充一句话吗？（可不填）"

@@ -25,5 +25,8 @@ contextBridge.exposeInMainWorld('sketchlink', {
     ipcRenderer.on('rpc', (_e, msg) => fn(msg))
   },
   rpcReply: (id: number, result: unknown, error?: string) => ipcRenderer.send('rpc:reply', { id, result, error }),
-  ready: () => ipcRenderer.send('renderer:ready')
+  ready: () => ipcRenderer.send('renderer:ready'),
+
+  // 隔离的测试实例上为 true，页面据此把画布接口挂到 window 上供端到端测试用
+  testMode: Boolean(process.env['SKETCHLINK_HOME'] && process.env['SKETCHLINK_DEBUG_PORT'])
 })

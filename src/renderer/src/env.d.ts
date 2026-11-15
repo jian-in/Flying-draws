@@ -24,6 +24,7 @@ declare global {
       onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => void
       rpcReply: (id: number, result: unknown, error?: string) => void
       ready: () => void
+      testMode: boolean
     }
     EXCALIDRAW_ASSET_PATH?: string
   }

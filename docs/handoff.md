@@ -16,7 +16,7 @@ Sketchlink（暂定名）：本地桌面画布（Electron + Excalidraw），通�
 | M2-a 写入通路 | ✅ `canvas_draw` 纯新增（节点、连线、文字），单元测试和隔离画板上的端到端测试通过；还没在真实 agent 会话里用过 | 见 git log |
 | M2-b 自动排版 | ✅ 新节点用 dagre 排版，可选从左到右或从上到下；箭头按图形轮廓起止，跨层连线会绕开节点。测试情况同上 | 见 git log |
 | M2-c 提议层 | ✅ `canvas_propose`：agent 画的提议是蓝色虚线半透明，用户点接受或拒绝，结果经 `canvas_wait` 回到 agent。测试情况同上，端到端测试里用 DevTools 扮演用户点了按钮 | 见 git log |
-| M2-d diff 和并发 | 未开始 | — |
+| M2-d diff 和并发 | 做了一半：用户改了提议的 diff ✅、待处理请求重启后恢复 ✅；按元素判断冲突、修改和删除类指令还没做 | 见 git log |
 
 - 远程：GitHub 仓库 `jian-in/Freedom-draw`，本地 `master` 跟踪 `origin/master`。
 - 项目名还是暂定，发布前要查 GitHub / npm 重名。
@@ -55,6 +55,7 @@ npm run e2e:draw     # 自己拉起一个隔离实例，画板在 out/e2e-home�
 src/main/index.ts      主进程入口：窗口、画板读写和版本号、给页面的 RPC、本地服务的路由
 src/main/semantic.ts   语义层（纯函数，不依赖 Electron）：buildGraph() 出结构，summarize() 出中文描述
 src/main/ops.ts        绘图指令 → 绘图计划（纯函数）：校验 ops、解析节点引用、定好每个新元素的 id、位置和大小
+src/main/diff.ts       提议的底稿和改动对比（纯函数）：用户在提议上改了什么
 src/main/daemon.ts     本地 HTTP 服务：127.0.0.1 随机端口 + token，信息写 ~/.sketchlink/daemon.json
 src/main/requests.ts   请求队列：agent 请求作画、用户发送/取消、长轮询等待、主动发送的收件箱
 src/preload/index.ts   页面能调用的全部接口
@@ -69,6 +70,12 @@ scripts/e2e.mjs        端到端测试
 写的数据流（`canvas_draw`）：主进程先取快照定版本号 → `planOps()` 出绘图计划 → 页面的 `applyPlan()` 用 Excalidraw 的 `convertToExcalidrawElements` 生成元素、打上作者标记、绑定箭头，再 `updateScene` → 主进程存盘升版本号。所有写入在主进程里排队，一次一批。
 
 提议的数据流（`canvas_propose`）：和 `canvas_draw` 走同一个 `drawOps()`，只是元素打上 `layer: 'proposal'` 和提议编号，画成功后在请求队列里建一个 `kind: 'proposal'` 的请求。用户点按钮时，页面的 `resolveProposal()` 把这批元素改成正式内容或删掉，再走原有的"发送"通路，多带一个 `decision`。
+
+用户改了什么（`src/main/diff.ts`，纯函数）：提议画上去时 `captureBaseline()` 记一份底稿，存在请求上；用户接受时 `diffProposal()` 拿当时的画布和底稿比，输出几句中文（改了文字、挪了位置、删了什么、自己加了什么），放在 `canvas_wait` 结果的 `changes` 里。挪动不到 24px、大小变化不到 25% 的不报。
+
+待处理的请求会存盘：每次请求有增减就同步写 `~/.sketchlink/pending.json`（连同提议的底稿），应用启动时读回来，编号不变，所以 agent 手里的 `request_id` 重启后还能用，确认横幅也会重新出现。提议对应的元素要是已经不在画板上了，这个提议就不恢复。
+
+多个请求同时等着时按先来后到一个一个问，横幅上写着后面还有几个；轮到一个提议时视野会移到它上面，并让开顶部的横幅。
 
 外观约定：agent 画的东西一律蓝色（`#1971c2`）；还没确认的提议再加虚线和 55% 透明度；接受后变实线、不透明，仍是蓝色。用户在提议上改过的地方（拖动、改字、删掉一部分）接受时原样保留。
 
@@ -120,16 +127,16 @@ scripts/e2e.mjs        端到端测试
 - 只有三种新增指令。`move`、`update`、`delete` 这些要改动已有元素，得先有 M2-d 的冲突判断，而且 agent 只能动自己画的（design.md 12.4）。
 - 冲突判断比 design.md 12.3 粗：只要引用了已有节点，`base_version` 就必须等于当前版本，不管那些节点有没有被动过。原因是 N1 这类编号按阅读顺序生成，画板一变就可能指向别的节点。要放宽得先给节点一个跨版本稳定的编号。
 - 用户正在画一笔时，页面最多等 8 秒，超时就报错让 agent 重试；还没有 12.4 节说的"agent 有内容要画"提示。
-- **提议没处理完就重启应用**：请求队列只在内存里，重启后横幅没了，但蓝色虚线的元素还留在画布上，没有按钮可以接受或拒绝（用户可以手动删）。要解决得把待处理的提议存盘，或者启动时把残留的提议层元素清掉。
-- 用户接受提议时，agent 只知道"接受了"和接受后的整张画，不知道用户具体改了哪几处。这就是 M2-d 要做的 diff。
-- 同时有多个待处理的请求时，横幅只显示最早的那个。
+- 改动对比只在接受时做。拒绝时提议已经删掉，agent 只拿到附言。
+- 改动对比按"提议画上去之后"算：两个提议同时挂着时，用户这期间自己加的东西会在两个提议的结果里都出现一次。
+- 端到端测试里"用户改提议"是直接改画布数据模拟的，不是真的鼠标拖动。真拖动时连着的箭头会跟着走，模拟的不会（截图 `propose-edited.png` 里那条箭头悬空就是这个原因）。
 - agent 画的一批可以用撤销去掉（`CaptureUpdateAction.IMMEDIATELY`），这一点只看了接口说明，没有实际按过撤销验证。
 
 **M2 后面几步**（设计见 design.md 第 4.3、7、12 节）
-- M2-d：用户修改提议后的 diff，按元素判断冲突
+- M2-d 剩下的：按元素判断冲突（现在是整张画板的版本必须一致），以及 `move` / `update` / `delete` 这类改动已有元素的指令
 
 **其他待定**
-- 请求队列只在内存里，应用重启后进行中的请求会丢（agent 会收到 unknown_request，提示它重新请求）
+- 用户主动"发给 agent"但还没被 agent 取走的画（收件箱）只在内存里，应用重启后会丢。等待中的请求已经会存盘了
 - 桥接靠 `require('electron')` 找可执行文件，Electron 现在是 devDependency；做成可分发的 npm 包时要重新设计启动方式
 - 只有一块画板 `default`，多画板还没做
 - 摘要只有中文

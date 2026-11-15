@@ -226,12 +226,14 @@ server.registerTool(
       case 'submitted': {
         const note = res.note ? `The user's note: "${res.note}"` : 'The user added no note.'
         if (res.decision === 'accepted') {
-          return {
-            content: boardContent(
-              res,
-              `The user ACCEPTED your proposal. It is now part of the canvas; they may have adjusted it first, so read the canvas below rather than assuming it matches what you drew. ${note}`
-            )
-          }
+          const changes = Array.isArray(res.changes) ? (res.changes as string[]) : null
+          const edits =
+            changes === null
+              ? 'They may have adjusted it first, so read the canvas below rather than assuming it matches what you drew.'
+              : changes.length === 0
+                ? 'They accepted it exactly as you drew it.'
+                : `Before accepting, the user changed it. Treat these edits as corrections to your understanding:\n${changes.map((c) => `- ${c}`).join('\n')}\n`
+          return { content: boardContent(res, `The user ACCEPTED your proposal. It is now part of the canvas. ${edits} ${note}`) }
         }
         if (res.decision === 'rejected') {
           return { content: boardContent(res, `The user REJECTED your proposal and it was removed from the canvas. ${note}`) }
@@ -315,7 +317,8 @@ server.registerTool(
       'Draw your understanding or plan on the canvas as a proposal (shown in dashed blue) and ask the user to confirm it. ' +
       'Use this instead of canvas_draw when you are not sure you understood the user: they can accept it, reject it, or fix it directly on the canvas and then accept. ' +
       'Takes the same ops as canvas_draw. Returns a request_id immediately; then call canvas_wait with that request_id to get the answer. ' +
-      'If accepted, the proposal becomes part of the canvas (including any changes the user made to it). If rejected, it is removed.',
+      'If accepted, the proposal becomes part of the canvas and you are told exactly what the user changed in it first. If rejected, it is removed. ' +
+      'The request survives a restart of the canvas app, so keep using the same request_id.',
     inputSchema: {
       ops: z.array(opSchema).min(1).describe('What to draw as the proposal, applied together as one batch.'),
       question: z.string().min(1).describe('What you want the user to confirm, in the user\'s language, e.g. "Is this the flow you meant?". Shown on the canvas.'),

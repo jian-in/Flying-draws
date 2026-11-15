@@ -1,12 +1,13 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { buildGraph, summarize, type SceneElement } from './semantic'
 import { OpsError, planOps, type DrawOp, type DrawPlan } from './ops'
-import { RequestHub, type Submission, type WaitResult } from './requests'
+import { RequestHub, type DrawRequest, type Submission, type WaitResult } from './requests'
+import { captureBaseline, diffProposal, type DiffElement, type ProposalBaseline } from './diff'
 import { startDaemon } from './daemon'
 
 // M1：仍然只有一块画板，叫 default
@@ -23,6 +24,7 @@ const BOARD_ID = 'default'
 const boardPath = join(BOARDS_DIR, `${BOARD_ID}.excalidraw`)
 const legacyM0Path = join(BOARDS_DIR, 'm0.excalidraw')
 const daemonInfoPath = join(HOME, 'daemon.json')
+const pendingPath = join(HOME, 'pending.json')
 
 const WAIT_MAX_S = 45
 const WAIT_DEFAULT_S = 40
@@ -153,7 +155,50 @@ function createWindow(): void {
 function pushHubState(): void {
   if (win && !win.isDestroyed()) win.webContents.send('hub:state', hub.state())
 }
-hub.onChange(pushHubState)
+
+// ---------- 还在等用户回应的请求：存盘，重启后恢复 ----------
+// 不存的话，应用重启后横幅没了，提议层上的元素却还留在画布上，没有按钮可以确认。
+
+let lastPendingKey = ''
+
+function persistPending(): void {
+  const waiting = hub.waiting()
+  const key = waiting.map((r) => r.id).join(',')
+  if (key === lastPendingKey) return // 只是有 agent 开始或结束等待，请求本身没变
+  lastPendingKey = key
+  try {
+    mkdirSync(HOME, { recursive: true })
+    // 请求不多、文件很小，同步写，保证应用被强杀前已经落盘
+    writeFileSync(pendingPath, JSON.stringify({ board: BOARD_ID, requests: waiting }), 'utf8')
+  } catch (err) {
+    console.error('[sketchlink] could not save pending requests:', err)
+  }
+}
+
+function restorePending(): void {
+  let saved: DrawRequest[] = []
+  try {
+    saved = JSON.parse(readFileSync(pendingPath, 'utf8')).requests ?? []
+  } catch {
+    return // 没有存过，或者文件坏了：当作没有待处理的请求
+  }
+  // 提议对应的元素要是已经不在画板上了（比如用户手动删光了），这个提议就不用再问
+  let proposalsOnBoard = new Set<string>()
+  try {
+    const elements = (JSON.parse(readFileSync(boardPath, 'utf8')).elements ?? []) as DiffElement[]
+    proposalsOnBoard = new Set(
+      elements.filter((el) => !el.isDeleted && el.customData?.sketchlink?.layer === 'proposal').map((el) => String(el.customData?.sketchlink?.proposal))
+    )
+  } catch {}
+  const usable = saved.filter((r) => r && typeof r.id === 'string' && (r.kind !== 'proposal' || (r.proposalId && proposalsOnBoard.has(r.proposalId))))
+  lastPendingKey = usable.map((r) => r.id).join(',')
+  hub.restore(usable)
+}
+
+hub.onChange(() => {
+  pushHubState()
+  persistPending()
+})
 
 // ---------- 给 agent 的响应 ----------
 
@@ -204,7 +249,7 @@ const newElementId = (): string => `sl_${randomBytes(8).toString('hex')}`
 async function drawOps(
   body: Record<string, unknown>,
   proposalId: string | null
-): Promise<{ ok: boolean; result: Record<string, unknown> }> {
+): Promise<{ ok: boolean; result: Record<string, unknown>; sceneJson?: string }> {
   // 先拿页面上的最新状态，版本号以它为准（用户刚画的几笔可能还没落盘）
   const snap = await takeSnapshot(false)
   const ver = await acceptScene(snap.sceneJson)
@@ -234,6 +279,7 @@ async function drawOps(
   }
   return {
     ok: true,
+    sceneJson: applied.sceneJson,
     result: {
       added: { nodes: plan.nodes.length, edges: plan.edges.length, texts: plan.texts.length },
       node_ids: nodeIds,
@@ -281,7 +327,9 @@ const routes = {
       const res = await drawOps(body, proposalId)
       if (!res.ok) return res.result
       // 画成功了才弹横幅，不然用户会看到一个没有内容的确认请求
-      const req = hub.create(question, proposalId)
+      // 记下提议刚画上去的样子，用户表态时拿来比出改了哪里
+      const baseline = captureBaseline((JSON.parse(res.sceneJson ?? '{}').elements ?? []) as DiffElement[], proposalId)
+      const req = hub.create(question, proposalId, baseline)
       bringToFront()
       return { status: 'proposed', request_id: req.id, ...res.result }
     }),
@@ -304,6 +352,7 @@ const routes = {
       status: 'submitted',
       request_id: sub.requestId,
       decision: sub.decision ?? null,
+      changes: sub.changes ?? null,
       note: sub.note,
       submitted_at: sub.at,
       ...describe(sub.sceneJson, sub.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, sub.pngBase64)
@@ -324,9 +373,17 @@ ipcMain.handle('hub:state', () => hub.state())
 type SubmitPayload = { requestId: string | null; note: string; sceneJson: string; pngBase64: string | null; decision?: 'accepted' | 'rejected' | null }
 ipcMain.handle('hub:submit', async (_e, payload: SubmitPayload) => {
   const ver = await acceptScene(payload.sceneJson)
+  const decision = payload.decision === 'accepted' || payload.decision === 'rejected' ? payload.decision : null
+  // 回应提议时，比出用户在提议上改了什么。拒绝时提议已经被删掉，只看用户自己加了什么没有意义，不比。
+  const req = payload.requestId ? hub.get(payload.requestId) : undefined
+  let changes: string[] | null = null
+  if (decision === 'accepted' && req?.kind === 'proposal' && req.baseline) {
+    changes = diffProposal(req.baseline as ProposalBaseline, (JSON.parse(payload.sceneJson).elements ?? []) as DiffElement[])
+  }
   const sub: Submission = {
     requestId: payload.requestId,
-    decision: payload.decision === 'accepted' || payload.decision === 'rejected' ? payload.decision : null,
+    decision,
+    changes,
     note: String(payload.note ?? '').trim(),
     sceneJson: payload.sceneJson,
     pngBase64: payload.pngBase64,
@@ -349,6 +406,7 @@ if (!app.requestSingleInstanceLock()) {
   let closeDaemon: (() => Promise<void>) | null = null
 
   app.whenReady().then(async () => {
+    restorePending()
     createWindow()
     const { close } = await startDaemon(daemonInfoPath, routes)
     closeDaemon = close

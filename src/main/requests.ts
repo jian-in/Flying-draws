@@ -9,6 +9,7 @@ export interface Submission {
   version: number
   at: string
   decision?: 'accepted' | 'rejected' | null // 只有回应提议时才有
+  changes?: string[] | null // 回应提议时：用户在提议上改了什么（中文句子）
 }
 
 export type RequestKind = 'draw' | 'proposal' // draw：请用户画；proposal：agent 画了提议，请用户确认
@@ -17,6 +18,7 @@ export interface DrawRequest {
   id: string
   kind: RequestKind
   proposalId: string | null // 提议层元素上打的标记，页面靠它找到这批元素
+  baseline: unknown // 提议画上去时的底稿，用户表态时拿来比出改了什么；这里不关心它的结构
   prompt: string
   createdAt: string
   status: 'waiting' | 'submitted' | 'cancelled'
@@ -64,12 +66,27 @@ export class RequestHub {
     this.listener?.(this.state())
   }
 
-  create(prompt: string, proposalId: string | null = null): DrawRequest {
+  // 还在等用户回应的请求，用来存盘
+  waiting(): DrawRequest[] {
+    return [...this.requests.values()].filter((r) => r.status === 'waiting')
+  }
+
+  // 应用重启后把存盘的请求放回来，编号不变，agent 手里的 request_id 还能用
+  restore(saved: readonly DrawRequest[]): void {
+    for (const r of saved) {
+      if (!r?.id || this.requests.has(r.id)) continue
+      this.requests.set(r.id, { ...r, status: 'waiting', submission: null })
+    }
+    this.emit()
+  }
+
+  create(prompt: string, proposalId: string | null = null, baseline: unknown = null): DrawRequest {
     this.seq += 1
     const req: DrawRequest = {
       id: `req_${Date.now().toString(36)}_${this.seq}`,
       kind: proposalId ? 'proposal' : 'draw',
       proposalId,
+      baseline,
       prompt,
       createdAt: new Date().toISOString(),
       status: 'waiting',

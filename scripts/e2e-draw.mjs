@@ -70,6 +70,7 @@ async function connectPage() {
       await js(`document.querySelector('.sl-banner-note')?.focus()`)
       await cdp('Input.insertText', { text: t })
     },
+    js,
     screenshot: async (file) => writeFileSync(file, Buffer.from((await cdp('Page.captureScreenshot', { format: 'png' })).result.data, 'base64')),
     close: () => ws.close()
   }
@@ -214,13 +215,86 @@ try {
   await user.waitForBanner()
   await user.click('对，就这样')
   const r2 = textOf(await w2)
-  check(/ACCEPTED/.test(r2), '接受：agent 收到结果')
+  check(/ACCEPTED/.test(r2) && /exactly as you drew it/.test(r2), '接受：agent 收到结果，并被告知用户没有改动')
   check(/「查缓存」菱形【agent 画的】/.test(r2) && !/提议/.test(r2), '接受后提议变成正式内容')
   const after = JSON.parse(readFileSync(join(HOME, 'boards', 'default.excalidraw'), 'utf8')).elements.filter((el) => !el.isDeleted)
   const merged = after.find((el) => el.type === 'diamond' && el.customData?.sketchlink?.layer === 'final' && el.strokeStyle === 'solid' && el.opacity === 100)
   check(after.length > before && !after.some((el) => el.customData?.sketchlink?.layer === 'proposal') && Boolean(merged), '画板文件里没有残留的提议层元素')
   await user.screenshot(join(OUT, 'propose-accepted.png'))
+
+  // 第三次：两个提议排队，用户在第一个上改了再接受
+  const pA = textOf(
+    await call('canvas_propose', {
+      question: '（自动测试）提议甲：这样记日志对吗？',
+      ops: [
+        { op: 'add_node', id: 'log', label: '写日志' },
+        { op: 'add_node', id: 'alert', label: '发告警' },
+        { op: 'add_edge', from: 'log', to: 'alert', label: '出错时' }
+      ]
+    })
+  )
+  const pB = textOf(await call('canvas_propose', { question: '（自动测试）提议乙：要不要加重试？', ops: [{ op: 'add_node', id: 'retry', label: '重试三次' }] }))
+  const [reqA, reqB] = [pA, pB].map((t) => t.match(/req_\w+/)?.[0])
+  const bannerA = (await user.waitForBanner()) ?? ''
+  check(/提议甲/.test(bannerA) && /后面还有 1 个请求/.test(bannerA), '两个提议排队：横幅先问第一个，并写明后面还有 1 个')
+
+  // 扮演用户直接改画布：把「发告警」往下拖、改成「发短信」，再自己画一个框
+  const edited = await user.js(`(async () => {
+    const api = window.__sketchlinkApi
+    const pid = (await window.sketchlink.getHubState()).pending[0].proposalId
+    const all = api.getSceneElementsIncludingDeleted()
+    const label = all.find((e) => e.type === 'text' && e.text === '发告警' && e.customData?.sketchlink?.proposal === pid)
+    const node = all.find((e) => e.id === label.containerId)
+    const bump = (e, patch) => ({ ...e, ...patch, version: e.version + 1, versionNonce: Math.floor(Math.random() * 1e9), updated: Date.now() })
+    const next = all.map((e) =>
+      e.id === node.id ? bump(e, { y: e.y + 200 }) : e.id === label.id ? bump(e, { y: e.y + 200, text: '发短信', originalText: '发短信' }) : e
+    )
+    const own = { ...node, id: 'user_box_1', x: node.x + 400, y: node.y, boundElements: null, opacity: 100, strokeStyle: 'solid', strokeColor: '#1e1e1e' }
+    delete own.customData
+    delete own.index
+    api.updateScene({ elements: [...next, own] })
+    return true
+  })()`)
+  check(edited === true, '（扮演用户）在提议上拖动、改字，并自己加了一个框')
+  await sleep(300)
+  await user.screenshot(join(OUT, 'propose-edited.png'))
+  const wA = call('canvas_wait', { request_id: reqA, timeout_s: 30, image: 'never' })
+  await user.click('对，就这样')
+  const rA = textOf(await wA)
+  console.log(rA.split('\n').slice(0, 6).join('\n'))
+  check(/ACCEPTED/.test(rA) && /the user changed it/.test(rA), '改了再接受：agent 被告知用户改过')
+  check(/把节点「发告警」的文字改成了「发短信」/.test(rA), '改动里有：改了文字')
+  check(/把节点「发短信」往下挪了/.test(rA), '改动里有：挪了位置')
+  check(/自己加了：节点一个没有文字的图形/.test(rA), '改动里有：用户自己加的框')
+  const boardA = rA.slice(rA.indexOf('画板「')) // 只看画布描述那一段，前面的改动说明里本来就会提到旧文字
+  check(/「发短信」矩形【agent 画的】/.test(boardA) && !/发告警/.test(boardA), '接受后画布上是用户改过的样子')
+
+  const bannerB = (await user.waitForBanner()) ?? ''
+  check(/提议乙/.test(bannerB) && !/后面还有/.test(bannerB), '处理完第一个，横幅接着问第二个')
+
+  // 第四次：提议还没处理，应用被强杀后重启
   user.close()
+  const oldPid = JSON.parse(readFileSync(join(HOME, 'daemon.json'), 'utf8')).pid
+  process.kill(oldPid)
+  await sleep(1500)
+  const afterRestart = textOf(await call('canvas_wait', { request_id: reqB, timeout_s: 3, image: 'never' }))
+  const newPid = JSON.parse(readFileSync(join(HOME, 'daemon.json'), 'utf8')).pid
+  check(newPid !== oldPid && /has not sent anything yet/.test(afterRestart), '应用重启后，原来的 request_id 还认得（不是 unknown_request）')
+  const user2 = await connectPage()
+  const bannerAgain = (await user2.waitForBanner()) ?? ''
+  check(/提议乙/.test(bannerAgain), '重启后确认横幅又出现了')
+  await sleep(500)
+  await user2.screenshot(join(OUT, 'propose-after-restart.png'))
+  const wB = call('canvas_wait', { request_id: reqB, timeout_s: 30, image: 'never' })
+  await user2.click('对，就这样')
+  const rB = textOf(await wB)
+  console.log(rB.split('\n').slice(0, 4).join('\n'))
+  check(/ACCEPTED/.test(rB) && /「重试三次」矩形【agent 画的】/.test(rB), '重启后照样能接受提议')
+  // 提议乙画上去之后，用户才加了那个框，所以对乙来说它也是"后来加的"；乙本身没被改
+  check(/自己加了：节点一个没有文字的图形/.test(rB) && !/把节点|删掉了/.test(rB), '重启后底稿还在：改动对比照常工作')
+  const pendingFile = JSON.parse(readFileSync(join(HOME, 'pending.json'), 'utf8'))
+  check(pendingFile.requests.length === 0, '处理完后，存盘的待处理请求清空了')
+  user2.close()
 } finally {
   await client.close()
   // 关掉测试开的那个画布实例
