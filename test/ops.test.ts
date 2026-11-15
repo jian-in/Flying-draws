@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGraph, summarize, type SceneElement } from '../src/main/semantic.ts'
-import { OpsError, planOps, type DrawOp } from '../src/main/ops.ts'
+import { estimateTextWidth, exitPoint, OpsError, planOps, type DrawOp } from '../src/main/ops.ts'
 
 const ids = () => {
   let n = 0
@@ -28,9 +28,95 @@ test('空画板上：新节点排成一行，连线从左边节点的右边缘�
   assert.ok(b.x >= a.x + a.w + 40, '两个节点之间留了空')
   const e = plan.edges[0]
   assert.deepEqual([e.fromElementId, e.toElementId, e.label], [a.elementId, b.elementId, '下一步'])
-  assert.ok(e.x > a.x + a.w && e.x + e.dx < b.x, '箭头两端都在节点外面')
-  assert.equal(e.dy, 0)
+  const [dx, dy] = e.points[e.points.length - 1]
+  assert.equal(e.points.length, 2)
+  assert.ok(e.x > a.x + a.w && e.x + dx < b.x, '箭头两端都在节点外面')
+  assert.ok(Math.abs(dy) < 0.001, '同一行的两个节点之间是水平线')
+  assert.ok(b.x - (a.x + a.w) >= estimateTextWidth('下一步'), '两个节点之间放得下连线上的文字')
   assert.deepEqual(plan.existingRefs, [])
+})
+
+const overlap = (p: { x: number; y: number; w: number; h: number }, q: { x: number; y: number; w: number; h: number }) =>
+  p.x < q.x + q.w && q.x < p.x + p.w && p.y < q.y + q.h && q.y < p.y + p.h
+
+test('分支流程：节点互不重叠，同一层的节点上下排开', () => {
+  const plan = planOps(
+    [
+      { op: 'add_node', id: 'ask', label: '已登录？', shape: 'diamond' },
+      { op: 'add_node', id: 'home', label: '首页' },
+      { op: 'add_node', id: 'login', label: '登录页' },
+      { op: 'add_edge', from: 'ask', to: 'home', label: '是' },
+      { op: 'add_edge', from: 'ask', to: 'login', label: '否' }
+    ],
+    empty,
+    ids()
+  )
+  const [ask, home, login] = plan.nodes
+  for (const [p, q] of [[ask, home], [ask, login], [home, login]] as const) assert.equal(overlap(p, q), false)
+  assert.ok(home.x > ask.x + ask.w && login.x > ask.x + ask.w, '两个分支都在判断节点右边')
+  assert.ok(Math.abs(home.x - login.x) < 1 && home.y !== login.y, '两个分支在同一层，上下排开')
+})
+
+test('direction: down 时从上往下排', () => {
+  const ops: DrawOp[] = [
+    { op: 'add_node', id: 'a', label: '第一步' },
+    { op: 'add_node', id: 'b', label: '第二步' },
+    { op: 'add_edge', from: 'a', to: 'b' }
+  ]
+  const [a, b] = planOps(ops, empty, ids(), { direction: 'down' }).nodes
+  assert.ok(b.y > a.y + a.h)
+  assert.ok(Math.abs(a.x - b.x) < 1)
+})
+
+test('跨层的连线带拐点，绕开中间的节点', () => {
+  const plan = planOps(
+    [
+      { op: 'add_node', id: 'a', label: 'A' },
+      { op: 'add_node', id: 'b', label: 'B' },
+      { op: 'add_node', id: 'c', label: 'C' },
+      { op: 'add_edge', from: 'a', to: 'b' },
+      { op: 'add_edge', from: 'b', to: 'c' },
+      { op: 'add_edge', from: 'a', to: 'c', label: '跳过' }
+    ],
+    empty,
+    ids()
+  )
+  const skip = plan.edges[2]
+  assert.ok(skip.points.length > 2)
+  const b = plan.nodes[1]
+  for (const [px, py] of skip.points) {
+    const inside = skip.x + px > b.x && skip.x + px < b.x + b.w && skip.y + py > b.y && skip.y + py < b.y + b.h
+    assert.equal(inside, false, '拐点不在中间节点里面')
+  }
+})
+
+test('箭头从菱形和椭圆的轮廓出发，不是从外接框出发', () => {
+  const box = { x: 0, y: 0, w: 200, h: 100 }
+  // 朝右下 45° 方向：矩形在角上附近，菱形和椭圆要近得多
+  const far = (shape: string) => Math.hypot(...exitPoint({ ...box, shape }, 1100, 1050, 0).map((v, i) => v - [100, 50][i]) as [number, number])
+  assert.ok(far('diamond') < far('ellipse') && far('ellipse') < far('rectangle'))
+  // 正右方：三种图形都在右边缘
+  for (const shape of ['rectangle', 'ellipse', 'diamond']) assert.deepEqual(exitPoint({ ...box, shape }, 500, 50, 8), [208, 50])
+})
+
+test('挂在新节点旁边的文字不和别的节点重叠', () => {
+  const plan = planOps(
+    [
+      { op: 'add_node', id: 'ask', label: '已登录？', shape: 'diamond' },
+      { op: 'add_node', id: 'home', label: '首页' },
+      { op: 'add_node', id: 'login', label: '登录页' },
+      { op: 'add_edge', from: 'ask', to: 'home' },
+      { op: 'add_edge', from: 'ask', to: 'login' },
+      { op: 'add_text', text: '没登录就去登录页，登录完再回来', near: 'home' }
+    ],
+    empty,
+    ids()
+  )
+  const t = plan.texts[0]
+  const home = plan.nodes[1]
+  const tb = { x: t.x, y: t.y, w: estimateTextWidth(t.text), h: 25 }
+  assert.ok(t.y >= home.y + home.h, '文字在节点下方')
+  for (const n of plan.nodes) assert.equal(overlap(tb, n), false, `文字没有压到 ${n.key}`)
 })
 
 test('新节点放在已有内容的下方，不压住用户画的东西', () => {

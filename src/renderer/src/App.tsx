@@ -108,12 +108,11 @@ async function applyPlan(api: Api, plan: DrawPlan): Promise<{ sceneJson: string 
       id: e.elementId,
       x: e.x,
       y: e.y,
-      width: Math.abs(e.dx),
-      height: Math.abs(e.dy),
-      points: [
-        [0, 0],
-        [e.dx, e.dy]
-      ],
+      width: Math.max(...e.points.map((p) => p[0])) - Math.min(...e.points.map((p) => p[0])),
+      height: Math.max(...e.points.map((p) => p[1])) - Math.min(...e.points.map((p) => p[1])),
+      points: e.points,
+      // 有拐点的连线画成圆滑的曲线，和用户手画的箭头一个样子
+      ...(e.points.length > 2 ? { roundness: { type: 2 } } : {}),
       endArrowhead: 'arrow' as const,
       ...(e.label ? { label: { text: e.label } } : {})
     })),

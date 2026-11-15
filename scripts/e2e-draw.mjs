@@ -59,10 +59,13 @@ try {
   const drawnText = textOf(drawn)
   console.log(drawnText)
   check(!drawn.isError && /Drawn: 3 node\(s\), 2 arrow\(s\), 1 text\(s\)/.test(drawnText), 'canvas_draw 画出 3 个节点、2 条连线、1 段文字')
-  check(/open = N1, ask = N2, home = N3/.test(drawnText), '返回新节点的编号')
-  check(/N1「打开 App」 → N2「已登录？」【agent 画的】/.test(drawnText), '连线两端绑定到了节点上')
-  check(/N2「已登录？」 → N3「首页」，标着「是」/.test(drawnText), '连线上的文字读得回来')
-  check(/N2 「已登录？」菱形【agent 画的】/.test(drawnText), '节点标明是 agent 画的')
+  // 编号按阅读顺序排，不假设谁是 N1，用返回的对照表
+  const idOf = (key, t = drawnText) => t.match(new RegExp(`\\b${key} = (N\\d+)`))?.[1]
+  const [nOpen, nAsk, nHome] = ['open', 'ask', 'home'].map((k) => idOf(k))
+  check(Boolean(nOpen && nAsk && nHome), `返回新节点的编号：open=${nOpen} ask=${nAsk} home=${nHome}`)
+  check(drawnText.includes(`${nOpen}「打开 App」 → ${nAsk}「已登录？」【agent 画的】`), '连线两端绑定到了节点上')
+  check(drawnText.includes(`${nAsk}「已登录？」 → ${nHome}「首页」，标着「是」`), '连线上的文字读得回来')
+  check(drawnText.includes(`${nAsk} 「已登录？」菱形【agent 画的】`), '节点标明是 agent 画的')
   const ver = Number(drawnText.match(/now at version (\d+)/)?.[1])
   check(ver > 0, `版本号 v${ver}`)
 
@@ -70,7 +73,7 @@ try {
   const stale = await call('canvas_draw', {
     ops: [
       { op: 'add_node', id: 'login', label: '登录页' },
-      { op: 'add_edge', from: 'N2', to: 'login', label: '否' }
+      { op: 'add_edge', from: nAsk, to: 'login', label: '否' }
     ]
   })
   check(stale.isError && /Nothing was drawn: the canvas changed/.test(textOf(stale)), '引用已有节点但没带 base_version：整批拒绝')
@@ -81,14 +84,32 @@ try {
     base_version: ver,
     ops: [
       { op: 'add_node', id: 'login', label: '登录页' },
-      { op: 'add_edge', from: 'N2', to: 'login', label: '否' }
+      { op: 'add_edge', from: nAsk, to: 'login', label: '否' }
     ]
   })
   const linkedText = textOf(linked)
-  check(!linked.isError && /N2「已登录？」 → N4「登录页」，标着「否」/.test(linkedText), '带上 base_version 后能连到已有节点')
+  check(!linked.isError && /「已登录？」 → N\d「登录页」，标着「否」/.test(linkedText), '带上 base_version 后能连到已有节点')
   check(new RegExp(`now at version ${ver + 1}\\b`).test(linkedText), '一批指令只升一次版本号')
 
-  const bad = await call('canvas_draw', { ops: [{ op: 'add_edge', from: 'nope', to: 'N1' }], base_version: ver + 1 })
+  // 再画一块从上往下的，带一条跨层的连线，看排版和拐弯
+  const down = await call('canvas_draw', {
+    direction: 'down',
+    ops: [
+      { op: 'add_node', id: 'req', label: '收到请求', shape: 'ellipse' },
+      { op: 'add_node', id: 'auth', label: '校验 token' },
+      { op: 'add_node', id: 'db', label: '查数据库' },
+      { op: 'add_node', id: 'resp', label: '返回结果', shape: 'ellipse' },
+      { op: 'add_edge', from: 'req', to: 'auth' },
+      { op: 'add_edge', from: 'auth', to: 'db', label: '通过' },
+      { op: 'add_edge', from: 'db', to: 'resp' },
+      { op: 'add_edge', from: 'auth', to: 'resp', label: '401' },
+      { op: 'add_text', text: 'token 过期也算不通过', near: 'auth' }
+    ]
+  })
+  check(!down.isError && /Drawn: 4 node\(s\), 4 arrow\(s\), 1 text\(s\)/.test(textOf(down)), 'direction: down 画出第二块流程')
+  check(/「校验 token」 → N\d「返回结果」，标着「401」/.test(textOf(down)), '跨层的连线读得回来')
+
+  const bad = await call('canvas_draw', { ops: [{ op: 'add_edge', from: 'nope', to: 'N1' }], base_version: ver + 2 })
   check(bad.isError && /unknown node "nope"/.test(textOf(bad)), '引用不存在的节点：报错并说明原因')
 
   // 落盘的文件里有作者标记，别的 Excalidraw 也能打开

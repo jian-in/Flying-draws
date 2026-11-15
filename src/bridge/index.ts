@@ -269,11 +269,15 @@ server.registerTool(
     title: 'Draw on the canvas',
     description:
       'Draw nodes, arrows and text on the Sketchlink canvas so the user can see your understanding or plan as a diagram. ' +
-      'You only say what to add; the canvas picks positions. This tool only adds things: it cannot move, change or delete what is already there. ' +
+      'You only say what to add; the canvas lays the new nodes out automatically, below whatever is already there. This tool only adds things: it cannot move, change or delete what is already there. ' +
       'To connect to nodes that are already on the canvas, call canvas_read first and pass the version it showed as base_version. ' +
       'Returns the updated canvas description. Things you drew are marked as drawn by the agent in later reads.',
     inputSchema: {
       ops: z.array(opSchema).min(1).describe('What to add, applied together as one batch: either all of it is drawn or none.'),
+      direction: z
+        .enum(['right', 'down'])
+        .optional()
+        .describe('Which way the new nodes flow: "right" (default, left to right) or "down" (top to bottom).'),
       base_version: z
         .number()
         .int()
@@ -281,8 +285,8 @@ server.registerTool(
         .describe('The canvas version from your latest canvas_read. Required when ops refer to existing nodes (N1, N2, ...); otherwise optional.')
     }
   },
-  ({ ops, base_version }) => guarded(async () => {
-    const res = await daemon('/draw', { ops, base_version }, 30_000)
+  ({ ops, base_version, direction }) => guarded(async () => {
+    const res = await daemon('/draw', { ops, base_version, direction }, 30_000)
     switch (res.status) {
       case 'drawn': {
         const added = res.added as { nodes: number; edges: number; texts: number }

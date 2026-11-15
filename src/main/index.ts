@@ -229,7 +229,7 @@ const routes = {
 
       let plan: DrawPlan
       try {
-        plan = planOps(body.ops as DrawOp[], graph, newElementId)
+        plan = planOps(body.ops as DrawOp[], graph, newElementId, { direction: body.direction === 'down' ? 'down' : 'right' })
       } catch (err) {
         if (err instanceof OpsError) return { status: 'invalid', error: err.message, ...current() }
         throw err
