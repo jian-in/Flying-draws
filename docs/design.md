@@ -149,8 +149,8 @@
 
 | 阶段 | 内容 | 可以对外发布的标志 |
 |---|---|---|
-| M0 技术验证 | Electron 窗口嵌入 Excalidraw，能把场景数据导出成 JSON | 自己能跑起来 |
-| M1 v0.1「画给 agent 看」 | 桥接进程、`canvas_open` / `read` / `request` / `wait`、语义层第一版（节点、连线、旁注、图片兜底） | 在 Claude Code 里画一个流程图，agent 能准确复述 |
+| M0 技术验证（✅ 2026-11-15） | Electron 窗口嵌入 Excalidraw，能把场景数据导出成 JSON | 自己能跑起来 |
+| M1 v0.1「画给 agent 看」（✅ 2026-11-15，待在真实 agent 会话里验收） | 桥接进程、`canvas_open` / `read` / `request` / `wait`、语义层第一版（节点、连线、旁注、图片兜底） | 在 Claude Code 里画一个流程图，agent 能准确复述 |
 | M2 v0.2「用画对话」 | `canvas_draw` / `propose`、提议层、diff、自动排版 | README 主演示：画草图 → agent 画出理解 → 用户改一笔 → agent 开始写代码 |
 | M3 v0.3「嵌入」 | 图片标注、代码块、Markdown 卡片、网页预览；HTTP MCP 直连 | 截图圈改的演示 |
 | M4 | 支持 MCP Apps 的宿主里直接内嵌显示；手绘识别增强；多画板、多 agent 同时连接 | — |

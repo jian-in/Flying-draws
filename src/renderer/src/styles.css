@@ -14,7 +14,8 @@ body,
   white-space: nowrap;
 }
 
-.sl-status button {
+.sl-status button,
+.sl-banner button {
   font-size: 12px;
   padding: 4px 8px;
   border-radius: 6px;
@@ -24,6 +25,74 @@ body,
   cursor: pointer;
 }
 
-.sl-status .sl-error {
+.sl-status button.sl-primary,
+.sl-banner button.sl-primary {
+  background: var(--color-primary, #6965db);
+  border-color: var(--color-primary, #6965db);
+  color: #fff;
+}
+
+.sl-banner button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.sl-error {
   color: #c92a2a;
+}
+
+/* agent 请求横幅：放在工具栏下方居中 */
+.sl-banner {
+  position: fixed;
+  top: 76px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  width: min(520px, calc(100vw - 32px));
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #fff8e6;
+  border: 1px solid #f0c36d;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  font-size: 13px;
+  color: #333;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sl-banner-title {
+  font-weight: 600;
+}
+
+.sl-banner-prompt {
+  white-space: pre-wrap;
+}
+
+.sl-banner-note {
+  font-size: 13px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #ddd;
+}
+
+.sl-banner-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.sl-waiting {
+  position: fixed;
+  top: 76px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: #fff8e6;
+  border: 1px solid #f0c36d;
+  font-size: 12px;
+  color: #333;
 }
