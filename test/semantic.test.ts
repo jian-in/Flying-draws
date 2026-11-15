@@ -109,6 +109,83 @@ test('已删除的元素被忽略，空画板有提示', () => {
   assert.match(summarize(g, { board: 't', version: 1 }), /画板是空的/)
 })
 
+// 一笔手绘：从 from 到 to 的直线，中间插几个点
+function stroke(from: [number, number], to: [number, number]): SceneElement {
+  const n = 8
+  return {
+    id: `f${++seq}`,
+    type: 'freedraw',
+    x: from[0],
+    y: from[1],
+    width: to[0] - from[0],
+    height: to[1] - from[1],
+    points: Array.from({ length: n + 1 }, (_, i) => [((to[0] - from[0]) * i) / n, ((to[1] - from[1]) * i) / n] as [number, number])
+  }
+}
+// 模拟一个手写字：横、竖、撇、捺四笔，外加一个很小的点
+function handwrittenChar(x: number, y: number): SceneElement[] {
+  return [
+    stroke([x, y + 20], [x + 60, y + 20]),
+    stroke([x + 30, y], [x + 30, y + 70]),
+    stroke([x + 28, y + 30], [x, y + 65]),
+    stroke([x + 32, y + 30], [x + 60, y + 65]),
+    stroke([x + 55, y + 5], [x + 57, y + 7])
+  ]
+}
+
+test('挨得近的手绘笔画合成一组，小点也算进去，并建议附图', () => {
+  const g = buildGraph([...handwrittenChar(1000, 100), ...handwrittenChar(1080, 100)])
+  assert.equal(g.strokes.length, 0)
+  assert.equal(g.strokeGroups.length, 1)
+  assert.equal(g.strokeGroups[0].count, 10)
+  assert.equal(g.needsImage, true)
+  const s = summarize(g, { board: 't', version: 1 })
+  assert.match(s, /10 笔手绘/)
+  assert.match(s, /一组手写或涂鸦（10 笔），内容请看附图/)
+  assert.doesNotMatch(s, /一条直线/)
+})
+
+test('离得远的手写分成两组，方位按节点或画面位置描述', () => {
+  const a = rect(0, 0)
+  const withNode = buildGraph([a, label(a, '登录'), ...handwrittenChar(300, -200), ...handwrittenChar(300, 600)])
+  assert.equal(withNode.strokeGroups.length, 2)
+  assert.deepEqual(withNode.strokeGroups[0].near, { id: 'N1', position: '右上方' })
+  assert.match(summarize(withNode, { board: 't', version: 1 }), /一组手写或涂鸦（5 笔），在 N1「登录」 右上方/)
+
+  const noNode = buildGraph([text(0, 500, '左下角的字'), ...handwrittenChar(900, 0)])
+  assert.equal(noNode.strokeGroups[0].near, null)
+  assert.equal(noNode.strokeGroups[0].region, '右上角')
+  assert.match(summarize(noNode, { board: 't', version: 1 }), /在画面右上角/)
+})
+
+test('圈住节点的圈不会和圈里圈外的笔画并成一组', () => {
+  const a = rect(100, 100)
+  const loop: SceneElement = {
+    id: 'f-loop',
+    type: 'freedraw',
+    x: 80,
+    y: 80,
+    width: 140,
+    height: 100,
+    points: Array.from({ length: 40 }, (_, i) => {
+      const t = (i / 39) * 2 * Math.PI
+      return [70 + 70 * Math.cos(t), 50 + 50 * Math.sin(t)] as [number, number]
+    })
+  }
+  const g = buildGraph([a, label(a, '这里'), loop, ...handwrittenChar(230, 90)])
+  assert.equal(g.strokes.length, 1)
+  assert.deepEqual(g.strokes[0].encloses, ['N1'])
+  assert.equal(g.strokeGroups.length, 1)
+  assert.equal(g.strokeGroups[0].count, 5)
+})
+
+test('单独的误点仍然被忽略', () => {
+  const g = buildGraph([stroke([0, 0], [1, 1]), stroke([3, 3], [4, 4])])
+  assert.equal(g.strokes.length, 0)
+  assert.equal(g.strokeGroups.length, 0)
+  assert.match(summarize(g, { board: 't', version: 1 }), /画板是空的/)
+})
+
 test('有曲线涂鸦时建议附图', () => {
   const squiggle: SceneElement = {
     id: 'f2',

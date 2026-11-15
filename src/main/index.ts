@@ -158,8 +158,8 @@ function describe(sceneJson: string, ver: number, opts: { format: string; image:
   const attached = wantImage && Boolean(png)
   if (graph.needsImage) {
     summary += attached
-      ? '\n提示：有文字描述不了的内容（涂鸦、图片或线条），已附画布截图。'
-      : '\n提示：有文字描述不了的内容（涂鸦、图片或线条），需要的话用 image: "always" 再读一次拿截图。'
+      ? '\n提示：有文字描述不了的内容（手写、涂鸦、图片或线条），已附画布截图。'
+      : '\n提示：有文字描述不了的内容（手写、涂鸦、图片或线条），需要的话用 image: "always" 再读一次拿截图。'
   }
   return {
     board: BOARD_ID,

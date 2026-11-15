@@ -63,11 +63,21 @@ export interface SemanticStroke {
   near: { id: string; position: string } | null
 }
 
+// 挨得近的几笔手绘合成一组（手写字、多笔涂鸦）。语义层不猜内容，只说在哪、有几笔，内容交给截图。
+export interface SemanticStrokeGroup {
+  refs: string[]
+  count: number
+  bbox: Bbox
+  near: { id: string; position: string } | null
+  region: string | null // 没有节点可参照时，在整张画里的大致方位，如"右上角"
+}
+
 export interface SemanticGraph {
   nodes: SemanticNode[]
   edges: SemanticEdge[]
   notes: SemanticNote[]
-  strokes: SemanticStroke[]
+  strokes: SemanticStroke[] // 只含没被分组的单笔
+  strokeGroups: SemanticStrokeGroup[]
   containment: { parent: string; child: string }[]
   images: { ref: string; bbox: Bbox }[]
   lines: { ref: string; bbox: Bbox }[]
@@ -92,6 +102,11 @@ const DIAGONAL_PENALTY = 1.5 // 文字在节点斜对角时，距离按 1.5 倍�
 const MIN_STROKE_SIZE = 6 // 外接框对角线小于这个值的笔画当作误点，忽略
 const MAX_LISTED_STROKES = 8 // 文字描述里最多逐条列出的手绘笔画数
 const EDGE_SNAP_DISTANCE = 40 // 箭头端点没绑定时，离节点多近算连上
+// 两笔手绘离多近算同一组：阈值取两笔里较小那笔的对角线长度，再夹到这个范围里。
+// 跟着笔画大小走，画布缩放不同、字写得大小不同时都能用。
+const GROUP_GAP_MIN = 30
+const GROUP_GAP_MAX = 150
+const GROUP_SAMPLE_POINTS = 24 // 算两笔之间的距离时，每笔最多取这么多个点
 
 function bboxOf(el: SceneElement): Bbox {
   // 线条和箭头的宽高可能是负的，统一成左上角加正宽高
@@ -162,6 +177,52 @@ function classifyStroke(el: SceneElement): SemanticStroke['shape'] {
     if (dev > maxDev) maxDev = dev
   }
   return maxDev < len * 0.08 ? 'straight' : 'curve'
+}
+
+function unionBbox(boxes: Bbox[]): Bbox {
+  const x0 = Math.min(...boxes.map((b) => b.x))
+  const y0 = Math.min(...boxes.map((b) => b.y))
+  const x1 = Math.max(...boxes.map((b) => b.x + b.w))
+  const y1 = Math.max(...boxes.map((b) => b.y + b.h))
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+}
+
+// 一笔里均匀抽出的若干个点。用点而不用外接框算距离，
+// 这样一个大圈和圈里面的字不会因为外接框重叠被并成一组。
+function strokeSamples(el: SceneElement): [number, number][] {
+  const pts = absPoints(el)
+  if (pts.length === 0) return [[el.x, el.y]]
+  if (pts.length <= GROUP_SAMPLE_POINTS) return pts
+  const out: [number, number][] = []
+  for (let i = 0; i < GROUP_SAMPLE_POINTS; i++) {
+    out.push(pts[Math.round((i * (pts.length - 1)) / (GROUP_SAMPLE_POINTS - 1))])
+  }
+  return out
+}
+
+function minPointDistance(a: [number, number][], b: [number, number][]): number {
+  let best = Infinity
+  for (const [ax, ay] of a) {
+    for (const [bx, by] of b) {
+      const d = Math.hypot(ax - bx, ay - by)
+      if (d < best) best = d
+    }
+  }
+  return best
+}
+
+// 一块内容在整张画里的大致方位。内容本身就占了大半张画时返回 null。
+function canvasRegion(b: Bbox, overall: Bbox): string | null {
+  if (b.w > overall.w * 0.6 && b.h > overall.h * 0.6) return null
+  const [cx, cy] = center(b)
+  const fx = overall.w > 0 ? (cx - overall.x) / overall.w : 0.5
+  const fy = overall.h > 0 ? (cy - overall.y) / overall.h : 0.5
+  const horiz = fx < 1 / 3 ? '左' : fx > 2 / 3 ? '右' : ''
+  const vert = fy < 1 / 3 ? '上' : fy > 2 / 3 ? '下' : ''
+  if (horiz && vert) return `${horiz}${vert}角`
+  if (horiz) return `${horiz}侧`
+  if (vert) return `${vert}方`
+  return '中间'
 }
 
 // 阅读顺序：按左上角先分行（纵向容差 40px），再从左到右。
@@ -326,29 +387,67 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
   }
 
   // 手绘笔画
-  const strokes: SemanticStroke[] = []
-  for (const el of elements) {
-    if (el.type !== 'freedraw') continue
-    const b = bboxOf(el)
-    if (Math.hypot(b.w, b.h) < MIN_STROKE_SIZE) continue
-    const shape = classifyStroke(el)
-    const encloses: string[] = []
-    if (shape === 'loop') {
-      for (const n of nodes) if (contains(b, n.bbox, 8)) encloses.push(n.id)
-      for (const note of notes) if (contains(b, note.bbox, 8)) encloses.push(`"${note.text}"`)
-    }
-    let near: SemanticStroke['near'] = null
+  const nearestTo = (b: Bbox, skip: string[] = []): { id: string; position: string } | null => {
+    let near: { id: string; position: string } | null = null
     let bestD = Infinity
     for (const n of nodes) {
-      if (encloses.includes(n.id) || n.kind === 'frame' || n.kind === 'magicframe') continue
+      if (skip.includes(n.id) || n.kind === 'frame' || n.kind === 'magicframe') continue
       const d = bboxDistance(b, n.bbox)
       if (d < bestD) {
         bestD = d
         near = { id: n.id, position: relativePosition(b, n.bbox) }
       }
     }
-    strokes.push({ ref: el.id, shape, bbox: b, encloses, near })
+    return near
   }
+
+  // 先逐笔看一遍。这里先不丢掉很小的笔画：字里的点很小，但属于那个字。
+  const raw = elements
+    .filter((el) => el.type === 'freedraw')
+    .map((el) => {
+      const b = bboxOf(el)
+      const diag = Math.hypot(b.w, b.h)
+      const shape = classifyStroke(el)
+      const encloses: string[] = []
+      if (shape === 'loop') {
+        for (const n of nodes) if (contains(b, n.bbox, 8)) encloses.push(n.id)
+        for (const note of notes) if (contains(b, note.bbox, 8)) encloses.push(`"${note.text}"`)
+      }
+      return { el, b, diag, shape, encloses, samples: strokeSamples(el) }
+    })
+
+  // 挨得近的笔画并成一组（并查集）。圈住了节点或文字的圈是标注，不参与分组。
+  const parent = raw.map((_, i) => i)
+  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])))
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i].encloses.length) continue
+    for (let j = i + 1; j < raw.length; j++) {
+      if (raw[j].encloses.length) continue
+      const gap = Math.min(GROUP_GAP_MAX, Math.max(GROUP_GAP_MIN, Math.min(raw[i].diag, raw[j].diag)))
+      if (bboxDistance(raw[i].b, raw[j].b) > gap) continue
+      if (minPointDistance(raw[i].samples, raw[j].samples) <= gap) parent[find(i)] = find(j)
+    }
+  }
+  const clusters = new Map<number, typeof raw>()
+  raw.forEach((s, i) => {
+    const root = find(i)
+    if (!clusters.has(root)) clusters.set(root, [])
+    clusters.get(root)!.push(s)
+  })
+
+  const strokes: SemanticStroke[] = []
+  const groupDrafts: { refs: string[]; bbox: Bbox }[] = []
+  for (const members of clusters.values()) {
+    // 整簇都是误点大小的，忽略
+    if (members.every((s) => s.diag < MIN_STROKE_SIZE)) continue
+    if (members.length === 1) {
+      const s = members[0]
+      strokes.push({ ref: s.el.id, shape: s.shape, bbox: s.b, encloses: s.encloses, near: nearestTo(s.b, s.encloses) })
+    } else {
+      groupDrafts.push({ refs: members.map((s) => s.el.id), bbox: unionBbox(members.map((s) => s.b)) })
+    }
+  }
+  groupDrafts.sort((a, b) => readingOrder(a.bbox, b.bbox))
 
   // 包含关系：框架里的元素，或一个形状完全套住另一个形状
   const containment: SemanticGraph['containment'] = []
@@ -370,13 +469,36 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
 
   const images = elements.filter((el) => el.type === 'image').map((el) => ({ ref: el.id, bbox: bboxOf(el) }))
   const lines = elements.filter((el) => el.type === 'line').map((el) => ({ ref: el.id, bbox: bboxOf(el) }))
+
+  // 手绘分组的方位：有节点就说在哪个节点旁边，没有节点就说在整张画的哪个位置
+  const allBoxes = [
+    ...nodes.map((n) => n.bbox),
+    ...notes.map((n) => n.bbox),
+    ...strokes.map((s) => s.bbox),
+    ...groupDrafts.map((g) => g.bbox),
+    ...images.map((i) => i.bbox),
+    ...lines.map((l) => l.bbox)
+  ]
+  const overall = allBoxes.length ? unionBbox(allBoxes) : null
+  const strokeGroups: SemanticStrokeGroup[] = groupDrafts.map((g) => {
+    const near = nearestTo(g.bbox)
+    return {
+      refs: g.refs,
+      count: g.refs.length,
+      bbox: g.bbox,
+      near,
+      region: !near && overall ? canvasRegion(g.bbox, overall) : null
+    }
+  })
+
   const needsImage =
     images.length > 0 ||
     lines.length > 0 ||
+    strokeGroups.length > 0 ||
     strokes.length > MAX_LISTED_STROKES ||
     strokes.some((s) => s.shape === 'curve')
 
-  return { nodes, edges, notes, strokes, containment, images, lines, needsImage }
+  return { nodes, edges, notes, strokes, strokeGroups, containment, images, lines, needsImage }
 }
 
 function nodeName(nodes: Map<string, SemanticNode>, id: string | null): string {
@@ -389,17 +511,18 @@ function nodeName(nodes: Map<string, SemanticNode>, id: string | null): string {
 export function summarize(graph: SemanticGraph, meta: { board: string; version: number }): string {
   const nodes = new Map(graph.nodes.map((n) => [n.id, n]))
   const edgeByRef = new Map(graph.edges.map((e) => [e.ref, e]))
+  const strokeTotal = graph.strokes.length + graph.strokeGroups.reduce((sum, g) => sum + g.count, 0)
   const counts = [
     `${graph.nodes.length} 个节点`,
     `${graph.edges.length} 条连线`,
     graph.notes.length ? `${graph.notes.length} 段文字` : '',
-    graph.strokes.length ? `${graph.strokes.length} 笔手绘` : '',
+    strokeTotal ? `${strokeTotal} 笔手绘` : '',
     graph.images.length ? `${graph.images.length} 张图片` : '',
     graph.lines.length ? `${graph.lines.length} 条线条` : ''
   ].filter(Boolean)
   const out: string[] = [`画板「${meta.board}」v${meta.version}：${counts.join('，')}`]
 
-  if (graph.nodes.length === 0 && graph.notes.length === 0 && graph.strokes.length === 0 && graph.images.length === 0) {
+  if (graph.nodes.length === 0 && graph.notes.length === 0 && strokeTotal === 0 && graph.images.length === 0) {
     out.push('（画板是空的）')
     return out.join('\n')
   }
@@ -437,8 +560,12 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
     }
   }
 
-  if (graph.strokes.length) {
+  if (strokeTotal) {
     out.push('手绘：')
+    for (const g of graph.strokeGroups) {
+      const where = g.near ? `，在 ${nodeName(nodes, g.near.id)} ${g.near.position}` : g.region ? `，在画面${g.region}` : ''
+      out.push(`  一组手写或涂鸦（${g.count} 笔）${where}，内容请看附图`)
+    }
     const shapeName = { loop: '一个圈', straight: '一条直线', curve: '一条曲线或涂鸦' }
     for (const s of graph.strokes.slice(0, MAX_LISTED_STROKES)) {
       const parts = [shapeName[s.shape]]
