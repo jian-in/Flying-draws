@@ -294,7 +294,24 @@ type Status =
 export default function App() {
   const [api, setApi] = useState<Api | null>(null)
   const [status, setStatus] = useState<Status>({ kind: 'loading' })
-  const [hub, setHub] = useState<HubState>({ pending: [], agentWaiting: false })
+  const [hub, setHub] = useState<HubState>({ pending: [], agentWaiting: false, inbox: 0 })
+  const [toast, setToast] = useState<string | null>(null)
+  const hubRef = useRef(hub)
+  hubRef.current = hub
+
+  // 几秒后自动消失的提示
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 4000)
+    return () => clearTimeout(t)
+  }, [toast])
+
+  // 收件箱里的画被 agent 取走了：告诉用户一声
+  const lastInbox = useRef(0)
+  useEffect(() => {
+    if (hub.inbox < lastInbox.current) setToast('agent 已经取走你的画')
+    lastInbox.current = hub.inbox
+  }, [hub.inbox])
   const [composing, setComposing] = useState(false)
   const [initialData] = useState(() =>
     window.sketchlink.loadBoard().then((res) => {
@@ -384,8 +401,11 @@ export default function App() {
   const submit = useCallback(
     async (requestId: string | null, note: string) => {
       if (!apiRef.current) return
+      // 有 agent 正等着（或者这是在回应它的请求）时，画会直接交到它手上；否则先放进收件箱
+      const direct = requestId !== null || hubRef.current.agentWaiting
       const snap = await snapshot(apiRef.current, true)
       await window.sketchlink.submit({ requestId, note, ...snap })
+      if (direct) setToast('agent 已经收到你的画')
       lastSavedVersion.current = elementsVersion(apiRef.current.getSceneElements())
       setComposing(false)
     },
@@ -473,13 +493,26 @@ export default function App() {
       ) : composing ? (
         <Banner
           title="把当前画布发给 agent"
-          prompt={hub.agentWaiting ? 'agent 正在等你的画。' : 'agent 下次读取时会收到。'}
+          prompt={
+            hub.agentWaiting
+              ? 'agent 正在等你的画，发出后它马上就能看到。'
+              : 'agent 现在没在等。发出后要在聊天里跟它说一声「画好了」，它才会来取。'
+          }
           onSend={(note) => submit(null, note)}
           onCancel={() => setComposing(false)}
           cancelLabel="取消"
         />
       ) : hub.agentWaiting ? (
         <div className="sl-waiting">agent 正在等你：画好后点右上角「发给 agent」</div>
+      ) : hub.inbox > 0 ? (
+        <div className="sl-waiting">
+          已发出{hub.inbox > 1 ? ` ${hub.inbox} 份` : ''}，agent 还没来取。在聊天里跟它说一声「画好了」
+        </div>
+      ) : null}
+      {toast ? (
+        <div className="sl-toast" role="status">
+          {toast}
+        </div>
       ) : null}
     </>
   )

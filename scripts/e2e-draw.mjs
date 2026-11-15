@@ -267,6 +267,32 @@ try {
   check(vanished.isError && /"完成"\) was deleted after version/.test(textOf(vanished)), '要连的节点被用户删了：冲突，并说明是哪个')
   check(!/「归档」/.test((await readNow()).t), '冲突时整批都没画')
 
+  // ---------- 用户主动"发给 agent"：发出后要有反馈 ----------
+  const notice = () => user.js(`document.querySelector('.sl-waiting')?.innerText ?? null`)
+  const toast = () => user.js(`document.querySelector('.sl-toast')?.innerText ?? null`)
+  const until = async (fn, ms = 6000) => {
+    for (const end = Date.now() + ms; Date.now() < end; await sleep(150)) if (await fn()) return true
+    return false
+  }
+  await user.click('发给 agent')
+  check(/没在等/.test((await user.waitForBanner()) ?? ''), '没有 agent 在等时，发送前就说明要在聊天里说一声')
+  await user.typeNote('看一下这版')
+  await user.click('发送')
+  check(await until(async () => /已发出，agent 还没来取/.test((await notice()) ?? '')), '发出后画布上显示"已发出，agent 还没来取"')
+  await user.screenshot(join(OUT, 'sent-waiting.png'))
+  const fetched = textOf(await call('canvas_read', { image: 'never' }))
+  check(/pressed "Send to agent"/.test(fetched) && /看一下这版/.test(fetched), 'agent 直接读画布时，一并拿到用户发的附言')
+  check(await until(async () => /已经取走/.test((await toast()) ?? '')) && (await notice()) === null, '被取走后提示消失，并告诉用户 agent 取走了')
+  check(!/pressed "Send to agent"/.test(textOf(await call('canvas_read', { image: 'never' }))), '同一份不会交给 agent 两次')
+  // agent 正等着的时候发：直接交到它手上
+  const inboxWait = call('canvas_wait', { timeout_s: 30, image: 'never' })
+  await until(async () => /正在等你/.test((await notice()) ?? ''))
+  await user.click('发给 agent')
+  await user.waitForBanner()
+  await user.click('发送')
+  check(/The user sent the canvas/.test(textOf(await inboxWait)), 'agent 正在等时，发出的画直接交到它手上')
+  check(await until(async () => /已经收到/.test((await toast()) ?? '')), '并告诉用户 agent 已经收到')
+
   // ---------- 提议层：agent 画出理解，用户确认 ----------
   const proposalOps = [
     { op: 'add_node', id: 'cache', label: '查缓存', shape: 'diamond' },

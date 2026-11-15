@@ -381,7 +381,9 @@ const routes = {
       snap = await takeSnapshot(true)
       res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64)
     }
-    return res
+    // 用户之前点过"发给 agent"但还没人来取的，这次读取就算取走了：把附言带上
+    const sent = hub.takeInbox().map((s) => ({ note: s.note, at: s.at }))
+    return { ...res, sent }
   },
 
   '/draw': (body: Record<string, unknown>) =>

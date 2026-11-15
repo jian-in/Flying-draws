@@ -175,12 +175,19 @@ server.registerTool(
     description:
       'Read what is currently drawn on the Sketchlink canvas. Returns a description of nodes (boxes with their text), ' +
       'arrows between them, free text notes and where they sit, and hand-drawn strokes. ' +
-      'The first line shows the canvas version (e.g. v12). Node ids like N1 are valid only for that version. Use this when the user says they drew something or refers to "the canvas" / "my sketch".',
+      'The first line shows the canvas version (e.g. v12). Node ids like N1 are valid only for that version. Use this right away when the user says they drew something, sent you the canvas, or refers to "the canvas" / "my sketch": ' +
+      'the canvas cannot notify you by itself, so a drawing the user sent just waits until you read it.',
     inputSchema: { format: formatSchema, image: imageSchema }
   },
   ({ format, image }) => guarded(async () => {
     const res = await daemon('/read', { format: format ?? 'summary', image: image ?? 'auto' }, 20_000)
-    return { content: boardContent(res) }
+    // 用户之前主动点过"发给 agent"的，这次读取一并交给 agent
+    const sent = (Array.isArray(res.sent) ? res.sent : []) as { note: string }[]
+    const notes = sent.map((s) => s.note).filter(Boolean)
+    const header = sent.length
+      ? `The user pressed "Send to agent" on the canvas${notes.length ? ` with this note: ${notes.map((n) => `"${n}"`).join(' / ')}` : ' (no note)'}. This is the canvas now:`
+      : undefined
+    return { content: boardContent(res, header) }
   })
 )
 

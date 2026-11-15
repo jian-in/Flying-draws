@@ -4,6 +4,7 @@ declare global {
   interface HubState {
     pending: { id: string; kind: 'draw' | 'proposal'; proposalId: string | null; prompt: string; createdAt: string }[]
     agentWaiting: boolean
+    inbox: number
   }
 
   interface Window {

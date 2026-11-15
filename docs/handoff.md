@@ -145,6 +145,7 @@ scripts/e2e.mjs        端到端测试
 
 **其他待定**
 - 用户主动"发给 agent"但还没被 agent 取走的画（收件箱）只在内存里，应用重启后会丢。等待中的请求已经会存盘了
+- **画布没法主动叫醒 agent**（MCP 是 agent 来问工具）。用户点了"发给 agent"而 agent 没在等时，画只能放在收件箱里，要用户在聊天里说一声。画布上现在会明说这一点：发送前提示"要在聊天里说一声"，发出后显示"已发出，agent 还没来取"，被取走时提示"agent 已经取走你的画"。`canvas_read` 和不带 `request_id` 的 `canvas_wait` 都会取走收件箱里的画和附言。想真正做到"发了就到"，得用 MCP 的资源订阅通知（design.md 第 7 节末尾），而且客户端要支持
 - 桥接靠 `require('electron')` 找可执行文件，Electron 现在是 devDependency；做成可分发的 npm 包时要重新设计启动方式
 - 只有一块画板 `default`，多画板还没做
 - 摘要只有中文

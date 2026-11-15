@@ -42,6 +42,7 @@ interface Waiter {
 export interface HubState {
   pending: { id: string; kind: RequestKind; proposalId: string | null; prompt: string; createdAt: string }[]
   agentWaiting: boolean // 有 agent 正在长轮询等待用户
+  inbox: number // 用户主动发出、agent 还没取走的画有几份
 }
 
 export class RequestHub {
@@ -59,7 +60,16 @@ export class RequestHub {
     const pending = [...this.requests.values()]
       .filter((r) => r.status === 'waiting')
       .map(({ id, kind, proposalId, prompt, createdAt }) => ({ id, kind, proposalId, prompt, createdAt }))
-    return { pending, agentWaiting: this.waiters.size > 0 }
+    return { pending, agentWaiting: this.waiters.size > 0, inbox: this.inbox.length }
+  }
+
+  // agent 直接读画布时，顺便把收件箱里还没取走的都交给它
+  takeInbox(): Submission[] {
+    if (!this.inbox.length) return []
+    const taken = this.inbox
+    this.inbox = []
+    this.emit()
+    return taken
   }
 
   private emit(): void {
@@ -131,7 +141,9 @@ export class RequestHub {
       if (req.status === 'submitted' && req.submission) return Promise.resolve({ status: 'submitted', submission: req.submission })
       if (req.status === 'cancelled') return Promise.resolve({ status: 'cancelled', requestId: req.id })
     } else if (this.inbox.length) {
-      return Promise.resolve({ status: 'submitted', submission: this.inbox.shift()! })
+      const submission = this.inbox.shift()!
+      this.emit() // 让画布知道这一份被取走了
+      return Promise.resolve({ status: 'submitted', submission })
     }
 
     return new Promise((resolve) => {
