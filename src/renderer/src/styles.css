@@ -1,0 +1,29 @@
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+.sl-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-gray-70, #555);
+  white-space: nowrap;
+}
+
+.sl-status button {
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--default-border-color, #ccc);
+  background: var(--island-bg-color, #fff);
+  color: inherit;
+  cursor: pointer;
+}
+
+.sl-status .sl-error {
+  color: #c92a2a;
+}
