@@ -8,10 +8,15 @@ export interface Submission {
   pngBase64: string | null
   version: number
   at: string
+  decision?: 'accepted' | 'rejected' | null // 只有回应提议时才有
 }
+
+export type RequestKind = 'draw' | 'proposal' // draw：请用户画；proposal：agent 画了提议，请用户确认
 
 export interface DrawRequest {
   id: string
+  kind: RequestKind
+  proposalId: string | null // 提议层元素上打的标记，页面靠它找到这批元素
   prompt: string
   createdAt: string
   status: 'waiting' | 'submitted' | 'cancelled'
@@ -33,7 +38,7 @@ interface Waiter {
 }
 
 export interface HubState {
-  pending: { id: string; prompt: string; createdAt: string }[]
+  pending: { id: string; kind: RequestKind; proposalId: string | null; prompt: string; createdAt: string }[]
   agentWaiting: boolean // 有 agent 正在长轮询等待用户
 }
 
@@ -51,7 +56,7 @@ export class RequestHub {
   state(): HubState {
     const pending = [...this.requests.values()]
       .filter((r) => r.status === 'waiting')
-      .map(({ id, prompt, createdAt }) => ({ id, prompt, createdAt }))
+      .map(({ id, kind, proposalId, prompt, createdAt }) => ({ id, kind, proposalId, prompt, createdAt }))
     return { pending, agentWaiting: this.waiters.size > 0 }
   }
 
@@ -59,10 +64,12 @@ export class RequestHub {
     this.listener?.(this.state())
   }
 
-  create(prompt: string): DrawRequest {
+  create(prompt: string, proposalId: string | null = null): DrawRequest {
     this.seq += 1
     const req: DrawRequest = {
       id: `req_${Date.now().toString(36)}_${this.seq}`,
+      kind: proposalId ? 'proposal' : 'draw',
+      proposalId,
       prompt,
       createdAt: new Date().toISOString(),
       status: 'waiting',

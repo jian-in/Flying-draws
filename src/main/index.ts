@@ -14,6 +14,10 @@ import { startDaemon } from './daemon'
 // 测试用它开一个和用户画板完全隔离的实例（单实例锁也是按 userData 目录算的）。
 const HOME = process.env['SKETCHLINK_HOME'] || join(homedir(), '.sketchlink')
 if (process.env['SKETCHLINK_HOME']) app.setPath('userData', join(HOME, 'electron-data'))
+// 端到端测试要在页面里点按钮，用这个变量打开 Chrome DevTools 端口。只在隔离实例上认。
+if (process.env['SKETCHLINK_HOME'] && process.env['SKETCHLINK_DEBUG_PORT']) {
+  app.commandLine.appendSwitch('remote-debugging-port', String(Number(process.env['SKETCHLINK_DEBUG_PORT'])))
+}
 const BOARDS_DIR = join(HOME, 'boards')
 const BOARD_ID = 'default'
 const boardPath = join(BOARDS_DIR, `${BOARD_ID}.excalidraw`)
@@ -195,6 +199,49 @@ function serialized<T>(fn: () => Promise<T>): Promise<T> {
 
 const newElementId = (): string => `sl_${randomBytes(8).toString('hex')}`
 
+// /draw 和 /propose 共用：把一批指令画到画布上。proposalId 不为空时画在提议层上。
+// 要在 serialized() 里面调用。
+async function drawOps(
+  body: Record<string, unknown>,
+  proposalId: string | null
+): Promise<{ ok: boolean; result: Record<string, unknown> }> {
+  // 先拿页面上的最新状态，版本号以它为准（用户刚画的几笔可能还没落盘）
+  const snap = await takeSnapshot(false)
+  const ver = await acceptScene(snap.sceneJson)
+  const graph = buildGraph((JSON.parse(snap.sceneJson).elements ?? []) as SceneElement[])
+  const current = () => describe(snap.sceneJson, ver, { format: 'summary', image: 'never' }, null)
+
+  let plan: DrawPlan
+  try {
+    plan = planOps(body.ops as DrawOp[], graph, newElementId, { direction: body.direction === 'down' ? 'down' : 'right' })
+  } catch (err) {
+    if (err instanceof OpsError) return { ok: false, result: { status: 'invalid', error: err.message, ...current() } }
+    throw err
+  }
+  // N1 这类编号只在某一个版本里有效。引用了已有节点，就必须基于当前版本；
+  // 只新增、不引用已有节点的指令在任何版本上都能执行，不算冲突。
+  if (plan.existingRefs.length && Number(body.base_version) !== ver) {
+    return { ok: false, result: { status: 'conflict', ...current() } }
+  }
+
+  const applied = await rpc<{ sceneJson: string }>('applyPlan', { plan, proposalId }, 12_000)
+  const newVer = await acceptScene(applied.sceneJson)
+  const after = buildGraph((JSON.parse(applied.sceneJson).elements ?? []) as SceneElement[])
+  const nodeIds: Record<string, string> = {}
+  for (const n of plan.nodes) {
+    const node = after.nodes.find((x) => x.ref === n.elementId)
+    if (node) nodeIds[n.key] = node.id
+  }
+  return {
+    ok: true,
+    result: {
+      added: { nodes: plan.nodes.length, edges: plan.edges.length, texts: plan.texts.length },
+      node_ids: nodeIds,
+      ...describe(applied.sceneJson, newVer, { format: 'summary', image: 'never' }, null)
+    }
+  }
+}
+
 const routes = {
   '/open': async () => {
     bringToFront()
@@ -221,39 +268,22 @@ const routes = {
   '/draw': (body: Record<string, unknown>) =>
     serialized(async () => {
       if (!win || win.isMinimized()) bringToFront()
-      // 先拿页面上的最新状态，版本号以它为准（用户刚画的几笔可能还没落盘）
-      const snap = await takeSnapshot(false)
-      const ver = await acceptScene(snap.sceneJson)
-      const graph = buildGraph((JSON.parse(snap.sceneJson).elements ?? []) as SceneElement[])
-      const current = () => describe(snap.sceneJson, ver, { format: 'summary', image: 'never' }, null)
+      const res = await drawOps(body, null)
+      return res.ok ? { status: 'drawn', ...res.result } : res.result
+    }),
 
-      let plan: DrawPlan
-      try {
-        plan = planOps(body.ops as DrawOp[], graph, newElementId, { direction: body.direction === 'down' ? 'down' : 'right' })
-      } catch (err) {
-        if (err instanceof OpsError) return { status: 'invalid', error: err.message, ...current() }
-        throw err
-      }
-      // N1 这类编号只在某一个版本里有效。引用了已有节点，就必须基于当前版本；
-      // 只新增、不引用已有节点的指令在任何版本上都能执行，不算冲突。
-      if (plan.existingRefs.length && Number(body.base_version) !== ver) {
-        return { status: 'conflict', ...current() }
-      }
-
-      const applied = await rpc<{ sceneJson: string }>('applyPlan', plan, 12_000)
-      const newVer = await acceptScene(applied.sceneJson)
-      const after = buildGraph((JSON.parse(applied.sceneJson).elements ?? []) as SceneElement[])
-      const nodeIds: Record<string, string> = {}
-      for (const n of plan.nodes) {
-        const node = after.nodes.find((x) => x.ref === n.elementId)
-        if (node) nodeIds[n.key] = node.id
-      }
-      return {
-        status: 'drawn',
-        added: { nodes: plan.nodes.length, edges: plan.edges.length, texts: plan.texts.length },
-        node_ids: nodeIds,
-        ...describe(applied.sceneJson, newVer, { format: 'summary', image: 'never' }, null)
-      }
+  // 画在提议层上，并弹出横幅请用户确认。结果用 /wait 等。
+  '/propose': (body: Record<string, unknown>) =>
+    serialized(async () => {
+      const question = String(body.question ?? '').trim()
+      if (!question) throw new Error('question is required')
+      const proposalId = `prop_${randomBytes(6).toString('hex')}`
+      const res = await drawOps(body, proposalId)
+      if (!res.ok) return res.result
+      // 画成功了才弹横幅，不然用户会看到一个没有内容的确认请求
+      const req = hub.create(question, proposalId)
+      bringToFront()
+      return { status: 'proposed', request_id: req.id, ...res.result }
     }),
 
   '/request': async (body: Record<string, unknown>) => {
@@ -273,6 +303,7 @@ const routes = {
     return {
       status: 'submitted',
       request_id: sub.requestId,
+      decision: sub.decision ?? null,
       note: sub.note,
       submitted_at: sub.at,
       ...describe(sub.sceneJson, sub.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, sub.pngBase64)
@@ -290,10 +321,12 @@ ipcMain.handle('board:save', async (_e, json: unknown) => {
 })
 ipcMain.handle('board:reveal', () => shell.showItemInFolder(boardPath))
 ipcMain.handle('hub:state', () => hub.state())
-ipcMain.handle('hub:submit', async (_e, payload: { requestId: string | null; note: string; sceneJson: string; pngBase64: string | null }) => {
+type SubmitPayload = { requestId: string | null; note: string; sceneJson: string; pngBase64: string | null; decision?: 'accepted' | 'rejected' | null }
+ipcMain.handle('hub:submit', async (_e, payload: SubmitPayload) => {
   const ver = await acceptScene(payload.sceneJson)
   const sub: Submission = {
     requestId: payload.requestId,
+    decision: payload.decision === 'accepted' || payload.decision === 'rejected' ? payload.decision : null,
     note: String(payload.note ?? '').trim(),
     sceneJson: payload.sceneJson,
     pngBase64: payload.pngBase64,

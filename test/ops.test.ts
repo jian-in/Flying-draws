@@ -187,3 +187,21 @@ test('agent 画的元素在摘要里单独标出来', () => {
   assert.match(s, /N3 （无文字）矩形【agent 画的】/)
   assert.doesNotMatch(s, /N1 .*agent 画的/)
 })
+
+test('还没确认的提议和已经画上去的分开标', () => {
+  const proposed: SceneElement = {
+    id: 'rp',
+    type: 'rectangle',
+    x: 0,
+    y: 200,
+    width: 100,
+    height: 60,
+    customData: { sketchlink: { author: 'agent', layer: 'proposal' } }
+  }
+  const g = buildGraph([...existing, proposed])
+  assert.deepEqual(
+    g.nodes.map((n) => n.proposed),
+    [false, false, true]
+  )
+  assert.match(summarize(g, { board: 't', version: 1 }), /N3 （无文字）矩形【agent 的提议，用户还没确认】/)
+})

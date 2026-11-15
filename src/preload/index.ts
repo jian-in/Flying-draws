@@ -10,7 +10,13 @@ contextBridge.exposeInMainWorld('sketchlink', {
   onHubState: (fn: (state: unknown) => void) => {
     ipcRenderer.on('hub:state', (_e, state) => fn(state))
   },
-  submit: (payload: { requestId: string | null; note: string; sceneJson: string; pngBase64: string | null }) =>
+  submit: (payload: {
+    requestId: string | null
+    note: string
+    sceneJson: string
+    pngBase64: string | null
+    decision?: 'accepted' | 'rejected' | null
+  }) =>
     ipcRenderer.invoke('hub:submit', payload),
   cancel: (requestId: string) => ipcRenderer.invoke('hub:cancel', requestId),
 

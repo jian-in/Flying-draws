@@ -15,7 +15,7 @@ Sketchlink（暂定名）：本地桌面画布（Electron + Excalidraw），通�
 | M1「画给 agent 看」 | ✅ 代码完成，单元测试和端到端测试通过；用户已在真实画布上手写字、经 MCP 读到并靠截图认出 | `6ee92fc` |
 | M2-a 写入通路 | ✅ `canvas_draw` 纯新增（节点、连线、文字），单元测试和隔离画板上的端到端测试通过；还没在真实 agent 会话里用过 | 见 git log |
 | M2-b 自动排版 | ✅ 新节点用 dagre 排版，可选从左到右或从上到下；箭头按图形轮廓起止，跨层连线会绕开节点。测试情况同上 | 见 git log |
-| M2-c 提议层 | 未开始 | — |
+| M2-c 提议层 | ✅ `canvas_propose`：agent 画的提议是蓝色虚线半透明，用户点接受或拒绝，结果经 `canvas_wait` 回到 agent。测试情况同上，端到端测试里用 DevTools 扮演用户点了按钮 | 见 git log |
 | M2-d diff 和并发 | 未开始 | — |
 
 - 远程：GitHub 仓库 `jian-in/Freedom-draw`，本地 `master` 跟踪 `origin/master`。
@@ -45,6 +45,8 @@ npm run e2e                                    # 截图输出到 out/e2e/
 npm run e2e:draw     # 自己拉起一个隔离实例，画板在 out/e2e-home，截图在 out/e2e/draw.png
 ```
 
+它还会用 DevTools 端口 9334 在页面里点按钮，扮演用户接受和拒绝提议（隔离实例上设了 `SKETCHLINK_DEBUG_PORT` 才会开这个端口）。提议的截图在 `out/e2e/propose.png` 和 `propose-accepted.png`。
+
 隔离靠环境变量 `SKETCHLINK_HOME`：设了它，画板、`daemon.json` 和 Electron 的 userData 都放到那个目录下，可以和用户开着的画布同时运行。**凡是会往画布上写东西的测试都要用它。**
 
 ## 代码地图
@@ -66,7 +68,11 @@ scripts/e2e.mjs        端到端测试
 
 写的数据流（`canvas_draw`）：主进程先取快照定版本号 → `planOps()` 出绘图计划 → 页面的 `applyPlan()` 用 Excalidraw 的 `convertToExcalidrawElements` 生成元素、打上作者标记、绑定箭头，再 `updateScene` → 主进程存盘升版本号。所有写入在主进程里排队，一次一批。
 
-作者标记写在元素的 `customData.sketchlink = { author: 'agent', layer: 'final' }`。已在 Excalidraw 0.18.1 里确认：`customData` 是所有元素都有的可选字段，新建、载入、导出时都原样保留。没有这个标记的元素都算用户画的。
+提议的数据流（`canvas_propose`）：和 `canvas_draw` 走同一个 `drawOps()`，只是元素打上 `layer: 'proposal'` 和提议编号，画成功后在请求队列里建一个 `kind: 'proposal'` 的请求。用户点按钮时，页面的 `resolveProposal()` 把这批元素改成正式内容或删掉，再走原有的"发送"通路，多带一个 `decision`。
+
+外观约定：agent 画的东西一律蓝色（`#1971c2`）；还没确认的提议再加虚线和 55% 透明度；接受后变实线、不透明，仍是蓝色。用户在提议上改过的地方（拖动、改字、删掉一部分）接受时原样保留。
+
+作者标记写在元素的 `customData.sketchlink = { author: 'agent', layer: 'final' }`（提议是 `layer: 'proposal'`，另带 `proposal: 提议编号`）。已在 Excalidraw 0.18.1 里确认：`customData` 是所有元素都有的可选字段，新建、载入、导出时都原样保留。没有这个标记的元素都算用户画的。
 
 ## MCP 工具
 
@@ -76,6 +82,7 @@ scripts/e2e.mjs        端到端测试
 | `canvas_read` | `format: summary/graph`，`image: auto/always/never`；auto 只在有涂鸦、图片、线条时附图 |
 | `canvas_request` | 弹出请求横幅，立即返回 `request_id` |
 | `canvas_wait` | 最多等 45 秒；带 `request_id` 等那个请求，不带就等用户主动"发给 agent" |
+| `canvas_propose` | 参数同 `canvas_draw`，另加 `question`。画在提议层上并弹出确认横幅，立即返回 `request_id`；用 `canvas_wait` 等结果，`decision` 是 `accepted` 或 `rejected` |
 | `canvas_draw` | `ops`（`add_node` / `add_edge` / `add_text`）整批生效或整批不生效；只能新增。`direction: right/down` 定排版方向。引用已有节点（N1 这类编号）时必须带 `base_version`，版本对不上返回冲突和当前画板 |
 
 工具描述是英文（给各种 agent 用），返回的画板描述是中文。国际化还没做。
@@ -113,11 +120,12 @@ scripts/e2e.mjs        端到端测试
 - 只有三种新增指令。`move`、`update`、`delete` 这些要改动已有元素，得先有 M2-d 的冲突判断，而且 agent 只能动自己画的（design.md 12.4）。
 - 冲突判断比 design.md 12.3 粗：只要引用了已有节点，`base_version` 就必须等于当前版本，不管那些节点有没有被动过。原因是 N1 这类编号按阅读顺序生成，画板一变就可能指向别的节点。要放宽得先给节点一个跨版本稳定的编号。
 - 用户正在画一笔时，页面最多等 8 秒，超时就报错让 agent 重试；还没有 12.4 节说的"agent 有内容要画"提示。
-- agent 画的东西在画布上和用户画的长得一样，只在读取时标【agent 画的】。颜色区分放到提议层一起做。
+- **提议没处理完就重启应用**：请求队列只在内存里，重启后横幅没了，但蓝色虚线的元素还留在画布上，没有按钮可以接受或拒绝（用户可以手动删）。要解决得把待处理的提议存盘，或者启动时把残留的提议层元素清掉。
+- 用户接受提议时，agent 只知道"接受了"和接受后的整张画，不知道用户具体改了哪几处。这就是 M2-d 要做的 diff。
+- 同时有多个待处理的请求时，横幅只显示最早的那个。
 - agent 画的一批可以用撤销去掉（`CaptureUpdateAction.IMMEDIATELY`），这一点只看了接口说明，没有实际按过撤销验证。
 
 **M2 后面几步**（设计见 design.md 第 4.3、7、12 节）
-- M2-c：`canvas_propose` 和提议层，agent 画的东西半透明另一种颜色，用户接受或修改后合并
 - M2-d：用户修改提议后的 diff，按元素判断冲突
 
 **其他待定**

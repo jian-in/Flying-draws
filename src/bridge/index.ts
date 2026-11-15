@@ -210,10 +210,10 @@ server.registerTool(
     title: 'Wait for the user\'s drawing',
     description:
       'Wait until the user presses "Send" on the canvas, for at most timeout_s seconds (max 45). ' +
-      'With request_id: waits for the answer to that canvas_request. Without it: waits for the user to send the canvas on their own. ' +
+      'With request_id: waits for the answer to that canvas_request or canvas_propose. Without it: waits for the user to send the canvas on their own. ' +
       'If the result says the user is still drawing, call canvas_wait again. After about 3 empty waits, stop and tell the user in the chat that you are waiting for their drawing instead of retrying silently.',
     inputSchema: {
-      request_id: z.string().optional().describe('The id returned by canvas_request.'),
+      request_id: z.string().optional().describe('The id returned by canvas_request or canvas_propose.'),
       timeout_s: z.number().int().min(1).max(45).optional().describe('How long to wait, in seconds. Default 40.'),
       format: formatSchema,
       image: imageSchema
@@ -225,6 +225,17 @@ server.registerTool(
     switch (res.status) {
       case 'submitted': {
         const note = res.note ? `The user's note: "${res.note}"` : 'The user added no note.'
+        if (res.decision === 'accepted') {
+          return {
+            content: boardContent(
+              res,
+              `The user ACCEPTED your proposal. It is now part of the canvas; they may have adjusted it first, so read the canvas below rather than assuming it matches what you drew. ${note}`
+            )
+          }
+        }
+        if (res.decision === 'rejected') {
+          return { content: boardContent(res, `The user REJECTED your proposal and it was removed from the canvas. ${note}`) }
+        }
         return { content: boardContent(res, `The user sent the canvas. ${note}`) }
       }
       case 'waiting':
@@ -263,6 +274,72 @@ const opSchema = z.discriminatedUnion('op', [
   })
 ])
 
+const directionSchema = z
+  .enum(['right', 'down'])
+  .optional()
+  .describe('Which way the new nodes flow: "right" (default, left to right) or "down" (top to bottom).')
+const baseVersionSchema = z
+  .number()
+  .int()
+  .optional()
+  .describe('The canvas version from your latest canvas_read. Required when ops refer to existing nodes (N1, N2, ...); otherwise optional.')
+
+// 画图没成功时（版本冲突、指令有问题）给 agent 的说明，canvas_draw 和 canvas_propose 共用
+function drawFailure(res: Record<string, unknown>, baseVersion: number | undefined): { content: Content[]; isError: true } | null {
+  if (res.status === 'conflict') {
+    return {
+      content: boardContent(
+        res,
+        `Nothing was drawn: the canvas changed since version ${baseVersion ?? '(none given)'} and is now at version ${res.version}, so node ids like N1 may point to different nodes. ` +
+          `Here is the current canvas. Rebuild your ops from it and call the tool again with base_version ${res.version}.`
+      ),
+      isError: true
+    }
+  }
+  if (res.status === 'invalid') {
+    return { content: boardContent(res, `Nothing was drawn: ${res.error}\nThe current canvas:`), isError: true }
+  }
+  return null
+}
+
+const newNodeIds = (res: Record<string, unknown>): string =>
+  Object.entries((res.node_ids ?? {}) as Record<string, string>)
+    .map(([key, id]) => `${key} = ${id}`)
+    .join(', ')
+
+server.registerTool(
+  'canvas_propose',
+  {
+    title: 'Draw your understanding and ask the user to confirm',
+    description:
+      'Draw your understanding or plan on the canvas as a proposal (shown in dashed blue) and ask the user to confirm it. ' +
+      'Use this instead of canvas_draw when you are not sure you understood the user: they can accept it, reject it, or fix it directly on the canvas and then accept. ' +
+      'Takes the same ops as canvas_draw. Returns a request_id immediately; then call canvas_wait with that request_id to get the answer. ' +
+      'If accepted, the proposal becomes part of the canvas (including any changes the user made to it). If rejected, it is removed.',
+    inputSchema: {
+      ops: z.array(opSchema).min(1).describe('What to draw as the proposal, applied together as one batch.'),
+      question: z.string().min(1).describe('What you want the user to confirm, in the user\'s language, e.g. "Is this the flow you meant?". Shown on the canvas.'),
+      direction: directionSchema,
+      base_version: baseVersionSchema
+    }
+  },
+  ({ ops, question, direction, base_version }) => guarded(async () => {
+    const res = await daemon('/propose', { ops, question, direction, base_version }, 30_000)
+    const failure = drawFailure(res, base_version)
+    if (failure) return failure
+    if (res.status !== 'proposed') return text(JSON.stringify(res))
+    const ids = newNodeIds(res)
+    return {
+      content: boardContent(
+        res,
+        `Proposal ${res.request_id} is shown on the canvas and the user is being asked: "${question}". ` +
+          `Now call canvas_wait with request_id "${res.request_id}" to get their answer.` +
+          (ids ? ` Your proposed nodes: ${ids}.` : '')
+      )
+    }
+  })
+)
+
 server.registerTool(
   'canvas_draw',
   {
@@ -274,44 +351,21 @@ server.registerTool(
       'Returns the updated canvas description. Things you drew are marked as drawn by the agent in later reads.',
     inputSchema: {
       ops: z.array(opSchema).min(1).describe('What to add, applied together as one batch: either all of it is drawn or none.'),
-      direction: z
-        .enum(['right', 'down'])
-        .optional()
-        .describe('Which way the new nodes flow: "right" (default, left to right) or "down" (top to bottom).'),
-      base_version: z
-        .number()
-        .int()
-        .optional()
-        .describe('The canvas version from your latest canvas_read. Required when ops refer to existing nodes (N1, N2, ...); otherwise optional.')
+      direction: directionSchema,
+      base_version: baseVersionSchema
     }
   },
   ({ ops, base_version, direction }) => guarded(async () => {
     const res = await daemon('/draw', { ops, base_version, direction }, 30_000)
-    switch (res.status) {
-      case 'drawn': {
-        const added = res.added as { nodes: number; edges: number; texts: number }
-        const ids = Object.entries((res.node_ids ?? {}) as Record<string, string>)
-          .map(([key, id]) => `${key} = ${id}`)
-          .join(', ')
-        const header =
-          `Drawn: ${added.nodes} node(s), ${added.edges} arrow(s), ${added.texts} text(s). The canvas is now at version ${res.version}.` +
-          (ids ? ` Your new nodes: ${ids}.` : '')
-        return { content: boardContent(res, header) }
-      }
-      case 'conflict':
-        return {
-          content: boardContent(
-            res,
-            `Nothing was drawn: the canvas changed since version ${base_version ?? '(none given)'} and is now at version ${res.version}, so node ids like N1 may point to different nodes. ` +
-              `Here is the current canvas. Rebuild your ops from it and call canvas_draw again with base_version ${res.version}.`
-          ),
-          isError: true
-        }
-      case 'invalid':
-        return { content: boardContent(res, `Nothing was drawn: ${res.error}\nThe current canvas:`), isError: true }
-      default:
-        return text(JSON.stringify(res))
-    }
+    const failure = drawFailure(res, base_version)
+    if (failure) return failure
+    if (res.status !== 'drawn') return text(JSON.stringify(res))
+    const added = res.added as { nodes: number; edges: number; texts: number }
+    const ids = newNodeIds(res)
+    const header =
+      `Drawn: ${added.nodes} node(s), ${added.edges} arrow(s), ${added.texts} text(s). The canvas is now at version ${res.version}.` +
+      (ids ? ` Your new nodes: ${ids}.` : '')
+    return { content: boardContent(res, header) }
   })
 )
 

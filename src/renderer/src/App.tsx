@@ -78,8 +78,13 @@ type SkeletonList = NonNullable<Parameters<typeof convertToExcalidrawElements>[0
 type SceneElementList = ReturnType<Api['getSceneElementsIncludingDeleted']>
 type SceneEl = SceneElementList[number]
 
+// agent 画的东西一律用蓝色，和用户画的区分开。还没确认的提议再加上虚线和半透明。
+const AGENT_COLOR = '#1971c2'
+const PROPOSAL_OPACITY = 55
+
 // 把主进程排好的绘图计划画到画布上。只新增元素；已有元素只会被补上"有箭头连着我"的记录。
-async function applyPlan(api: Api, plan: DrawPlan): Promise<{ sceneJson: string }> {
+// proposalId 不为空时画在提议层上，等用户确认。
+async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): Promise<{ sceneJson: string }> {
   // 用户优先：等用户手上的动作做完（design.md 12.4）
   const deadline = Date.now() + USER_BUSY_WAIT_MS
   while (userIsBusy(api)) {
@@ -126,8 +131,12 @@ async function applyPlan(api: Api, plan: DrawPlan): Promise<{ sceneJson: string 
   const attach = (nodeId: string, arrowId: string) => {
     arrowsOn.set(nodeId, [...(arrowsOn.get(nodeId) ?? []), { id: arrowId, type: 'arrow' }])
   }
+  const look = proposalId
+    ? { strokeColor: AGENT_COLOR, opacity: PROPOSAL_OPACITY, strokeStyle: 'dashed' as const }
+    : { strokeColor: AGENT_COLOR }
+  const mark = proposalId ? { author: 'agent', layer: 'proposal', proposal: proposalId } : { author: 'agent', layer: 'final' }
   const fresh = created.map((el) => {
-    const tagged = { ...el, customData: { ...el.customData, sketchlink: { author: 'agent', layer: 'final' } } }
+    const tagged = { ...el, ...look, customData: { ...el.customData, sketchlink: mark } }
     const edge = edgeById.get(el.id)
     if (!edge || el.type !== 'arrow') return tagged
     attach(edge.fromElementId, el.id)
@@ -151,6 +160,34 @@ async function applyPlan(api: Api, plan: DrawPlan): Promise<{ sceneJson: string 
   // 把视野移到新画的内容上，不改缩放
   api.scrollToContent(fresh, { fitToContent: false, animate: true })
   return { sceneJson: (await snapshot(api, false)).sceneJson }
+}
+
+// 用户对一个提议做了决定。接受：提议层上的元素变成正式内容（实线、不透明，仍是蓝色）；
+// 拒绝：删掉。用户在提议上改过的地方原样保留，用户自己删掉的不会回来。
+function resolveProposal(api: Api, proposalId: string, accept: boolean): void {
+  const isProposed = (el: SceneEl): boolean => {
+    const mark = el.customData?.sketchlink
+    return !el.isDeleted && mark?.layer === 'proposal' && mark?.proposal === proposalId
+  }
+  const all = api.getSceneElementsIncludingDeleted()
+  const removed = new Set(accept ? [] : all.filter(isProposed).map((el) => el.id))
+  const elements = all.map((el) => {
+    if (isProposed(el)) {
+      return accept
+        ? newElementWith(el, {
+            opacity: 100,
+            strokeStyle: 'solid',
+            customData: { ...el.customData, sketchlink: { author: 'agent', layer: 'final' } }
+          })
+        : newElementWith(el, { isDeleted: true })
+    }
+    // 删掉提议里的箭头后，把别的节点上"有箭头连着我"的记录也清掉
+    if (removed.size && el.boundElements?.some((b) => removed.has(b.id))) {
+      return newElementWith(el, { boundElements: el.boundElements.filter((b) => !removed.has(b.id)) })
+    }
+    return el
+  })
+  api.updateScene({ elements, captureUpdate: CaptureUpdateAction.IMMEDIATELY })
 }
 
 type Status =
@@ -237,7 +274,8 @@ export default function App() {
           const withImage = Boolean((params as { image?: boolean })?.image)
           window.sketchlink.rpcReply(id, await snapshot(current, withImage))
         } else if (method === 'applyPlan') {
-          window.sketchlink.rpcReply(id, await applyPlan(current, params as DrawPlan))
+          const { plan, proposalId } = params as { plan: DrawPlan; proposalId: string | null }
+          window.sketchlink.rpcReply(id, await applyPlan(current, plan, proposalId))
         } else {
           throw new Error(`unknown method ${method}`)
         }
@@ -258,6 +296,16 @@ export default function App() {
     },
     []
   )
+
+  // 回应 agent 的提议：先把提议层上的元素合并或删掉，再把结果发给 agent
+  const decide = useCallback(async (requestId: string, proposalId: string, accept: boolean, note: string) => {
+    const current = apiRef.current
+    if (!current) return
+    resolveProposal(current, proposalId, accept)
+    const snap = await snapshot(current, true)
+    await window.sketchlink.submit({ requestId, note, decision: accept ? 'accepted' : 'rejected', ...snap })
+    lastSavedVersion.current = elementsVersion(current.getSceneElements())
+  }, [])
 
   const request = hub.pending[0] ?? null
 
@@ -283,7 +331,17 @@ export default function App() {
           </div>
         )}
       />
-      {request ? (
+      {request && request.kind === 'proposal' && request.proposalId ? (
+        <Banner
+          key={request.id}
+          title="agent 画了它的理解（蓝色虚线部分），可以直接在上面改："
+          prompt={request.prompt}
+          onSend={(note) => decide(request.id, request.proposalId!, true, note)}
+          sendLabel="对，就这样"
+          onCancel={(note) => decide(request.id, request.proposalId!, false, note)}
+          cancelLabel="不对，去掉"
+        />
+      ) : request ? (
         <Banner
           key={request.id}
           title="agent 请你画："
@@ -311,22 +369,24 @@ function Banner(props: {
   title: string
   prompt: string
   onSend: (note: string) => Promise<void>
-  onCancel: () => void
+  sendLabel?: string
+  onCancel: (note: string) => void | Promise<void>
   cancelLabel: string
 }) {
   const [note, setNote] = useState('')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const send = async () => {
+  const run = async (action: (note: string) => void | Promise<void>) => {
     setSending(true)
     setError(null)
     try {
-      await props.onSend(note)
+      await action(note)
     } catch (err) {
       setError(String(err))
       setSending(false)
     }
   }
+  const send = () => run(props.onSend)
   return (
     <div className="sl-banner" role="dialog" aria-label={props.title}>
       <div className="sl-banner-title">{props.title}</div>
@@ -343,11 +403,11 @@ function Banner(props: {
       />
       {error ? <div className="sl-error">{error}</div> : null}
       <div className="sl-banner-actions">
-        <button onClick={props.onCancel} disabled={sending}>
+        <button onClick={() => void run(props.onCancel)} disabled={sending}>
           {props.cancelLabel}
         </button>
         <button className="sl-primary" onClick={() => void send()} disabled={sending}>
-          {sending ? '发送中…' : '发送'}
+          {sending ? '发送中…' : (props.sendLabel ?? '发送')}
         </button>
       </div>
     </div>

@@ -28,7 +28,7 @@ export interface SceneElement {
   groupIds?: readonly string[]
   frameId?: string | null
   name?: string | null
-  customData?: { sketchlink?: { author?: string } } | null
+  customData?: { sketchlink?: { author?: string; layer?: string } } | null
 }
 
 export type Author = 'user' | 'agent'
@@ -38,6 +38,11 @@ export function authorOf(el: SceneElement): Author {
   return el.customData?.sketchlink?.author === 'agent' ? 'agent' : 'user'
 }
 
+// 作者，以及是不是还在提议层上（agent 画的提议，用户还没确认）
+function provenance(el: SceneElement): { author: Author; proposed: boolean } {
+  return { author: authorOf(el), proposed: el.customData?.sketchlink?.layer === 'proposal' }
+}
+
 export interface SemanticNode {
   id: string // 给 agent 看的短编号：N1、N2……
   ref: string // Excalidraw 元素 id
@@ -45,6 +50,7 @@ export interface SemanticNode {
   label: string | null
   bbox: Bbox
   author: Author
+  proposed: boolean // true 表示这是 agent 的提议，用户还没确认
 }
 
 export interface SemanticEdge {
@@ -55,6 +61,7 @@ export interface SemanticEdge {
   directed: 'forward' | 'both' | 'none'
   inferred: boolean // true 表示箭头端点没有真正绑定，是按距离猜的
   author: Author
+  proposed: boolean // true 表示这是 agent 的提议，用户还没确认
 }
 
 export interface SemanticNote {
@@ -64,6 +71,7 @@ export interface SemanticNote {
   position: string | null // 相对位置，如"下方"
   bbox: Bbox
   author: Author
+  proposed: boolean // true 表示这是 agent 的提议，用户还没确认
 }
 
 export interface SemanticStroke {
@@ -314,7 +322,7 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     kind: el.type,
     label: el.type === 'text' ? (el.text ?? '').trim() : (boundText.get(el.id) ?? el.name ?? null) || null,
     bbox: bboxOf(el),
-    author: authorOf(el)
+    ...provenance(el)
   }))
   const nodeByRef = new Map(nodes.map((n) => [n.ref, n]))
 
@@ -359,7 +367,7 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     if (start && end) directed = 'both'
     else if (!start && !end) directed = 'none'
     else if (start && !end) [from, to] = [to, from] // 只有起点有箭头，方向反过来
-    edges.push({ ref: el.id, from, to, label: boundText.get(el.id) ?? null, directed, inferred, author: authorOf(el) })
+    edges.push({ ref: el.id, from, to, label: boundText.get(el.id) ?? null, directed, inferred, ...provenance(el) })
     edgeSamples.set(el.id, samplePolyline(pts.length ? pts : [first, last]))
   }
 
@@ -395,7 +403,7 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
       attachedTo: best,
       position: bestBox ? relativePosition(b, bestBox) : null,
       bbox: b,
-      author: authorOf(el)
+      ...provenance(el)
     })
   }
 
@@ -535,7 +543,8 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
   ].filter(Boolean)
   const out: string[] = [`画板「${meta.board}」v${meta.version}：${counts.join('，')}`]
   // 没标的都是用户画的；agent 自己画的单独标出来，方便它分清哪些是用户的原意
-  const byAgent = (x: { author: Author }): string => (x.author === 'agent' ? '【agent 画的】' : '')
+  const byAgent = (x: { author: Author; proposed: boolean }): string =>
+    x.proposed ? '【agent 的提议，用户还没确认】' : x.author === 'agent' ? '【agent 画的】' : ''
 
   if (graph.nodes.length === 0 && graph.notes.length === 0 && strokeTotal === 0 && graph.images.length === 0) {
     out.push('（画板是空的）')

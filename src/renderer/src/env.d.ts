@@ -2,7 +2,7 @@ export {}
 
 declare global {
   interface HubState {
-    pending: { id: string; prompt: string; createdAt: string }[]
+    pending: { id: string; kind: 'draw' | 'proposal'; proposalId: string | null; prompt: string; createdAt: string }[]
     agentWaiting: boolean
   }
 
@@ -18,6 +18,7 @@ declare global {
         note: string
         sceneJson: string
         pngBase64: string | null
+        decision?: 'accepted' | 'rejected' | null
       }) => Promise<{ version: number }>
       cancel: (requestId: string) => Promise<boolean>
       onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => void

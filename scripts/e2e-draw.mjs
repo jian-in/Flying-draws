@@ -20,6 +20,61 @@ rmSync(HOME, { recursive: true, force: true })
 mkdirSync(HOME, { recursive: true })
 mkdirSync(OUT, { recursive: true })
 
+const DEBUG_PORT = 9334 // 隔离实例的 DevTools 端口，用来扮演用户点按钮
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// 连上画布窗口，返回几个扮演用户的动作
+async function connectPage() {
+  let page
+  for (let i = 0; i < 40 && !page; i++) {
+    try {
+      page = (await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json`)).json()).find((t) => t.type === 'page')
+    } catch {}
+    if (!page) await sleep(500)
+  }
+  if (!page) throw new Error('找不到画布窗口')
+  const ws = new WebSocket(page.webSocketDebuggerUrl)
+  await new Promise((r) => ws.addEventListener('open', r))
+  let cid = 0
+  const pending = new Map()
+  ws.addEventListener('message', (ev) => {
+    const m = JSON.parse(ev.data)
+    if (m.id && pending.has(m.id)) {
+      pending.get(m.id)(m)
+      pending.delete(m.id)
+    }
+  })
+  const cdp = (method, params = {}) =>
+    new Promise((res) => {
+      const i = ++cid
+      pending.set(i, res)
+      ws.send(JSON.stringify({ id: i, method, params }))
+    })
+  const js = async (e) => (await cdp('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true })).result?.result?.value
+  const waitFor = async (fn, ms = 10000) => {
+    const end = Date.now() + ms
+    while (Date.now() < end) {
+      const v = await fn()
+      if (v) return v
+      await sleep(200)
+    }
+    return null
+  }
+  return {
+    bannerText: () => js(`document.querySelector('.sl-banner')?.innerText ?? null`),
+    waitForBanner: () => waitFor(() => js(`document.querySelector('.sl-banner')?.innerText ?? null`)),
+    waitForNoBanner: () => waitFor(() => js(`!document.querySelector('.sl-banner')`)),
+    click: (label) =>
+      js(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===${JSON.stringify(label)}); if(!b) return false; b.click(); return true })()`),
+    typeNote: async (t) => {
+      await js(`document.querySelector('.sl-banner-note')?.focus()`)
+      await cdp('Input.insertText', { text: t })
+    },
+    screenshot: async (file) => writeFileSync(file, Buffer.from((await cdp('Page.captureScreenshot', { format: 'png' })).result.data, 'base64')),
+    close: () => ws.close()
+  }
+}
+
 let failures = 0
 const check = (ok, label) => {
   console.log(`${ok ? '✔' : '✖'} ${label}`)
@@ -31,7 +86,7 @@ await client.connect(
   new StdioClientTransport({
     command: process.execPath,
     args: [join(ROOT, 'out/bridge/index.js')],
-    env: { ...process.env, SKETCHLINK_HOME: HOME },
+    env: { ...process.env, SKETCHLINK_HOME: HOME, SKETCHLINK_DEBUG_PORT: String(DEBUG_PORT) },
     stderr: 'inherit'
   })
 )
@@ -124,6 +179,48 @@ try {
   const img = shot.content.find((c) => c.type === 'image')
   check(Boolean(img), '截图')
   if (img) writeFileSync(join(OUT, 'draw.png'), Buffer.from(img.data, 'base64'))
+
+  // ---------- 提议层：agent 画出理解，用户确认 ----------
+  const user = await connectPage()
+  const proposalOps = [
+    { op: 'add_node', id: 'cache', label: '查缓存', shape: 'diamond' },
+    { op: 'add_node', id: 'hit', label: '直接返回' },
+    { op: 'add_edge', from: 'cache', to: 'hit', label: '命中' }
+  ]
+  const countOnDisk = () => JSON.parse(readFileSync(join(HOME, 'boards', 'default.excalidraw'), 'utf8')).elements.filter((el) => !el.isDeleted).length
+  const before = countOnDisk()
+
+  // 第一次：用户拒绝
+  const p1 = textOf(await call('canvas_propose', { ops: proposalOps, question: '（自动测试）加一层缓存，是这个意思吗？' }))
+  const req1 = p1.match(/req_\w+/)?.[0]
+  check(Boolean(req1) && /「查缓存」菱形【agent 的提议，用户还没确认】/.test(p1), `canvas_propose 返回 ${req1}，读出来标着"提议"`)
+  check(/加一层缓存，是这个意思吗/.test((await user.waitForBanner()) ?? ''), '画布上出现确认横幅')
+  await sleep(600) // 等视野移到提议上再截图
+  await user.screenshot(join(OUT, 'propose.png'))
+  const still = textOf(await call('canvas_wait', { request_id: req1, timeout_s: 1, image: 'never' }))
+  check(/has not sent anything yet/.test(still), '用户没表态时 canvas_wait 返回"还在等"')
+  const w1 = call('canvas_wait', { request_id: req1, timeout_s: 30, image: 'never' })
+  await user.typeNote('缓存放在校验之后')
+  await user.click('不对，去掉')
+  const r1 = textOf(await w1)
+  check(/REJECTED/.test(r1) && /缓存放在校验之后/.test(r1), '拒绝：agent 收到结果和附言')
+  check(!/查缓存/.test(r1) && countOnDisk() === before, '拒绝后提议的元素全部去掉了')
+  check(Boolean(await user.waitForNoBanner()), '表态后横幅消失')
+
+  // 第二次：用户接受
+  const p2 = textOf(await call('canvas_propose', { ops: proposalOps, question: '（自动测试）这样对吗？' }))
+  const req2 = p2.match(/req_\w+/)?.[0]
+  const w2 = call('canvas_wait', { request_id: req2, timeout_s: 30, image: 'never' })
+  await user.waitForBanner()
+  await user.click('对，就这样')
+  const r2 = textOf(await w2)
+  check(/ACCEPTED/.test(r2), '接受：agent 收到结果')
+  check(/「查缓存」菱形【agent 画的】/.test(r2) && !/提议/.test(r2), '接受后提议变成正式内容')
+  const after = JSON.parse(readFileSync(join(HOME, 'boards', 'default.excalidraw'), 'utf8')).elements.filter((el) => !el.isDeleted)
+  const merged = after.find((el) => el.type === 'diamond' && el.customData?.sketchlink?.layer === 'final' && el.strokeStyle === 'solid' && el.opacity === 100)
+  check(after.length > before && !after.some((el) => el.customData?.sketchlink?.layer === 'proposal') && Boolean(merged), '画板文件里没有残留的提议层元素')
+  await user.screenshot(join(OUT, 'propose-accepted.png'))
+  user.close()
 } finally {
   await client.close()
   // 关掉测试开的那个画布实例
