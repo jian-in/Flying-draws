@@ -1,7 +1,7 @@
 // agent 的绘图指令（ops）→ 一份"绘图计划"：每个新元素的 id、位置、大小都在这里定好。
 // 纯函数，不依赖 Electron。页面拿到计划后只负责把它变成 Excalidraw 元素。
 //
-// 目前只支持纯新增：add_node、add_edge、add_text。
+// 新增：add_node、add_edge、add_text。改动：update_node、delete_node、update_edge、delete_edge（只能动 agent 自己画的）。
 // 排版：这一批里没指定坐标的新节点交给 dagre 排成一块，整块放在已有内容下方；
 // 已有元素一律不动。
 import dagre from '@dagrejs/dagre'
@@ -14,6 +14,13 @@ export type DrawOp =
   | { op: 'add_node'; id: string; label?: string; shape?: NodeShape; x?: number; y?: number }
   | { op: 'add_edge'; from: string; to: string; label?: string }
   | { op: 'add_text'; text: string; near?: string; x?: number; y?: number }
+  // 下面四种会改动已有元素。agent 只能改自己画的（design.md 12.4），而且只能用在 canvas_draw 里。
+  | { op: 'update_node'; id: string; label: string }
+  | { op: 'delete_node'; id: string }
+  | { op: 'update_edge'; from: string; to: string; label: string }
+  | { op: 'delete_edge'; from: string; to: string }
+
+export const MODIFY_OPS = ['update_node', 'delete_node', 'update_edge', 'delete_edge']
 
 export interface PlannedNode {
   key: string // agent 在 ops 里起的名字
@@ -47,7 +54,51 @@ export interface DrawPlan {
   nodes: PlannedNode[]
   edges: PlannedEdge[]
   texts: PlannedText[]
+  updates: { elementId: string; textId: string; label: string | null }[] // 换掉节点里或连线上的文字；textId 是新文字元素的 id
+  deletes: string[] // 要删的节点或连线。绑在上面的文字、连着被删节点的 agent 连线由页面一并处理
   existingRefs: string[] // 这批指令引用到的已有元素（Excalidraw id），页面执行前要确认它们还在
+  modifiedRefs: string[] // 其中要被改动或删除的。这些元素在 agent 读过之后不能被别人动过
+}
+
+// agent 上一次读到的编号 → 现在的编号。
+// N1 这类编号按阅读顺序排，画板一变就可能指向别的节点；这里用 agent 读的那个版本的对照表，
+// 把指令里的旧编号换成同一个元素现在的编号。元素已经不在了的，记进 gone。
+export function rebaseOps(
+  ops: readonly DrawOp[],
+  base: readonly { id: string; ref: string }[],
+  graph: SemanticGraph
+): { ops: DrawOp[]; gone: string[] } {
+  const fresh = new Set(ops.flatMap((op) => (op.op === 'add_node' ? [String(op.id)] : [])))
+  const refOf = new Map(base.map((n) => [n.id, n.ref]))
+  const nowOf = new Map(graph.nodes.map((n) => [n.ref, n.id]))
+  const gone = new Set<string>()
+  const fix = <T>(id: T): T => {
+    if (typeof id !== 'string' || fresh.has(id)) return id
+    const ref = refOf.get(id)
+    if (!ref) return id // 那个版本里没有这个编号：留给 planOps 报"不认识这个节点"
+    const now = nowOf.get(ref)
+    if (!now) {
+      gone.add(id)
+      return id
+    }
+    return now as T
+  }
+  const out = ops.map((op): DrawOp => {
+    switch (op.op) {
+      case 'add_edge':
+      case 'update_edge':
+      case 'delete_edge':
+        return { ...op, from: fix(op.from), to: fix(op.to) }
+      case 'add_text':
+        return { ...op, near: fix(op.near) }
+      case 'update_node':
+      case 'delete_node':
+        return { ...op, id: fix(op.id) }
+      default:
+        return op
+    }
+  })
+  return { ops: out, gone: [...gone] }
 }
 
 export class OpsError extends Error {}
@@ -176,8 +227,61 @@ export function planOps(
   }
   const edgeOps: { from: string; to: string; label: string | null }[] = []
   const textOps: { text: string; near: string | null; x: number | null; y: number | null }[] = []
+
+  // 改动和删除：只能动 agent 自己画的、已经在正式层上的东西
+  const updates: DrawPlan['updates'] = []
+  const deletes = new Set<string>()
+  const modifiedRefs = new Set<string>()
+  const deletedKeys = new Set<string>()
+  const own = (item: { author: string; proposed: boolean }, what: string, where: string): void => {
+    if (item.author !== 'agent') {
+      throw new OpsError(
+        `${where}: ${what} was drawn by the user. You can only change or delete things you drew yourself. ` +
+          'To suggest a change to the user\'s drawing, say it in the chat, or draw your version with canvas_propose.'
+      )
+    }
+    if (item.proposed) throw new OpsError(`${where}: ${what} is part of a proposal the user has not answered yet. Wait for their answer (canvas_wait) first.`)
+  }
+  const ownNode = (key: string, where: string) => {
+    const node = existing.get(key)
+    if (!node) {
+      throw new OpsError(
+        byKey.has(key)
+          ? `${where}: "${key}" is being added in this same call; just add it the way you want it`
+          : `${where}: unknown node "${key}". Use a node id (like N1) from your latest canvas_read`
+      )
+    }
+    own(node, `node ${key}`, where)
+    return node
+  }
+  const ownEdge = (from: string, to: string, where: string) => {
+    for (const key of [from, to]) if (!existing.has(key)) throw new OpsError(`${where}: unknown node "${key}". Use node ids (like N1) from your latest canvas_read`)
+    const edge =
+      graph.edges.find((e) => e.from === from && e.to === to) ??
+      graph.edges.find((e) => e.directed !== 'forward' && e.from === to && e.to === from) // 没有方向或双向的线，两头反着说也认
+    if (!edge) throw new OpsError(`${where}: there is no arrow from ${from} to ${to} on the canvas`)
+    own(edge, `the arrow from ${from} to ${to}`, where)
+    return edge
+  }
+
   ops.forEach((op, i) => {
-    if (op.op === 'add_edge') {
+    if (op.op === 'update_node' || op.op === 'delete_node') {
+      const node = ownNode(String(op.id ?? ''), `ops[${i}].id`)
+      existingRefs.add(node.ref)
+      modifiedRefs.add(node.ref)
+      if (op.op === 'delete_node') {
+        deletes.add(node.ref)
+        deletedKeys.add(node.id)
+      } else {
+        updates.push({ elementId: node.ref, textId: newId(), label: cleanLabel(op.label) })
+      }
+    } else if (op.op === 'update_edge' || op.op === 'delete_edge') {
+      const edge = ownEdge(String(op.from ?? ''), String(op.to ?? ''), `ops[${i}]`)
+      existingRefs.add(edge.ref)
+      modifiedRefs.add(edge.ref)
+      if (op.op === 'delete_edge') deletes.add(edge.ref)
+      else updates.push({ elementId: edge.ref, textId: newId(), label: cleanLabel(op.label) })
+    } else if (op.op === 'add_edge') {
       const from = check(String(op.from ?? ''), `ops[${i}].from`)
       const to = check(String(op.to ?? ''), `ops[${i}].to`)
       if (from === to) throw new OpsError(`ops[${i}]: an edge cannot connect a node to itself`)
@@ -193,9 +297,16 @@ export function planOps(
         y: placed ? op.y! : null
       })
     } else if (op.op !== 'add_node') {
-      throw new OpsError(`ops[${i}]: unknown op "${String((op as { op?: unknown }).op)}". Supported: add_node, add_edge, add_text`)
+      throw new OpsError(
+        `ops[${i}]: unknown op "${String((op as { op?: unknown }).op)}". Supported: add_node, add_edge, add_text, update_node, delete_node, update_edge, delete_edge`
+      )
     }
   })
+  // 同一批里又删又用同一个节点，说明指令自相矛盾
+  for (const e of edgeOps) {
+    for (const key of [e.from, e.to]) if (deletedKeys.has(key)) throw new OpsError(`this call deletes node ${key} and also adds an arrow to it`)
+  }
+  for (const t of textOps) if (t.near && deletedKeys.has(t.near)) throw new OpsError(`this call deletes node ${t.near} and also puts text next to it`)
 
   // 挂在新节点旁边的文字：排版时给它留出位置（横排时在节点下方，竖排时在节点右侧）
   const reserved = new Map<string, { w: number; h: number }>()
@@ -336,5 +447,5 @@ export function planOps(
     return { elementId: newId(), text: t.text, x, y }
   })
 
-  return { nodes, edges, texts, existingRefs: [...existingRefs] }
+  return { nodes, edges, texts, updates, deletes: [...deletes], existingRefs: [...existingRefs], modifiedRefs: [...modifiedRefs] }
 }

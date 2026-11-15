@@ -252,7 +252,23 @@ server.registerTool(
   })
 )
 
-const opSchema = z.discriminatedUnion('op', [
+const existingNode = 'An existing node id like "N1" from your latest canvas_read.'
+const modifyOps = [
+  z.object({ op: z.literal('update_node'), id: z.string().min(1).describe(existingNode), label: z.string().describe('The new text inside the node.') }),
+  z.object({
+    op: z.literal('delete_node'),
+    id: z.string().min(1).describe(existingNode + ' Arrows you drew that touch it are deleted with it.')
+  }),
+  z.object({
+    op: z.literal('update_edge'),
+    from: z.string().min(1).describe(existingNode),
+    to: z.string().min(1).describe(existingNode),
+    label: z.string().describe('The new text on the arrow. Empty string removes it.')
+  }),
+  z.object({ op: z.literal('delete_edge'), from: z.string().min(1).describe(existingNode), to: z.string().min(1).describe(existingNode) })
+] as const
+
+const addOps = [
   z.object({
     op: z.literal('add_node'),
     id: z.string().min(1).describe('A name you choose for this new node (e.g. "login"), used by add_edge / add_text in the same call. Must not look like an existing node id.'),
@@ -274,7 +290,10 @@ const opSchema = z.discriminatedUnion('op', [
     x: z.number().optional(),
     y: z.number().optional()
   })
-])
+] as const
+
+const opSchema = z.discriminatedUnion('op', [...addOps]) // canvas_propose：只能新增
+const drawOpSchema = z.discriminatedUnion('op', [...addOps, ...modifyOps]) // canvas_draw：还能改、删自己画的
 
 const directionSchema = z
   .enum(['right', 'down'])
@@ -284,7 +303,7 @@ const baseVersionSchema = z
   .number()
   .int()
   .optional()
-  .describe('The canvas version from your latest canvas_read. Required when ops refer to existing nodes (N1, N2, ...); otherwise optional.')
+  .describe('The canvas version shown by the read (or draw result) where you saw the node ids you are using. Required when ops refer to existing nodes (N1, N2, ...); otherwise optional.')
 
 // 画图没成功时（版本冲突、指令有问题）给 agent 的说明，canvas_draw 和 canvas_propose 共用
 function drawFailure(res: Record<string, unknown>, baseVersion: number | undefined): { content: Content[]; isError: true } | null {
@@ -292,7 +311,8 @@ function drawFailure(res: Record<string, unknown>, baseVersion: number | undefin
     return {
       content: boardContent(
         res,
-        `Nothing was drawn: the canvas changed since version ${baseVersion ?? '(none given)'} and is now at version ${res.version}, so node ids like N1 may point to different nodes. ` +
+        `Nothing was drawn (conflict): ${res.error} ` +
+          `You sent base_version ${baseVersion ?? '(none)'}; the canvas is now at version ${res.version}. ` +
           `Here is the current canvas. Rebuild your ops from it and call the tool again with base_version ${res.version}.`
       ),
       isError: true
@@ -349,11 +369,14 @@ server.registerTool(
     title: 'Draw on the canvas',
     description:
       'Draw nodes, arrows and text on the Sketchlink canvas so the user can see your understanding or plan as a diagram. ' +
-      'You only say what to add; the canvas lays the new nodes out automatically, below whatever is already there. This tool only adds things: it cannot move, change or delete what is already there. ' +
-      'To connect to nodes that are already on the canvas, call canvas_read first and pass the version it showed as base_version. ' +
+      'You only say what to add; the canvas lays the new nodes out automatically, below whatever is already there. ' +
+      'You can also change the text of, or delete, nodes and arrows that YOU drew earlier (update_node, delete_node, update_edge, delete_edge). ' +
+      'You cannot change or delete what the user drew, and nothing can be moved. ' +
+      'To refer to nodes that are already on the canvas, pass the version from the read where you saw them as base_version; ' +
+      'it still works if the canvas changed since, unless a node you refer to was deleted or something you want to change was edited by the user. ' +
       'Returns the updated canvas description. Things you drew are marked as drawn by the agent in later reads.',
     inputSchema: {
-      ops: z.array(opSchema).min(1).describe('What to add, applied together as one batch: either all of it is drawn or none.'),
+      ops: z.array(drawOpSchema).min(1).describe('What to add or change, applied together as one batch: either all of it happens or none.'),
       direction: directionSchema,
       base_version: baseVersionSchema
     }
@@ -364,9 +387,12 @@ server.registerTool(
     if (failure) return failure
     if (res.status !== 'drawn') return text(JSON.stringify(res))
     const added = res.added as { nodes: number; edges: number; texts: number }
+    const changed = (res.changed ?? { updated: 0, deleted: 0 }) as { updated: number; deleted: number }
     const ids = newNodeIds(res)
     const header =
-      `Drawn: ${added.nodes} node(s), ${added.edges} arrow(s), ${added.texts} text(s). The canvas is now at version ${res.version}.` +
+      `Drawn: ${added.nodes} node(s), ${added.edges} arrow(s), ${added.texts} text(s).` +
+      (changed.updated || changed.deleted ? ` Changed: ${changed.updated} text(s) updated, ${changed.deleted} deleted.` : '') +
+      ` The canvas is now at version ${res.version}.` +
       (ids ? ` Your new nodes: ${ids}.` : '')
     return { content: boardContent(res, header) }
   })

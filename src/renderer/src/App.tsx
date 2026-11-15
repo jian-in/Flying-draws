@@ -108,7 +108,77 @@ function showElements(api: Api, elements: readonly SceneEl[], belowBanner: boole
 const AGENT_COLOR = '#1971c2'
 const PROPOSAL_OPACITY = 55
 
-// 把主进程排好的绘图计划画到画布上。只新增元素；已有元素只会被补上"有箭头连着我"的记录。
+// 这里要读写的字段比 Excalidraw 的联合类型好写得多，统一按这个形状看待元素
+type Loose = SceneEl & {
+  containerId?: string | null
+  startBinding?: { elementId: string } | null
+  endBinding?: { elementId: string } | null
+  points?: readonly (readonly [number, number])[]
+}
+const patch = (el: SceneEl, changes: Record<string, unknown>): SceneEl =>
+  newElementWith(el, changes as Parameters<typeof newElementWith>[1]) as SceneEl
+
+// 执行计划里的"改字"和"删除"。主进程已经确认过这些都是 agent 自己画的。
+// 删节点时，绑在上面的文字和连着它的 agent 连线一起删；用户画的连线留着，只把那一头松开。
+function applyChanges(elements: SceneEl[], plan: DrawPlan): SceneEl[] {
+  if (!plan.updates.length && !plan.deletes.length) return elements
+  const byId = new Map(elements.map((el) => [el.id, el]))
+  const gone = new Set(plan.deletes)
+  const goneNodes = new Set(plan.deletes.filter((id) => byId.get(id)?.type !== 'arrow'))
+  for (const el of elements as Loose[]) {
+    if (el.isDeleted || el.type !== 'arrow' || el.customData?.sketchlink?.author !== 'agent') continue
+    if ((el.startBinding && goneNodes.has(el.startBinding.elementId)) || (el.endBinding && goneNodes.has(el.endBinding.elementId))) gone.add(el.id)
+  }
+
+  // 改字：不直接改旧文字（尺寸和换行都要重算），而是让 Excalidraw 按新文字重新生成一个，替换掉旧的
+  const replaced = new Map<string, SceneEl>()
+  const added: SceneEl[] = []
+  for (const u of plan.updates) {
+    const target = byId.get(u.elementId) as Loose | undefined
+    if (!target || target.isDeleted) continue
+    const old = (elements as Loose[]).find((el) => !el.isDeleted && el.type === 'text' && el.containerId === target.id)
+    if (old) gone.add(old.id)
+    let bound = (target.boundElements ?? []).filter((b) => b.id !== old?.id)
+    const grow: Record<string, unknown> = {}
+    if (u.label) {
+      const shape = { type: target.type, id: 'sl_tmp', x: target.x, y: target.y, width: target.width, height: target.height, label: { text: u.label } }
+      const skeleton = target.type === 'arrow' ? { ...shape, points: target.points } : shape
+      const made = convertToExcalidrawElements([skeleton] as unknown as SkeletonList, { regenerateIds: false })
+      const text = made.find((el) => el.type === 'text')
+      const box = made.find((el) => el.type !== 'text')
+      if (text) {
+        added.push({
+          ...text,
+          id: u.textId,
+          containerId: target.id,
+          strokeColor: target.strokeColor,
+          opacity: target.opacity,
+          customData: target.customData
+        } as unknown as SceneEl)
+        bound = [...bound, { type: 'text', id: u.textId }]
+      }
+      // 新文字放不下时节点会长高
+      if (target.type !== 'arrow' && box && box.height > target.height) grow.height = box.height
+    }
+    replaced.set(target.id, patch(target, { ...grow, boundElements: bound }))
+  }
+
+  for (const el of elements as Loose[]) if (!el.isDeleted && el.type === 'text' && el.containerId && gone.has(el.containerId)) gone.add(el.id)
+
+  const kept = elements.map((original) => {
+    let el = (replaced.get(original.id) ?? original) as Loose
+    if (gone.has(el.id)) return el.isDeleted ? el : patch(el, { isDeleted: true })
+    if (el.boundElements?.some((b) => gone.has(b.id))) el = patch(el, { boundElements: el.boundElements.filter((b) => !gone.has(b.id)) }) as Loose
+    if (el.type === 'arrow') {
+      if (el.startBinding && gone.has(el.startBinding.elementId)) el = patch(el, { startBinding: null }) as Loose
+      if (el.endBinding && gone.has(el.endBinding.elementId)) el = patch(el, { endBinding: null }) as Loose
+    }
+    return el
+  })
+  return [...kept, ...added]
+}
+
+// 把主进程排好的绘图计划画到画布上。已有元素只会按计划改字或删除，以及补上"有箭头连着我"的记录。
 // proposalId 不为空时画在提议层上，等用户确认。
 async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): Promise<{ sceneJson: string }> {
   // 用户优先：等用户手上的动作做完（design.md 12.4）
@@ -180,7 +250,7 @@ async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): P
   }
 
   api.updateScene({
-    elements: [...current.map(withArrows), ...fresh.map(withArrows)],
+    elements: [...applyChanges(current.map(withArrows), plan), ...fresh.map(withArrows)],
     captureUpdate: CaptureUpdateAction.IMMEDIATELY // 用户可以用撤销去掉 agent 画的这一批
   })
   showElements(api, fresh, Boolean(proposalId))

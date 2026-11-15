@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGraph, summarize, type SceneElement } from '../src/main/semantic.ts'
-import { estimateTextWidth, exitPoint, OpsError, planOps, type DrawOp } from '../src/main/ops.ts'
+import { estimateTextWidth, exitPoint, OpsError, planOps, rebaseOps, type DrawOp } from '../src/main/ops.ts'
 
 const ids = () => {
   let n = 0
@@ -186,6 +186,97 @@ test('agent 画的元素在摘要里单独标出来', () => {
   const s = summarize(g, { board: 't', version: 1 })
   assert.match(s, /N3 （无文字）矩形【agent 画的】/)
   assert.doesNotMatch(s, /N1 .*agent 画的/)
+})
+
+// 画板：用户的「入口」(N1) → agent 的「校验」(N2) → agent 的「入库」(N3)，外加一个还没确认的提议「缓存」(N4)
+const agent = { customData: { sketchlink: { author: 'agent', layer: 'final' } } }
+const mixed: SceneElement[] = [
+  { id: 'u', type: 'rectangle', x: 0, y: 0, width: 100, height: 60 },
+  { id: 'ut', type: 'text', x: 10, y: 10, width: 40, height: 20, text: '入口', containerId: 'u' },
+  { id: 'a', type: 'rectangle', x: 300, y: 0, width: 100, height: 60, ...agent },
+  { id: 'at', type: 'text', x: 310, y: 10, width: 40, height: 20, text: '校验', containerId: 'a', ...agent },
+  { id: 'b', type: 'rectangle', x: 600, y: 0, width: 100, height: 60, ...agent },
+  { id: 'bt', type: 'text', x: 610, y: 10, width: 40, height: 20, text: '入库', containerId: 'b', ...agent },
+  { id: 'e1', type: 'arrow', x: 100, y: 30, width: 200, height: 0, startBinding: { elementId: 'u' }, endBinding: { elementId: 'a' }, endArrowhead: 'arrow' },
+  { id: 'e2', type: 'arrow', x: 400, y: 30, width: 200, height: 0, startBinding: { elementId: 'a' }, endBinding: { elementId: 'b' }, endArrowhead: 'arrow', ...agent },
+  { id: 'p', type: 'rectangle', x: 900, y: 0, width: 100, height: 60, customData: { sketchlink: { author: 'agent', layer: 'proposal' } } },
+  { id: 'pt', type: 'text', x: 910, y: 10, width: 40, height: 20, text: '缓存', containerId: 'p' }
+]
+
+test('改字和删除：只列出要动的元素，级联由页面处理', () => {
+  const plan = planOps(
+    [
+      { op: 'update_node', id: 'N2', label: '校验 token' },
+      { op: 'update_edge', from: 'N2', to: 'N3', label: '通过' },
+      { op: 'delete_node', id: 'N3' }
+    ],
+    buildGraph(mixed),
+    ids()
+  )
+  assert.deepEqual(
+    plan.updates.map((u) => [u.elementId, u.label]),
+    [
+      ['a', '校验 token'],
+      ['e2', '通过']
+    ]
+  )
+  assert.deepEqual(plan.deletes, ['b'])
+  assert.deepEqual(plan.modifiedRefs.sort(), ['a', 'b', 'e2'])
+  assert.equal(new Set(plan.updates.map((u) => u.textId)).size, 2)
+})
+
+test('不能改用户画的东西，也不能改还没确认的提议', () => {
+  const g = buildGraph(mixed)
+  assert.throws(() => planOps([{ op: 'delete_node', id: 'N1' }], g, ids()), /node N1 was drawn by the user/)
+  assert.throws(() => planOps([{ op: 'update_node', id: 'N1', label: 'x' }], g, ids()), /drawn by the user/)
+  assert.throws(() => planOps([{ op: 'delete_edge', from: 'N1', to: 'N2' }], g, ids()), /the arrow from N1 to N2 was drawn by the user/)
+  assert.throws(() => planOps([{ op: 'delete_node', id: 'N4' }], g, ids()), /proposal the user has not answered/)
+  assert.throws(() => planOps([{ op: 'delete_edge', from: 'N3', to: 'N2' }], g, ids()), /no arrow from N3 to N2/)
+  assert.throws(() => planOps([{ op: 'delete_node', id: 'nope' }], g, ids()), /unknown node "nope"/)
+})
+
+test('同一批里删掉一个节点又去连它：整批拒绝', () => {
+  const ops: DrawOp[] = [
+    { op: 'delete_node', id: 'N3' },
+    { op: 'add_node', id: 'x', label: '新的' },
+    { op: 'add_edge', from: 'x', to: 'N3' }
+  ]
+  assert.throws(() => planOps(ops, buildGraph(mixed), ids()), /deletes node N3 and also adds an arrow to it/)
+})
+
+test('编号换算：画板变了以后，旧编号换成同一个元素现在的编号', () => {
+  const before = buildGraph(mixed)
+  // 用户在最左边加了一个节点，原来的编号全部往后挪一位
+  const after = buildGraph([{ id: 'new', type: 'rectangle', x: -300, y: 0, width: 100, height: 60 }, ...mixed])
+  assert.equal(after.nodes.find((n) => n.ref === 'a')?.id, 'N3')
+  const { ops, gone } = rebaseOps(
+    [
+      { op: 'add_node', id: 'x', label: '新的' },
+      { op: 'add_edge', from: 'N2', to: 'x' },
+      { op: 'update_node', id: 'N2', label: '改了' },
+      { op: 'delete_edge', from: 'N2', to: 'N3' },
+      { op: 'add_text', text: '注', near: 'N1' }
+    ],
+    before.nodes,
+    after
+  )
+  assert.deepEqual(gone, [])
+  assert.deepEqual(ops, [
+    { op: 'add_node', id: 'x', label: '新的' },
+    { op: 'add_edge', from: 'N3', to: 'x' },
+    { op: 'update_node', id: 'N3', label: '改了' },
+    { op: 'delete_edge', from: 'N3', to: 'N4' },
+    { op: 'add_text', text: '注', near: 'N2' }
+  ])
+  // 换算后的指令在新画板上指向的还是原来那个元素
+  assert.equal(planOps(ops, after, ids()).updates[0].elementId, 'a')
+})
+
+test('编号换算：引用的节点已经被删掉时报出来', () => {
+  const before = buildGraph(mixed)
+  const after = buildGraph(mixed.filter((el) => el.id !== 'b' && el.id !== 'bt'))
+  const { gone } = rebaseOps([{ op: 'add_node', id: 'x' }, { op: 'add_edge', from: 'x', to: 'N3' }], before.nodes, after)
+  assert.deepEqual(gone, ['N3'])
 })
 
 test('还没确认的提议和已经画上去的分开标', () => {

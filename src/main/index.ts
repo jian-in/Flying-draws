@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { buildGraph, summarize, type SceneElement } from './semantic'
-import { OpsError, planOps, type DrawOp, type DrawPlan } from './ops'
+import { MODIFY_OPS, OpsError, planOps, rebaseOps, type DrawOp, type DrawPlan } from './ops'
 import { RequestHub, type DrawRequest, type Submission, type WaitResult } from './requests'
 import { captureBaseline, diffProposal, type DiffElement, type ProposalBaseline } from './diff'
 import { startDaemon } from './daemon'
@@ -204,9 +204,41 @@ hub.onChange(() => {
 
 type ImageMode = 'auto' | 'always' | 'never'
 
+// ---------- 每个版本的节点对照表 ----------
+// agent 拿到的每一份画板描述，都记下当时"编号 → 元素"的对照和每个元素的指纹。
+// agent 之后带着 base_version 来画时，用它把旧编号换算成现在的元素，并判断它要改的东西有没有被别人动过。
+// 只放在内存里：应用重启后查不到旧版本，agent 会被要求重新读一次。
+
+interface VersionRecord {
+  nodes: { id: string; ref: string; label: string | null }[]
+  fingerprints: Map<string, string> // 元素 id → 指纹
+}
+const HISTORY_LIMIT = 60
+const history = new Map<number, VersionRecord>()
+
+type VersionedElement = SceneElement & { version?: number }
+
+// 元素的指纹：它自己的 version 加上绑在它上面的文字的 version。任何一个变了，说明这个元素被动过。
+function fingerprints(elements: readonly VersionedElement[]): Map<string, string> {
+  const textVersion = new Map<string, number>()
+  for (const el of elements) {
+    if (!el.isDeleted && el.type === 'text' && el.containerId) textVersion.set(el.containerId, el.version ?? 0)
+  }
+  const out = new Map<string, string>()
+  for (const el of elements) if (!el.isDeleted) out.set(el.id, `${el.version ?? 0}:${textVersion.get(el.id) ?? ''}`)
+  return out
+}
+
+function remember(ver: number, elements: readonly VersionedElement[], graph: ReturnType<typeof buildGraph>): void {
+  history.delete(ver)
+  history.set(ver, { nodes: graph.nodes.map(({ id, ref, label }) => ({ id, ref, label })), fingerprints: fingerprints(elements) })
+  while (history.size > HISTORY_LIMIT) history.delete(history.keys().next().value as number)
+}
+
 function describe(sceneJson: string, ver: number, opts: { format: string; image: ImageMode }, png: string | null) {
   const scene = JSON.parse(sceneJson)
   const graph = buildGraph((scene.elements ?? []) as SceneElement[])
+  remember(ver, (scene.elements ?? []) as VersionedElement[], graph)
   let summary = summarize(graph, { board: BOARD_ID, version: ver })
   const wantImage = opts.image === 'always' || (opts.image === 'auto' && graph.needsImage)
   const attached = wantImage && Boolean(png)
@@ -253,20 +285,60 @@ async function drawOps(
   // 先拿页面上的最新状态，版本号以它为准（用户刚画的几笔可能还没落盘）
   const snap = await takeSnapshot(false)
   const ver = await acceptScene(snap.sceneJson)
-  const graph = buildGraph((JSON.parse(snap.sceneJson).elements ?? []) as SceneElement[])
+  const elements = (JSON.parse(snap.sceneJson).elements ?? []) as VersionedElement[]
+  const graph = buildGraph(elements)
   const current = () => describe(snap.sceneJson, ver, { format: 'summary', image: 'never' }, null)
+  const fail = (status: 'invalid' | 'conflict', message: string) => ({ ok: false, result: { status, error: message, ...current() } })
+
+  let ops = (Array.isArray(body.ops) ? body.ops : []) as DrawOp[]
+  if (proposalId && ops.some((op) => MODIFY_OPS.includes(op?.op))) {
+    return fail('invalid', 'A proposal can only add things (add_node, add_edge, add_text). Use canvas_draw to change or delete what you drew.')
+  }
+
+  // agent 是基于哪个版本下的指令。和当前版本不一样时，先把指令里的旧编号换算成现在的。
+  const base = Number(body.base_version)
+  const record = base !== ver ? history.get(base) : undefined
+  const nameAt = (id: string) => {
+    const label = record?.nodes.find((n) => n.id === id)?.label
+    return label ? `${id} ("${label}")` : id
+  }
+  if (record) {
+    const rebased = rebaseOps(ops, record.nodes, graph)
+    if (rebased.gone.length) {
+      return fail('conflict', `${rebased.gone.map(nameAt).join(', ')} ${rebased.gone.length > 1 ? 'were' : 'was'} deleted after version ${base}.`)
+    }
+    ops = rebased.ops
+  }
 
   let plan: DrawPlan
   try {
-    plan = planOps(body.ops as DrawOp[], graph, newElementId, { direction: body.direction === 'down' ? 'down' : 'right' })
+    plan = planOps(ops, graph, newElementId, { direction: body.direction === 'down' ? 'down' : 'right' })
   } catch (err) {
-    if (err instanceof OpsError) return { ok: false, result: { status: 'invalid', error: err.message, ...current() } }
+    if (err instanceof OpsError) return fail('invalid', err.message)
     throw err
   }
-  // N1 这类编号只在某一个版本里有效。引用了已有节点，就必须基于当前版本；
-  // 只新增、不引用已有节点的指令在任何版本上都能执行，不算冲突。
-  if (plan.existingRefs.length && Number(body.base_version) !== ver) {
-    return { ok: false, result: { status: 'conflict', ...current() } }
+
+  // 只新增、不引用已有节点的指令在任何版本上都能执行。引用了已有节点时：
+  if (plan.existingRefs.length && base !== ver) {
+    if (!record) {
+      // 查不到 agent 读的那个版本，编号没法换算
+      return fail(
+        'conflict',
+        Number.isFinite(base)
+          ? `The canvas has no record of version ${base} (the app may have restarted, or that read is too old), so node ids like N1 cannot be trusted.`
+          : 'These ops refer to nodes already on the canvas, so base_version is required.'
+      )
+    }
+    // 引用的节点只要还在就行；但要改动或删除的元素，从那个版本到现在不能被别人动过（design.md 12.3）
+    const now = fingerprints(elements)
+    const touched = plan.modifiedRefs.filter((ref) => record.fingerprints.get(ref) !== now.get(ref))
+    if (touched.length) {
+      const names = touched.map((ref) => {
+        const node = graph.nodes.find((n) => n.ref === ref)
+        return node ? `${node.id}${node.label ? ` ("${node.label}")` : ''}` : 'an arrow'
+      })
+      return fail('conflict', `${names.join(', ')} ${touched.length > 1 ? 'were' : 'was'} changed by someone else after version ${base}.`)
+    }
   }
 
   const applied = await rpc<{ sceneJson: string }>('applyPlan', { plan, proposalId }, 12_000)
@@ -282,6 +354,7 @@ async function drawOps(
     sceneJson: applied.sceneJson,
     result: {
       added: { nodes: plan.nodes.length, edges: plan.edges.length, texts: plan.texts.length },
+      changed: { updated: plan.updates.length, deleted: plan.deletes.length },
       node_ids: nodeIds,
       ...describe(applied.sceneJson, newVer, { format: 'summary', image: 'never' }, null)
     }

@@ -132,7 +132,7 @@ try {
       { op: 'add_edge', from: nAsk, to: 'login', label: '否' }
     ]
   })
-  check(stale.isError && /Nothing was drawn: the canvas changed/.test(textOf(stale)), '引用已有节点但没带 base_version：整批拒绝')
+  check(stale.isError && /conflict/.test(textOf(stale)) && /base_version is required/.test(textOf(stale)), '引用已有节点但没带 base_version：整批拒绝')
   const afterStale = textOf(await call('canvas_read', { image: 'never' }))
   check(!/「登录页」/.test(afterStale) && new RegExp(`v${ver}：3 个节点`).test(afterStale), '被拒绝的那批一个元素都没画上去')
 
@@ -181,8 +181,93 @@ try {
   check(Boolean(img), '截图')
   if (img) writeFileSync(join(OUT, 'draw.png'), Buffer.from(img.data, 'base64'))
 
-  // ---------- 提议层：agent 画出理解，用户确认 ----------
+  // ---------- 改动已有内容：改字、删除，按元素判断冲突 ----------
   const user = await connectPage()
+  const readNow = async () => {
+    const t = textOf(await call('canvas_read', { image: 'never' }))
+    return { t, v: Number(t.match(/v(\d+)：/)?.[1]), id: (label) => t.match(new RegExp(`(N\\d+) 「${label}」`))?.[1] }
+  }
+  // 扮演用户直接改画布上的一个元素
+  const userEdits = (label, patchSrc) =>
+    user.js(`(() => {
+      const api = window.__sketchlinkApi
+      const all = api.getSceneElementsIncludingDeleted()
+      const text = all.find((e) => !e.isDeleted && e.type === 'text' && e.text === ${JSON.stringify(label)})
+      const patch = ${patchSrc}
+      api.updateScene({ elements: all.map((e) => (e.id === text.containerId ? { ...e, ...patch(e), version: e.version + 1, versionNonce: Math.floor(Math.random() * 1e9), updated: Date.now() } : e)) })
+      return true
+    })()`)
+
+  // 旧版本号照样能用：读一次，画板再变一次，然后拿旧版本号里的编号去连线
+  const s0 = await readNow()
+  await call('canvas_draw', { ops: [{ op: 'add_node', id: 'pad', label: '占位' }] })
+  const late = await call('canvas_draw', {
+    base_version: s0.v,
+    ops: [
+      { op: 'add_node', id: 'done', label: '完成' },
+      { op: 'add_edge', from: s0.id('首页'), to: 'done' }
+    ]
+  })
+  check(!late.isError && /「首页」 → N\d+「完成」/.test(textOf(late)), '画板变过以后，用旧版本号里的编号照样能连到同一个节点')
+
+  // 改字和删除
+  const s1 = await readNow()
+  const changed = await call('canvas_draw', {
+    base_version: s1.v,
+    ops: [
+      { op: 'update_node', id: s1.id('首页'), label: '个人主页' },
+      { op: 'update_edge', from: s1.id('已登录？'), to: s1.id('首页'), label: '已登录' },
+      { op: 'delete_node', id: s1.id('登录页') },
+      { op: 'delete_edge', from: s1.id('查数据库'), to: s1.id('返回结果') }
+    ]
+  })
+  const changedText = textOf(changed)
+  check(!changed.isError && /Changed: 2 text\(s\) updated, 2 deleted/.test(changedText), 'canvas_draw 改了 2 处文字、删了 2 个元素')
+  check(/「个人主页」矩形【agent 画的】/.test(changedText) && !/「首页」/.test(changedText), '节点的文字换掉了')
+  check(/「已登录？」 → N\d+「个人主页」，标着「已登录」/.test(changedText) && !/标着「是」/.test(changedText), '连线上的文字换掉了')
+  check(!/登录页」矩形/.test(changedText) && !/标着「否」/.test(changedText), '删节点时连着它的连线一起删了')
+  check(!/「查数据库」 → N\d+「返回结果」/.test(changedText) && /「查数据库」矩形/.test(changedText), '删连线不影响两头的节点')
+  const disk = () => JSON.parse(readFileSync(join(HOME, 'boards', 'default.excalidraw'), 'utf8')).elements.filter((el) => !el.isDeleted)
+  const dangling = disk().filter((el) => (el.boundElements ?? []).some((b) => !disk().some((x) => x.id === b.id)))
+  check(dangling.length === 0, '画板文件里没有指向已删除元素的绑定记录')
+  const modShot = (await call('canvas_read', { image: 'always' })).content.find((c) => c.type === 'image')
+  if (modShot) writeFileSync(join(OUT, 'draw-modified.png'), Buffer.from(modShot.data, 'base64'))
+
+  // 用户画的东西不能动
+  await user.js(`(() => {
+    const api = window.__sketchlinkApi
+    const all = api.getSceneElementsIncludingDeleted()
+    const model = all.find((e) => !e.isDeleted && e.type === 'rectangle')
+    const mine = { ...model, id: 'user_box_0', x: model.x - 400, boundElements: null, strokeColor: '#1e1e1e' }
+    delete mine.customData
+    delete mine.index
+    api.updateScene({ elements: [...all, mine] })
+    return true
+  })()`)
+  const s2 = await readNow()
+  const userBox = s2.t.match(/(N\d+) （无文字）矩形(?!【)/)?.[1]
+  const forbidden = await call('canvas_draw', { base_version: s2.v, ops: [{ op: 'delete_node', id: userBox }] })
+  check(Boolean(userBox) && forbidden.isError && /was drawn by the user/.test(textOf(forbidden)), `用户画的节点（${userBox}）agent 删不了`)
+  check((await readNow()).t.includes(`${userBox} （无文字）矩形`), '被拒绝后用户的节点还在')
+
+  // 冲突一：agent 读过之后，用户动了它想改的那个节点
+  const s3 = await readNow()
+  await userEdits('个人主页', '(e) => ({ x: e.x + 60 })')
+  const touched = await call('canvas_draw', { base_version: s3.v, ops: [{ op: 'update_node', id: s3.id('个人主页'), label: '我的' }] })
+  check(touched.isError && /conflict/.test(textOf(touched)) && /"个人主页"\) was changed by someone else/.test(textOf(touched)), '用户动过的节点，agent 按旧版本去改会冲突')
+  check(/「个人主页」/.test((await readNow()).t), '冲突时什么都没改')
+  // 但只是引用它（连一条线过去）不算冲突
+  const stillOk = await call('canvas_draw', { base_version: s3.v, ops: [{ op: 'add_node', id: 'more', label: '设置' }, { op: 'add_edge', from: s3.id('个人主页'), to: 'more' }] })
+  check(!stillOk.isError && /「个人主页」 → N\d+「设置」/.test(textOf(stillOk)), '被用户动过的节点仍然可以连线过去')
+
+  // 冲突二：agent 读过之后，用户把它要连的节点删了
+  const s4 = await readNow()
+  await userEdits('完成', '() => ({ isDeleted: true })')
+  const vanished = await call('canvas_draw', { base_version: s4.v, ops: [{ op: 'add_node', id: 'z', label: '归档' }, { op: 'add_edge', from: s4.id('完成'), to: 'z' }] })
+  check(vanished.isError && /"完成"\) was deleted after version/.test(textOf(vanished)), '要连的节点被用户删了：冲突，并说明是哪个')
+  check(!/「归档」/.test((await readNow()).t), '冲突时整批都没画')
+
+  // ---------- 提议层：agent 画出理解，用户确认 ----------
   const proposalOps = [
     { op: 'add_node', id: 'cache', label: '查缓存', shape: 'diamond' },
     { op: 'add_node', id: 'hit', label: '直接返回' },
