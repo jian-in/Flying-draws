@@ -3,12 +3,17 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
 import { buildGraph, summarize, type SceneElement } from './semantic'
+import { OpsError, planOps, type DrawOp, type DrawPlan } from './ops'
 import { RequestHub, type Submission, type WaitResult } from './requests'
 import { startDaemon } from './daemon'
 
 // M1：仍然只有一块画板，叫 default
-const HOME = join(homedir(), '.sketchlink')
+// 设了 SKETCHLINK_HOME 就把画板、连接信息和 Electron 自己的数据都放到那个目录下。
+// 测试用它开一个和用户画板完全隔离的实例（单实例锁也是按 userData 目录算的）。
+const HOME = process.env['SKETCHLINK_HOME'] || join(homedir(), '.sketchlink')
+if (process.env['SKETCHLINK_HOME']) app.setPath('userData', join(HOME, 'electron-data'))
 const BOARDS_DIR = join(HOME, 'boards')
 const BOARD_ID = 'default'
 const boardPath = join(BOARDS_DIR, `${BOARD_ID}.excalidraw`)
@@ -180,6 +185,16 @@ async function takeSnapshot(withImage: boolean): Promise<Snapshot> {
   return rpc<Snapshot>('snapshot', { image: withImage })
 }
 
+// 所有写入排成一队，一次只执行一批（design.md 12.2）
+let writeChain: Promise<unknown> = Promise.resolve()
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const run = writeChain.then(fn, fn)
+  writeChain = run.catch(() => undefined)
+  return run
+}
+
+const newElementId = (): string => `sl_${randomBytes(8).toString('hex')}`
+
 const routes = {
   '/open': async () => {
     bringToFront()
@@ -202,6 +217,44 @@ const routes = {
     }
     return res
   },
+
+  '/draw': (body: Record<string, unknown>) =>
+    serialized(async () => {
+      if (!win || win.isMinimized()) bringToFront()
+      // 先拿页面上的最新状态，版本号以它为准（用户刚画的几笔可能还没落盘）
+      const snap = await takeSnapshot(false)
+      const ver = await acceptScene(snap.sceneJson)
+      const graph = buildGraph((JSON.parse(snap.sceneJson).elements ?? []) as SceneElement[])
+      const current = () => describe(snap.sceneJson, ver, { format: 'summary', image: 'never' }, null)
+
+      let plan: DrawPlan
+      try {
+        plan = planOps(body.ops as DrawOp[], graph, newElementId)
+      } catch (err) {
+        if (err instanceof OpsError) return { status: 'invalid', error: err.message, ...current() }
+        throw err
+      }
+      // N1 这类编号只在某一个版本里有效。引用了已有节点，就必须基于当前版本；
+      // 只新增、不引用已有节点的指令在任何版本上都能执行，不算冲突。
+      if (plan.existingRefs.length && Number(body.base_version) !== ver) {
+        return { status: 'conflict', ...current() }
+      }
+
+      const applied = await rpc<{ sceneJson: string }>('applyPlan', plan, 12_000)
+      const newVer = await acceptScene(applied.sceneJson)
+      const after = buildGraph((JSON.parse(applied.sceneJson).elements ?? []) as SceneElement[])
+      const nodeIds: Record<string, string> = {}
+      for (const n of plan.nodes) {
+        const node = after.nodes.find((x) => x.ref === n.elementId)
+        if (node) nodeIds[n.key] = node.id
+      }
+      return {
+        status: 'drawn',
+        added: { nodes: plan.nodes.length, edges: plan.edges.length, texts: plan.texts.length },
+        node_ids: nodeIds,
+        ...describe(applied.sceneJson, newVer, { format: 'summary', image: 'never' }, null)
+      }
+    }),
 
   '/request': async (body: Record<string, unknown>) => {
     const prompt = String(body.prompt ?? '').trim()

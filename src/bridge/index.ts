@@ -10,7 +10,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 
-const DAEMON_INFO = join(homedir(), '.sketchlink', 'daemon.json')
+// SKETCHLINK_HOME 和桌面应用用的是同一个变量；桥接拉起应用时环境变量会传下去
+const DAEMON_INFO = join(process.env.SKETCHLINK_HOME || join(homedir(), '.sketchlink'), 'daemon.json')
 const APP_ROOT = resolve(__dirname, '..', '..')
 const LAUNCH_TIMEOUT_MS = 30_000
 
@@ -174,7 +175,7 @@ server.registerTool(
     description:
       'Read what is currently drawn on the Sketchlink canvas. Returns a description of nodes (boxes with their text), ' +
       'arrows between them, free text notes and where they sit, and hand-drawn strokes. ' +
-      'Node ids like N1 are stable only within one read. Use this when the user says they drew something or refers to "the canvas" / "my sketch".',
+      'The first line shows the canvas version (e.g. v12). Node ids like N1 are valid only for that version. Use this when the user says they drew something or refers to "the canvas" / "my sketch".',
     inputSchema: { format: formatSchema, image: imageSchema }
   },
   ({ format, image }) => guarded(async () => {
@@ -232,6 +233,78 @@ server.registerTool(
         return text('The user dismissed this drawing request. Continue in the chat instead.')
       case 'unknown_request':
         return text(`Unknown request_id "${request_id}". The canvas app may have restarted; call canvas_request again.`)
+      default:
+        return text(JSON.stringify(res))
+    }
+  })
+)
+
+const opSchema = z.discriminatedUnion('op', [
+  z.object({
+    op: z.literal('add_node'),
+    id: z.string().min(1).describe('A name you choose for this new node (e.g. "login"), used by add_edge / add_text in the same call. Must not look like an existing node id.'),
+    label: z.string().optional().describe('Text inside the node.'),
+    shape: z.enum(['rectangle', 'ellipse', 'diamond']).optional().describe('Default rectangle. Use diamond for decisions.'),
+    x: z.number().optional().describe('Usually omit x and y: the canvas places new nodes in free space.'),
+    y: z.number().optional()
+  }),
+  z.object({
+    op: z.literal('add_edge'),
+    from: z.string().min(1).describe('Id of a node added in this call, or an existing node id like "N1" from your latest canvas_read.'),
+    to: z.string().min(1),
+    label: z.string().optional().describe('Text on the arrow.')
+  }),
+  z.object({
+    op: z.literal('add_text'),
+    text: z.string().min(1),
+    near: z.string().optional().describe('Put the text just below this node (new id or existing id like "N1").'),
+    x: z.number().optional(),
+    y: z.number().optional()
+  })
+])
+
+server.registerTool(
+  'canvas_draw',
+  {
+    title: 'Draw on the canvas',
+    description:
+      'Draw nodes, arrows and text on the Sketchlink canvas so the user can see your understanding or plan as a diagram. ' +
+      'You only say what to add; the canvas picks positions. This tool only adds things: it cannot move, change or delete what is already there. ' +
+      'To connect to nodes that are already on the canvas, call canvas_read first and pass the version it showed as base_version. ' +
+      'Returns the updated canvas description. Things you drew are marked as drawn by the agent in later reads.',
+    inputSchema: {
+      ops: z.array(opSchema).min(1).describe('What to add, applied together as one batch: either all of it is drawn or none.'),
+      base_version: z
+        .number()
+        .int()
+        .optional()
+        .describe('The canvas version from your latest canvas_read. Required when ops refer to existing nodes (N1, N2, ...); otherwise optional.')
+    }
+  },
+  ({ ops, base_version }) => guarded(async () => {
+    const res = await daemon('/draw', { ops, base_version }, 30_000)
+    switch (res.status) {
+      case 'drawn': {
+        const added = res.added as { nodes: number; edges: number; texts: number }
+        const ids = Object.entries((res.node_ids ?? {}) as Record<string, string>)
+          .map(([key, id]) => `${key} = ${id}`)
+          .join(', ')
+        const header =
+          `Drawn: ${added.nodes} node(s), ${added.edges} arrow(s), ${added.texts} text(s). The canvas is now at version ${res.version}.` +
+          (ids ? ` Your new nodes: ${ids}.` : '')
+        return { content: boardContent(res, header) }
+      }
+      case 'conflict':
+        return {
+          content: boardContent(
+            res,
+            `Nothing was drawn: the canvas changed since version ${base_version ?? '(none given)'} and is now at version ${res.version}, so node ids like N1 may point to different nodes. ` +
+              `Here is the current canvas. Rebuild your ops from it and call canvas_draw again with base_version ${res.version}.`
+          ),
+          isError: true
+        }
+      case 'invalid':
+        return { content: boardContent(res, `Nothing was drawn: ${res.error}\nThe current canvas:`), isError: true }
       default:
         return text(JSON.stringify(res))
     }

@@ -28,6 +28,14 @@ export interface SceneElement {
   groupIds?: readonly string[]
   frameId?: string | null
   name?: string | null
+  customData?: { sketchlink?: { author?: string } } | null
+}
+
+export type Author = 'user' | 'agent'
+
+// 元素是谁画的。agent 画的元素在 customData.sketchlink.author 里有标记，其余都算用户画的。
+export function authorOf(el: SceneElement): Author {
+  return el.customData?.sketchlink?.author === 'agent' ? 'agent' : 'user'
 }
 
 export interface SemanticNode {
@@ -36,6 +44,7 @@ export interface SemanticNode {
   kind: string
   label: string | null
   bbox: Bbox
+  author: Author
 }
 
 export interface SemanticEdge {
@@ -45,6 +54,7 @@ export interface SemanticEdge {
   label: string | null
   directed: 'forward' | 'both' | 'none'
   inferred: boolean // true 表示箭头端点没有真正绑定，是按距离猜的
+  author: Author
 }
 
 export interface SemanticNote {
@@ -53,6 +63,7 @@ export interface SemanticNote {
   attachedTo: { kind: 'node' | 'edge'; id: string } | null
   position: string | null // 相对位置，如"下方"
   bbox: Bbox
+  author: Author
 }
 
 export interface SemanticStroke {
@@ -302,7 +313,8 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     ref: el.id,
     kind: el.type,
     label: el.type === 'text' ? (el.text ?? '').trim() : (boundText.get(el.id) ?? el.name ?? null) || null,
-    bbox: bboxOf(el)
+    bbox: bboxOf(el),
+    author: authorOf(el)
   }))
   const nodeByRef = new Map(nodes.map((n) => [n.ref, n]))
 
@@ -347,7 +359,7 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     if (start && end) directed = 'both'
     else if (!start && !end) directed = 'none'
     else if (start && !end) [from, to] = [to, from] // 只有起点有箭头，方向反过来
-    edges.push({ ref: el.id, from, to, label: boundText.get(el.id) ?? null, directed, inferred })
+    edges.push({ ref: el.id, from, to, label: boundText.get(el.id) ?? null, directed, inferred, author: authorOf(el) })
     edgeSamples.set(el.id, samplePolyline(pts.length ? pts : [first, last]))
   }
 
@@ -382,7 +394,8 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
       text: (el.text ?? '').trim(),
       attachedTo: best,
       position: bestBox ? relativePosition(b, bestBox) : null,
-      bbox: b
+      bbox: b,
+      author: authorOf(el)
     })
   }
 
@@ -521,6 +534,8 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
     graph.lines.length ? `${graph.lines.length} 条线条` : ''
   ].filter(Boolean)
   const out: string[] = [`画板「${meta.board}」v${meta.version}：${counts.join('，')}`]
+  // 没标的都是用户画的；agent 自己画的单独标出来，方便它分清哪些是用户的原意
+  const byAgent = (x: { author: Author }): string => (x.author === 'agent' ? '【agent 画的】' : '')
 
   if (graph.nodes.length === 0 && graph.notes.length === 0 && strokeTotal === 0 && graph.images.length === 0) {
     out.push('（画板是空的）')
@@ -533,7 +548,7 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
     for (const n of graph.nodes) {
       const kind = KIND_NAMES[n.kind] ?? n.kind
       const parent = parentOf.get(n.id)
-      out.push(`  ${n.id} ${n.label ? `「${n.label}」` : '（无文字）'}${kind}${parent ? `，在 ${nodeName(nodes, parent)} 里面` : ''}`)
+      out.push(`  ${n.id} ${n.label ? `「${n.label}」` : '（无文字）'}${kind}${parent ? `，在 ${nodeName(nodes, parent)} 里面` : ''}${byAgent(n)}`)
     }
   }
 
@@ -543,7 +558,7 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
       const arrow = e.directed === 'both' ? '↔' : e.directed === 'none' ? '—' : '→'
       const label = e.label ? `，标着「${e.label}」` : ''
       const guess = e.inferred ? '（端点没有吸附，按距离推测）' : ''
-      out.push(`  ${nodeName(nodes, e.from)} ${arrow} ${nodeName(nodes, e.to)}${label}${guess}`)
+      out.push(`  ${nodeName(nodes, e.from)} ${arrow} ${nodeName(nodes, e.to)}${label}${guess}${byAgent(e)}`)
     }
   }
 
@@ -556,7 +571,7 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
         const e = edgeByRef.get(note.attachedTo.id)
         if (e) where = `（在连线 ${e.from ?? '?'}→${e.to ?? '?'} 的${note.position}）`
       }
-      out.push(`  「${note.text}」${where}`)
+      out.push(`  「${note.text}」${where}${byAgent(note)}`)
     }
   }
 

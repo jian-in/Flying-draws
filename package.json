@@ -17,6 +17,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --test \"test/*.test.ts\"",
     "e2e": "node scripts/e2e.mjs",
+    "e2e:draw": "node scripts/e2e-draw.mjs",
     "inspect": "node scripts/inspect.mjs"
   },
   "dependencies": {

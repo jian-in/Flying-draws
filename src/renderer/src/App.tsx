@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type ComponentProps } from 'react'
-import { Excalidraw, exportToBlob, serializeAsJSON } from '@excalidraw/excalidraw'
+import {
+  CaptureUpdateAction,
+  convertToExcalidrawElements,
+  Excalidraw,
+  exportToBlob,
+  newElementWith,
+  serializeAsJSON
+} from '@excalidraw/excalidraw'
+import type { DrawPlan } from '../../main/ops'
 import '@excalidraw/excalidraw/index.css'
 
 type ExcalidrawProps = ComponentProps<typeof Excalidraw>
@@ -46,6 +54,104 @@ async function snapshot(api: Api, withImage: boolean): Promise<{ sceneJson: stri
     pngBase64 = await blobToBase64(blob)
   }
   return { sceneJson, pngBase64 }
+}
+
+const USER_BUSY_WAIT_MS = 8000
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+// 用户是不是正在画一笔、拖东西或打字。这时候往画布里写东西会打断手上的动作。
+function userIsBusy(api: Api): boolean {
+  const s = api.getAppState()
+  return Boolean(
+    s.newElement ||
+      s.multiElement ||
+      s.editingTextElement ||
+      s.resizingElement ||
+      s.selectionElement ||
+      s.selectedElementsAreBeingDragged ||
+      s.isResizing ||
+      s.isRotating
+  )
+}
+
+type SkeletonList = NonNullable<Parameters<typeof convertToExcalidrawElements>[0]>
+type SceneElementList = ReturnType<Api['getSceneElementsIncludingDeleted']>
+type SceneEl = SceneElementList[number]
+
+// 把主进程排好的绘图计划画到画布上。只新增元素；已有元素只会被补上"有箭头连着我"的记录。
+async function applyPlan(api: Api, plan: DrawPlan): Promise<{ sceneJson: string }> {
+  // 用户优先：等用户手上的动作做完（design.md 12.4）
+  const deadline = Date.now() + USER_BUSY_WAIT_MS
+  while (userIsBusy(api)) {
+    if (Date.now() > deadline) throw new Error('the user is in the middle of drawing; wait a moment and call canvas_draw again')
+    await sleep(100)
+  }
+
+  const current = api.getSceneElementsIncludingDeleted()
+  const alive = new Set(current.filter((el) => !el.isDeleted).map((el) => el.id))
+  for (const ref of plan.existingRefs) {
+    if (!alive.has(ref)) throw new Error('a node these ops refer to was just deleted by the user; call canvas_read and try again')
+  }
+
+  const skeletons = [
+    ...plan.nodes.map((n) => ({
+      type: n.shape,
+      id: n.elementId,
+      x: n.x,
+      y: n.y,
+      width: n.w,
+      height: n.h,
+      ...(n.label ? { label: { text: n.label } } : {})
+    })),
+    ...plan.edges.map((e) => ({
+      type: 'arrow' as const,
+      id: e.elementId,
+      x: e.x,
+      y: e.y,
+      width: Math.abs(e.dx),
+      height: Math.abs(e.dy),
+      points: [
+        [0, 0],
+        [e.dx, e.dy]
+      ],
+      endArrowhead: 'arrow' as const,
+      ...(e.label ? { label: { text: e.label } } : {})
+    })),
+    ...plan.texts.map((t) => ({ type: 'text' as const, id: t.elementId, x: t.x, y: t.y, text: t.text }))
+  ] as unknown as SkeletonList
+  const created = convertToExcalidrawElements(skeletons, { regenerateIds: false })
+
+  // 标上"agent 画的"，并把箭头两端绑到节点上（这样用户拖节点时箭头会跟着走）
+  const edgeById = new Map(plan.edges.map((e) => [e.elementId, e]))
+  const arrowsOn = new Map<string, { id: string; type: 'arrow' }[]>()
+  const attach = (nodeId: string, arrowId: string) => {
+    arrowsOn.set(nodeId, [...(arrowsOn.get(nodeId) ?? []), { id: arrowId, type: 'arrow' }])
+  }
+  const fresh = created.map((el) => {
+    const tagged = { ...el, customData: { ...el.customData, sketchlink: { author: 'agent', layer: 'final' } } }
+    const edge = edgeById.get(el.id)
+    if (!edge || el.type !== 'arrow') return tagged
+    attach(edge.fromElementId, el.id)
+    attach(edge.toElementId, el.id)
+    return {
+      ...tagged,
+      startBinding: { elementId: edge.fromElementId, focus: 0, gap: 8 },
+      endBinding: { elementId: edge.toElementId, focus: 0, gap: 8 }
+    }
+  }) as SceneEl[]
+  const withArrows = (el: SceneEl): SceneEl => {
+    const add = arrowsOn.get(el.id)
+    if (!add) return el
+    return newElementWith(el, { boundElements: [...(el.boundElements ?? []), ...add] })
+  }
+
+  api.updateScene({
+    elements: [...current.map(withArrows), ...fresh.map(withArrows)],
+    captureUpdate: CaptureUpdateAction.IMMEDIATELY // 用户可以用撤销去掉 agent 画的这一批
+  })
+  // 把视野移到新画的内容上，不改缩放
+  api.scrollToContent(fresh, { fitToContent: false, animate: true })
+  return { sceneJson: (await snapshot(api, false)).sceneJson }
 }
 
 type Status =
@@ -131,6 +237,8 @@ export default function App() {
         if (method === 'snapshot') {
           const withImage = Boolean((params as { image?: boolean })?.image)
           window.sketchlink.rpcReply(id, await snapshot(current, withImage))
+        } else if (method === 'applyPlan') {
+          window.sketchlink.rpcReply(id, await applyPlan(current, params as DrawPlan))
         } else {
           throw new Error(`unknown method ${method}`)
         }
