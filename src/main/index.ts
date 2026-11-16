@@ -1,15 +1,16 @@
 import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { bboxOf, buildGraph, summarize, type SceneElement } from './semantic'
 import { OpsError, planOps, rebaseOps, toProposalPlan, type DrawOp, type DrawPlan, type PendingChanges } from './ops'
-import { pickupHint, RequestHub, type DrawRequest, type Handoff, type HubState, type Submission, type WaitResult } from './requests'
+import { pickupHint, RequestHub, type HubState, type Submission, type WaitResult } from './requests'
+import { PendingStore } from './pending'
 import { SEAT_COLORS, SeatRegistry } from './seats'
 import { captureBaseline, diffProposal, type DiffElement, type ProposalBaseline } from './diff'
-import { startDaemon } from './daemon'
+import { createDaemonLifecycle, startDaemon } from './daemon'
 import { WindowDock, type DockState } from './dock'
 import {
   BOARD_EXT,
@@ -608,120 +609,17 @@ function pushHubState(): void {
 // 不存的话，应用重启后横幅没了，提议层上的元素却还留在画布上，没有按钮可以确认；
 // 用户主动"发给 agent"的画如果还在收件箱里，重启也会丢失。
 
-let lastPendingKey = '#'
+const pendingStore = new PendingStore({
+  pendingPath,
+  boardsDir: BOARDS_DIR,
+  getCurrentBoardId: () => currentBoardId,
+  sessions,
+  getHub: (boardId) => getSession(boardId).hub,
+  onRequestRestored: (requestId, boardId) => requestBoard.set(requestId, boardId)
+})
 
-function pendingStateKey(
-  boards: Record<string, DrawRequest[]>,
-  inbox: Record<string, Submission[]>,
-  handoffs: Record<string, Handoff[]>
-): string {
-  const reqKey = Object.entries(boards)
-    .filter(([, list]) => list.length > 0)
-    .map(([id, list]) => `${id}:${list.map((r) => r.id).join(',')}`)
-    .sort()
-    .join('|')
-  const inboxKey = Object.entries(inbox)
-    .filter(([, list]) => list.length > 0)
-    .map(([id, list]) => `${id}:${list.map((s) => `${s.at}:${s.version}`).join(',')}`)
-    .sort()
-    .join('|')
-  const handoffKey = Object.entries(handoffs)
-    .filter(([, list]) => list.length > 0)
-    .map(([id, list]) => `${id}:${list.map((h) => `${h.at}:${h.from}:${h.to ?? ''}`).join(',')}`)
-    .sort()
-    .join('|')
-  return `${reqKey}#${inboxKey}#${handoffKey}`
-}
-
-function persistPending(): void {
-  const boards: Record<string, DrawRequest[]> = {}
-  const inbox: Record<string, Submission[]> = {}
-  const handoffs: Record<string, Handoff[]> = {}
-  for (const [id, session] of sessions) {
-    const waiting = session.hub.waiting()
-    if (waiting.length) boards[id] = waiting
-    const queued = session.hub.queuedInbox()
-    if (queued.length) inbox[id] = queued
-    const queuedPasses = session.hub.queuedHandoffs()
-    if (queuedPasses.length) handoffs[id] = queuedPasses
-  }
-  const key = pendingStateKey(boards, inbox, handoffs)
-  if (key === lastPendingKey) return // 只是有 agent 开始或结束等待，请求和收件箱本身没变
-  lastPendingKey = key
-  try {
-    mkdirSync(HOME, { recursive: true })
-    const tmp = `${pendingPath}.tmp`
-    const payload = {
-      version: 2,
-      boards,
-      ...(Object.keys(inbox).length ? { inbox } : {}),
-      ...(Object.keys(handoffs).length ? { handoffs } : {})
-    }
-    // 同步原子写盘，保证应用被强杀前已落盘且不留半截文件
-    writeFileSync(tmp, JSON.stringify(payload), 'utf8')
-    renameSync(tmp, pendingPath)
-  } catch (err) {
-    console.error('[flyingdraws] could not save pending requests:', err)
-  }
-}
-
-function restorePending(): void {
-  let perBoard: Record<string, DrawRequest[]> = {}
-  let perInbox: Record<string, Submission[]> = {}
-  let perHandoffs: Record<string, Handoff[]> = {}
-  try {
-    const raw = JSON.parse(readFileSync(pendingPath, 'utf8')) as {
-      version?: number
-      board?: string
-      requests?: DrawRequest[]
-      boards?: Record<string, DrawRequest[]>
-      inbox?: Record<string, Submission[]>
-      handoffs?: Record<string, Handoff[]>
-    }
-    if (raw.version === 2) {
-      if (raw.boards && typeof raw.boards === 'object') perBoard = raw.boards
-      if (raw.inbox && typeof raw.inbox === 'object') perInbox = raw.inbox
-      if (raw.handoffs && typeof raw.handoffs === 'object') perHandoffs = raw.handoffs
-    } else if (Array.isArray(raw.requests)) {
-      perBoard = { [raw.board && isValidBoardId(raw.board) ? raw.board : DEFAULT_BOARD_ID]: raw.requests }
-    }
-  } catch {
-    return // 没有存过，或者文件坏了：当作没有待处理的请求
-  }
-  const restoredBoards: Record<string, DrawRequest[]> = {}
-  const restoredInbox: Record<string, Submission[]> = {}
-  const restoredHandoffs: Record<string, Handoff[]> = {}
-  const allBoardIds = new Set([...Object.keys(perBoard), ...Object.keys(perInbox), ...Object.keys(perHandoffs)])
-  for (const boardId of allBoardIds) {
-    if (!isValidBoardId(boardId)) continue
-    const boardPath = boardFilePath(BOARDS_DIR, boardId)
-    const boardExists = existsSync(boardPath)
-    if (!boardExists && boardId !== currentBoardId) continue
-    const saved = Array.isArray(perBoard[boardId]) ? perBoard[boardId] : []
-    const savedInbox = Array.isArray(perInbox[boardId]) ? perInbox[boardId] : []
-    const savedHandoffs = Array.isArray(perHandoffs[boardId]) ? perHandoffs[boardId] : []
-    // 提议对应的元素要是已经不在画板上了（比如用户手动删光了），这个提议就不用再问
-    let proposalsOnBoard = new Set<string>()
-    if (boardExists) {
-      try {
-        const elements = (JSON.parse(readFileSync(boardPath, 'utf8')).elements ?? []) as DiffElement[]
-        proposalsOnBoard = new Set(
-          elements.filter((el) => !el.isDeleted && el.customData?.flyingdraws?.layer === 'proposal').map((el) => String(el.customData?.flyingdraws?.proposal))
-        )
-      } catch {}
-    }
-    const usable = saved.filter((r) => r && typeof r.id === 'string' && (r.kind !== 'proposal' || (r.proposalId && proposalsOnBoard.has(r.proposalId))))
-    const usableInbox = savedInbox.filter((s) => s && typeof s.sceneJson === 'string' && typeof s.at === 'string')
-    const usableHandoffs = savedHandoffs.filter((h) => h && typeof h.from === 'string' && typeof h.sceneJson === 'string' && typeof h.at === 'string')
-    if (!usable.length && !usableInbox.length && !usableHandoffs.length) continue
-    if (usable.length) restoredBoards[boardId] = usable
-    if (usableInbox.length) restoredInbox[boardId] = usableInbox
-    if (usableHandoffs.length) restoredHandoffs[boardId] = usableHandoffs
-    for (const r of usable) requestBoard.set(r.id, boardId)
-    getSession(boardId).hub.restore(usable, usableInbox, usableHandoffs)
-  }
-  lastPendingKey = pendingStateKey(restoredBoards, restoredInbox, restoredHandoffs)
-}
+const persistPending = (): void => pendingStore.persist()
+const restorePending = (): void => pendingStore.restore()
 
 // ---------- 给 agent 的响应 ----------
 
@@ -1308,13 +1206,13 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on('second-instance', () => bringToFront())
 
-  let closeDaemon: (() => Promise<void>) | null = null
+  const daemon = createDaemonLifecycle()
 
   app.whenReady().then(async () => {
+    if (daemon.isQuitting()) return
     restorePending()
     createWindow()
-    const { close } = await startDaemon(daemonInfoPath, routes)
-    closeDaemon = close
+    await daemon.start(() => startDaemon(daemonInfoPath, routes))
   })
 
   app.on('activate', () => {
@@ -1325,11 +1223,14 @@ if (!app.requestSingleInstanceLock()) {
     if (process.platform !== 'darwin') app.quit()
   })
 
+  app.on('before-quit', () => {
+    daemon.markQuitting()
+  })
+
   app.on('will-quit', (event) => {
-    if (!closeDaemon) return
+    const closing = daemon.closeOnQuit()
+    if (!closing) return
     event.preventDefault()
-    const close = closeDaemon
-    closeDaemon = null
-    void close().finally(() => app.quit())
+    void closing.finally(() => app.quit())
   })
 }

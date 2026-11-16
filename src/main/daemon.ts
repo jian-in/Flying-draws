@@ -109,3 +109,48 @@ export async function startDaemon(
   }
   return { info, close }
 }
+
+export interface DaemonHandle {
+  close: () => Promise<void>
+}
+
+/**
+ * 协调 daemon 启动与退出清理，避免应用在 startDaemon 尚未完成时退出导致 daemon.json 残留。
+ */
+export function createDaemonLifecycle() {
+  let quitting = false
+  let daemonPromise: Promise<DaemonHandle> | null = null
+  let daemonClosed = false
+
+  const closeOnce = (): Promise<void> | null => {
+    if (daemonClosed || !daemonPromise) return null
+    daemonClosed = true
+    return daemonPromise.then(
+      ({ close }) => close(),
+      () => undefined
+    )
+  }
+
+  return {
+    isQuitting: (): boolean => quitting,
+    markQuitting: (): void => {
+      quitting = true
+    },
+    start: (starter: () => Promise<DaemonHandle>): Promise<void> => {
+      if (quitting) return Promise.resolve()
+      daemonPromise = starter()
+      return daemonPromise.then(
+        async () => {
+          if (quitting) await closeOnce()
+        },
+        (err) => {
+          if (!quitting) throw err
+        }
+      )
+    },
+    closeOnQuit: (): Promise<void> | null => {
+      quitting = true
+      return closeOnce()
+    }
+  }
+}
