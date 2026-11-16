@@ -5,10 +5,12 @@ import {
   convertToExcalidrawElements,
   Excalidraw,
   exportToBlob,
+  MainMenu,
   newElementWith,
   serializeAsJSON
 } from '@excalidraw/excalidraw'
-import type { DrawPlan } from '../../main/ops'
+import { exitPoint, type ShapeBox } from '../../main/geometry'
+import type { DrawPlan, PendingChanges } from '../../main/ops'
 import '@excalidraw/excalidraw/index.css'
 
 type ExcalidrawProps = ComponentProps<typeof Excalidraw>
@@ -36,9 +38,55 @@ function blobToBase64(blob: Blob): Promise<string> {
   })
 }
 
+type HiddenMap = Map<string, { opacity: number; locked: boolean }>
+type AuthorFilter = 'all' | 'user' | 'agent' | 'other' | `seat:${string}`
+
+interface SeatEntry {
+  name: string
+  color: string
+  explicit: boolean
+}
+
+function extractSeats(elements: readonly SceneEl[]): { seats: SeatEntry[]; hasAnonAgent: boolean } {
+  const map = new Map<string, SeatEntry>()
+  let hasAnonAgent = false
+  for (const el of elements) {
+    if (el.isDeleted) continue
+    const mark = el.customData?.flyingdraws
+    if (mark?.role === 'marker' || mark?.author !== 'agent') continue
+    if (typeof mark.agent === 'string' && mark.agent) {
+      const existing = map.get(mark.agent)
+      const color = typeof mark.color === 'string' && mark.color ? mark.color : (el.strokeColor || AGENT_COLOR)
+      const explicit = Boolean(mark.seat)
+      if (!existing) map.set(mark.agent, { name: mark.agent, color, explicit })
+      else if (explicit && !existing.explicit) map.set(mark.agent, { ...existing, explicit: true, color })
+    } else {
+      hasAnonAgent = true
+    }
+  }
+  return { seats: [...map.values()], hasAnonAgent }
+}
+
+const isDynamicSeats = (info: { seats: SeatEntry[]; hasAnonAgent: boolean }): boolean =>
+  info.seats.some((s) => s.explicit) || info.seats.length >= 2
+
+const seatsKeyOf = (info: { seats: SeatEntry[]; hasAnonAgent: boolean }): string =>
+  `${info.seats.map((s) => `${s.name}:${s.color}:${s.explicit ? 1 : 0}`).join('|')}#${info.hasAnonAgent ? 1 : 0}`
+
+function unmaskElements(elements: readonly SceneEl[], hidden: HiddenMap): SceneEl[] {
+  if (!hidden.size) return elements as SceneEl[]
+  return elements.map((el) => {
+    const saved = hidden.get(el.id)
+    if (!saved) return el
+    // 读快照和存盘时把筛选隐藏掉的元素还原，不动 version，避免污染画板文件
+    return { ...el, opacity: saved.opacity, locked: saved.locked }
+  })
+}
+
 // 从画布当前状态取一份快照：场景 JSON，以及可选的 PNG 截图
-async function snapshot(api: Api, withImage: boolean): Promise<{ sceneJson: string; pngBase64: string | null }> {
-  const elements = api.getSceneElements()
+async function snapshot(api: Api, withImage: boolean, hidden?: HiddenMap): Promise<{ sceneJson: string; pngBase64: string | null }> {
+  const raw = api.getSceneElements()
+  const elements = hidden ? unmaskElements(raw, hidden) : raw
   const appState = api.getAppState()
   const files = api.getFiles()
   const sceneJson = serializeAsJSON(elements, appState, files, 'local')
@@ -120,14 +168,68 @@ type Loose = SceneEl & {
   startBinding?: { elementId: string } | null
   endBinding?: { elementId: string } | null
   points?: readonly (readonly [number, number])[]
+  fillStyle?: string
 }
 const patch = (el: SceneEl, changes: Record<string, unknown>): SceneEl =>
   newElementWith(el, changes as Parameters<typeof newElementWith>[1]) as SceneEl
 
-// 执行计划里的"改字"和"删除"。主进程已经确认过这些都是 agent 自己画的。
+function primaryAgentOf(elements: readonly SceneEl[], preferred: string | null): string | null {
+  if (preferred) return preferred
+  for (const el of elements) {
+    if (el.isDeleted) continue
+    const a = el.customData?.flyingdraws?.agent
+    if (typeof a === 'string' && a) return a
+  }
+  return null
+}
+
+function matchesFilter(
+  el: SceneEl,
+  byId: Map<string, SceneEl>,
+  filter: AuthorFilter,
+  primaryAgent: string | null,
+  dynamicSeats: boolean
+): boolean {
+  if (filter === 'all') return true
+  const loose = el as Loose
+  const host = loose.type === 'text' && loose.containerId ? (byId.get(loose.containerId) ?? el) : el
+  const mark = host.customData?.flyingdraws
+  if (filter === 'user') return mark?.author !== 'agent'
+  if (mark?.author !== 'agent') return false
+  if (filter.startsWith('seat:')) return mark.agent === filter.slice(5)
+  if (dynamicSeats && filter === 'agent') return !(typeof mark.agent === 'string' && mark.agent)
+  const name = typeof mark.agent === 'string' && mark.agent ? mark.agent : null
+  const bucket = !name || !primaryAgent || name === primaryAgent ? 'agent' : 'other'
+  return bucket === filter
+}
+
+function applyAuthorFilter(api: Api, nextFilter: AuthorFilter, hidden: HiddenMap, preferredAgent: string | null, dynamicSeats: boolean): void {
+  const raw = api.getSceneElementsIncludingDeleted()
+  const restored = unmaskElements(raw, hidden)
+  hidden.clear()
+
+  let finalElements = restored
+  if (nextFilter !== 'all') {
+    const byId = new Map(restored.map((el) => [el.id, el]))
+    const primary = primaryAgentOf(restored, preferredAgent)
+    finalElements = restored.map((el) => {
+      if (el.isDeleted) return el
+      if (matchesFilter(el, byId, nextFilter, primary, dynamicSeats)) return el
+      hidden.set(el.id, { opacity: el.opacity ?? 100, locked: Boolean(el.locked) })
+      // 不改 el.version：筛选显示不触发自动保存和版本号变化
+      return { ...el, opacity: 0, locked: true, versionNonce: Math.floor(Math.random() * 1e9) }
+    })
+  }
+  api.updateScene({
+    elements: finalElements,
+    captureUpdate: CaptureUpdateAction.NEVER
+  })
+}
+
+// 执行计划里的样式修改、改字、独立文字修改和删除。
 // 删节点时，绑在上面的文字和连着它的 agent 连线一起删；用户画的连线留着，只把那一头松开。
-function applyChanges(elements: SceneEl[], plan: DrawPlan): SceneEl[] {
-  if (!plan.updates.length && !plan.deletes.length) return elements
+function applyChanges(elements: SceneEl[], plan: Pick<DrawPlan, 'updates' | 'textEdits' | 'styles' | 'deletes'>): SceneEl[] {
+  if (!plan.updates.length && !plan.textEdits.length && !plan.styles.length && !plan.deletes.length) return elements
   const byId = new Map(elements.map((el) => [el.id, el]))
   const gone = new Set(plan.deletes)
   const goneNodes = new Set(plan.deletes.filter((id) => byId.get(id)?.type !== 'arrow'))
@@ -136,12 +238,46 @@ function applyChanges(elements: SceneEl[], plan: DrawPlan): SceneEl[] {
     if ((el.startBinding && goneNodes.has(el.startBinding.elementId)) || (el.endBinding && goneNodes.has(el.endBinding.elementId))) gone.add(el.id)
   }
 
-  // 改字：不直接改旧文字（尺寸和换行都要重算），而是让 Excalidraw 按新文字重新生成一个，替换掉旧的
   const replaced = new Map<string, SceneEl>()
   const added: SceneEl[] = []
+  const reshapedNodes = new Map<string, ShapeBox>()
+  const styledById = new Map(plan.styles.map((s) => [s.elementId, s]))
+
+  // 1. 先改样式（颜色、填充、形状、宽高），后面的文字重排要用到新形状和尺寸
+  for (const s of plan.styles) {
+    const target = byId.get(s.elementId) as Loose | undefined
+    if (!target || target.isDeleted || gone.has(target.id)) continue
+    const newW = s.w ?? target.width
+    const newH = s.h ?? target.height
+    const resized = s.w !== undefined || s.h !== undefined
+    const newX = resized ? target.x + target.width / 2 - newW / 2 : target.x
+    const newY = resized ? target.y + target.height / 2 - newH / 2 : target.y
+    const nextType = s.shape ?? target.type
+    const stylePatch: Record<string, unknown> = {
+      ...(s.color ? { strokeColor: s.color } : {}),
+      ...(s.fill
+        ? {
+            backgroundColor: s.fill,
+            ...(s.fill !== 'transparent' ? { fillStyle: target.fillStyle || 'solid' } : {})
+          }
+        : {}),
+      ...(s.shape ? { type: s.shape } : {}),
+      ...(resized ? { x: newX, y: newY, width: newW, height: newH } : {})
+    }
+    replaced.set(target.id, patch(target, stylePatch))
+    if (s.color) {
+      const boundText = (elements as Loose[]).find((el) => !el.isDeleted && el.type === 'text' && el.containerId === target.id)
+      if (boundText) replaced.set(boundText.id, patch(boundText, { strokeColor: s.color }))
+    }
+    if (['rectangle', 'ellipse', 'diamond'].includes(nextType) && (s.shape || resized)) {
+      reshapedNodes.set(target.id, { x: newX, y: newY, w: newW, h: newH, shape: nextType })
+    }
+  }
+
+  // 2. 节点/连线改字或节点改形后的文字重排：不直接改旧文字，让 Excalidraw 重新算尺寸并替换
   for (const u of plan.updates) {
-    const target = byId.get(u.elementId) as Loose | undefined
-    if (!target || target.isDeleted) continue
+    const target = (replaced.get(u.elementId) ?? byId.get(u.elementId)) as Loose | undefined
+    if (!target || target.isDeleted || gone.has(target.id)) continue
     const old = (elements as Loose[]).find((el) => !el.isDeleted && el.type === 'text' && el.containerId === target.id)
     if (old) gone.add(old.id)
     let bound = (target.boundElements ?? []).filter((b) => b.id !== old?.id)
@@ -163,10 +299,79 @@ function applyChanges(elements: SceneEl[], plan: DrawPlan): SceneEl[] {
         } as unknown as SceneEl)
         bound = [...bound, { type: 'text', id: u.textId }]
       }
-      // 新文字放不下时节点会长高
-      if (target.type !== 'arrow' && box && box.height > target.height) grow.height = box.height
+      // 显式指定了高度的重排不再自动撑高；其余情况新文字放不下时节点长高
+      const explicitHeight = u.relayout && styledById.get(target.id)?.h !== undefined
+      if (target.type !== 'arrow' && !explicitHeight && box && box.height > target.height) {
+        grow.height = box.height
+        if (reshapedNodes.has(target.id)) {
+          const prev = reshapedNodes.get(target.id)!
+          reshapedNodes.set(target.id, { ...prev, h: box.height })
+        }
+      }
     }
     replaced.set(target.id, patch(target, { ...grow, boundElements: bound }))
+  }
+
+  // 3. 修改独立文字的内容并重算宽高
+  for (const te of plan.textEdits) {
+    const target = (replaced.get(te.elementId) ?? byId.get(te.elementId)) as Loose | undefined
+    if (!target || target.isDeleted || gone.has(target.id)) continue
+    const made = convertToExcalidrawElements(
+      [{ type: 'text', id: 'sl_tmp', x: target.x, y: target.y, text: te.text }] as unknown as SkeletonList,
+      { regenerateIds: false }
+    )
+    const measured = made[0]
+    replaced.set(
+      target.id,
+      patch(target, {
+        text: te.text,
+        originalText: te.text,
+        ...(measured ? { width: measured.width, height: measured.height } : {})
+      })
+    )
+  }
+
+  // 4. 节点改了形状或尺寸时，把连着它的箭头端点贴回到新轮廓上
+  if (reshapedNodes.size > 0) {
+    const nodeBox = (id: string): ShapeBox | null => {
+      const reshaped = reshapedNodes.get(id)
+      if (reshaped) return reshaped
+      const el = (replaced.get(id) ?? byId.get(id)) as Loose | undefined
+      if (!el || el.isDeleted) return null
+      return { x: el.x, y: el.y, w: el.width, h: el.height, shape: el.type }
+    }
+    for (const original of elements as Loose[]) {
+      if (original.isDeleted || gone.has(original.id) || original.type !== 'arrow') continue
+      const el = (replaced.get(original.id) ?? original) as Loose
+      const fromId = el.startBinding?.elementId
+      const toId = el.endBinding?.elementId
+      if ((!fromId || !reshapedNodes.has(fromId)) && (!toId || !reshapedNodes.has(toId))) continue
+      const fromBox = fromId ? nodeBox(fromId) : null
+      const toBox = toId ? nodeBox(toId) : null
+      if (!fromBox && !toBox) continue
+      const pts = (el.points && el.points.length >= 2 ? el.points : [[0, 0], [el.width, el.height]]).map(
+        ([px, py]): [number, number] => [el.x + px, el.y + py]
+      )
+      const firstTarget = pts.length > 2 ? pts[1] : toBox ? [toBox.x + toBox.w / 2, toBox.y + toBox.h / 2] : pts[pts.length - 1]
+      const lastTarget = pts.length > 2 ? pts[pts.length - 2] : fromBox ? [fromBox.x + fromBox.w / 2, fromBox.y + fromBox.h / 2] : pts[0]
+      const nextStart = fromBox && reshapedNodes.has(fromId!) ? exitPoint(fromBox, firstTarget[0], firstTarget[1], 8) : pts[0]
+      const nextEnd = toBox && reshapedNodes.has(toId!) ? exitPoint(toBox, lastTarget[0], lastTarget[1], 8) : pts[pts.length - 1]
+      const absPts: [number, number][] = [nextStart, ...pts.slice(1, -1), nextEnd]
+      const [sx, sy] = absPts[0]
+      const relPts = absPts.map(([px, py]): [number, number] => [px - sx, py - sy])
+      const xs = relPts.map((p) => p[0])
+      const ys = relPts.map((p) => p[1])
+      replaced.set(
+        el.id,
+        patch(el, {
+          x: sx,
+          y: sy,
+          width: Math.max(...xs) - Math.min(...xs),
+          height: Math.max(...ys) - Math.min(...ys),
+          points: relPts
+        })
+      )
+    }
   }
 
   for (const el of elements as Loose[]) if (!el.isDeleted && el.type === 'text' && el.containerId && gone.has(el.containerId)) gone.add(el.id)
@@ -184,9 +389,20 @@ function applyChanges(elements: SceneEl[], plan: DrawPlan): SceneEl[] {
   return [...kept, ...added]
 }
 
-// 把主进程排好的绘图计划画到画布上。已有元素只会按计划改字或删除，以及补上"有箭头连着我"的记录。
+// 把主进程排好的绘图计划画到画布上。
 // proposalId 不为空时画在提议层上，等用户确认。
-async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): Promise<{ sceneJson: string }> {
+async function applyPlan(
+  api: Api,
+  plan: DrawPlan,
+  proposalId: string | null,
+  agent: string | null,
+  seat: boolean,
+  color: string | null,
+  hidden: HiddenMap,
+  filter: AuthorFilter,
+  preferredAgent: string | null,
+  dynamicSeats: boolean
+): Promise<{ sceneJson: string }> {
   // 用户优先：等用户手上的动作做完（design.md 12.4）
   const deadline = Date.now() + USER_BUSY_WAIT_MS
   while (userIsBusy(api)) {
@@ -194,7 +410,7 @@ async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): P
     await sleep(100)
   }
 
-  const current = api.getSceneElementsIncludingDeleted()
+  const current = unmaskElements(api.getSceneElementsIncludingDeleted(), hidden)
   const alive = new Set(current.filter((el) => !el.isDeleted).map((el) => el.id))
   for (const ref of plan.existingRefs) {
     if (!alive.has(ref)) throw new Error('a node these ops refer to was just deleted by the user; call canvas_read and try again')
@@ -225,18 +441,26 @@ async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): P
     })),
     ...plan.texts.map((t) => ({ type: 'text' as const, id: t.elementId, x: t.x, y: t.y, text: t.text }))
   ] as unknown as SkeletonList
-  const created = convertToExcalidrawElements(skeletons, { regenerateIds: false })
+  const created = skeletons.length ? convertToExcalidrawElements(skeletons, { regenerateIds: false }) : []
 
-  // 标上"agent 画的"，并把箭头两端绑到节点上（这样用户拖节点时箭头会跟着走）
+  // 标上"agent 画的"和席位信息，并把箭头两端绑到节点上（这样用户拖节点时箭头会跟着走）
   const edgeById = new Map(plan.edges.map((e) => [e.elementId, e]))
   const arrowsOn = new Map<string, { id: string; type: 'arrow' }[]>()
   const attach = (nodeId: string, arrowId: string) => {
     arrowsOn.set(nodeId, [...(arrowsOn.get(nodeId) ?? []), { id: arrowId, type: 'arrow' }])
   }
+  const strokeColor = color || AGENT_COLOR
   const look = proposalId
-    ? { strokeColor: AGENT_COLOR, opacity: PROPOSAL_OPACITY, strokeStyle: 'dashed' as const }
-    : { strokeColor: AGENT_COLOR }
-  const mark = proposalId ? { author: 'agent', layer: 'proposal', proposal: proposalId } : { author: 'agent', layer: 'final' }
+    ? { strokeColor, opacity: PROPOSAL_OPACITY, strokeStyle: 'dashed' as const }
+    : { strokeColor }
+  const seatFields = {
+    ...(agent ? { agent } : {}),
+    ...(seat ? { seat: true } : {}),
+    ...(color ? { color } : {})
+  }
+  const mark = proposalId
+    ? { author: 'agent', ...seatFields, layer: 'proposal', proposal: proposalId }
+    : { author: 'agent', ...seatFields, layer: 'final' }
   const fresh = created.map((el) => {
     const tagged = { ...el, ...look, customData: { ...el.customData, flyingdraws: mark } }
     const edge = edgeById.get(el.id)
@@ -249,38 +473,96 @@ async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): P
       endBinding: { elementId: edge.toElementId, focus: 0, gap: 8 }
     }
   }) as SceneEl[]
+
+  // 提议里的改动预览标记框：虚线框 + 上方一句说明文字，成组方便用户整处删掉表示不同意
+  const markerSkeletons = plan.markers.flatMap((m) => [
+    { type: 'rectangle' as const, id: m.frameId, x: m.x, y: m.y, width: m.w, height: m.h },
+    { type: 'text' as const, id: m.noteId, x: m.x, y: m.y - 26, text: m.note }
+  ]) as unknown as SkeletonList
+  const markerMeta = new Map(plan.markers.flatMap((m) => [[m.frameId, m], [m.noteId, m]]))
+  const markerElements = markerSkeletons.length
+    ? convertToExcalidrawElements(markerSkeletons, { regenerateIds: false }).map((el) => {
+        const m = markerMeta.get(el.id)!
+        const markerColor = m.tone === 'delete' ? '#e03131' : strokeColor
+        return {
+          ...el,
+          strokeColor: markerColor,
+          backgroundColor: 'transparent',
+          strokeStyle: 'dashed' as const,
+          opacity: 75,
+          groupIds: [`fd_mk_${m.frameId}`],
+          customData: {
+            ...el.customData,
+            flyingdraws: { author: 'agent', ...seatFields, layer: 'proposal', proposal: proposalId, role: 'marker' }
+          }
+        } as unknown as SceneEl
+      })
+    : []
+
   const withArrows = (el: SceneEl): SceneEl => {
     const add = arrowsOn.get(el.id)
     if (!add) return el
     return newElementWith(el, { boundElements: [...(el.boundElements ?? []), ...add] })
   }
 
+  const nextAll = [...applyChanges(current.map(withArrows), plan), ...fresh.map(withArrows), ...markerElements]
   api.updateScene({
-    elements: [...applyChanges(current.map(withArrows), plan), ...fresh.map(withArrows)],
+    elements: nextAll,
     captureUpdate: CaptureUpdateAction.IMMEDIATELY // 用户可以用撤销去掉 agent 画的这一批
   })
-  showElements(api, fresh, Boolean(proposalId))
-  return { sceneJson: (await snapshot(api, false)).sceneJson }
+  if (filter !== 'all') applyAuthorFilter(api, filter, hidden, preferredAgent, dynamicSeats || seat || Boolean(agent))
+  showElements(api, [...fresh, ...markerElements], Boolean(proposalId))
+  return { sceneJson: (await snapshot(api, false, hidden)).sceneJson }
 }
 
-// 用户对一个提议做了决定。接受：提议层上的元素变成正式内容（实线、不透明，仍是蓝色）；
-// 拒绝：删掉。用户在提议上改过的地方原样保留，用户自己删掉的不会回来。
-function resolveProposal(api: Api, proposalId: string, accept: boolean): void {
+// 用户对一个提议做了决定。接受：提议层上的元素变成正式内容（实线、不透明，仍是对应席位颜色），
+// 并把提议里尚未被用户删掉标记框的改动真正执行；拒绝：全部删掉。返回用户删掉标记框取消的改动说明。
+function resolveProposal(api: Api, proposalId: string, accept: boolean, pending: PendingChanges | null, hidden: HiddenMap): string[] {
+  const all = unmaskElements(api.getSceneElementsIncludingDeleted(), hidden)
+  const liveIds = new Set(all.filter((el) => !el.isDeleted).map((el) => el.id))
+  const skipped: string[] = []
+  let working = all
+  if (accept && pending) {
+    const approvedTargets = new Set<string>()
+    for (const m of pending.markers ?? []) {
+      if (liveIds.has(m.frameId)) {
+        for (const t of m.targets) approvedTargets.add(t)
+      } else {
+        skipped.push(`不同意${m.summary}`)
+      }
+    }
+    working = applyChanges(all, {
+      updates: (pending.updates ?? []).filter((u) => approvedTargets.has(u.elementId)),
+      textEdits: (pending.textEdits ?? []).filter((t) => approvedTargets.has(t.elementId)),
+      styles: (pending.styles ?? []).filter((s) => approvedTargets.has(s.elementId)),
+      deletes: (pending.deletes ?? []).filter((id) => approvedTargets.has(id))
+    })
+  }
+
   const isProposed = (el: SceneEl): boolean => {
     const mark = el.customData?.flyingdraws
     return !el.isDeleted && mark?.layer === 'proposal' && mark?.proposal === proposalId
   }
-  const all = api.getSceneElementsIncludingDeleted()
-  const removed = new Set(accept ? [] : all.filter(isProposed).map((el) => el.id))
-  const elements = all.map((el) => {
+  const isMarkerEl = (el: SceneEl): boolean => el.customData?.flyingdraws?.role === 'marker'
+  const removed = new Set(working.filter((el) => isProposed(el) && (!accept || isMarkerEl(el))).map((el) => el.id))
+  const elements = working.map((el) => {
     if (isProposed(el)) {
-      return accept
-        ? newElementWith(el, {
-            opacity: 100,
-            strokeStyle: 'solid',
-            customData: { ...el.customData, flyingdraws: { author: 'agent', layer: 'final' } }
-          })
-        : newElementWith(el, { isDeleted: true })
+      if (!accept || isMarkerEl(el)) return newElementWith(el, { isDeleted: true })
+      const prevMark = el.customData?.flyingdraws
+      return newElementWith(el, {
+        opacity: 100,
+        strokeStyle: 'solid',
+        customData: {
+          ...el.customData,
+          flyingdraws: {
+            author: 'agent',
+            ...(typeof prevMark?.agent === 'string' && prevMark.agent ? { agent: prevMark.agent } : {}),
+            ...(prevMark?.seat ? { seat: true } : {}),
+            ...(typeof prevMark?.color === 'string' && prevMark.color ? { color: prevMark.color } : {}),
+            layer: 'final'
+          }
+        }
+      })
     }
     // 删掉提议里的箭头后，把别的节点上"有箭头连着我"的记录也清掉
     if (removed.size && el.boundElements?.some((b) => removed.has(b.id))) {
@@ -289,6 +571,7 @@ function resolveProposal(api: Api, proposalId: string, accept: boolean): void {
     return el
   })
   api.updateScene({ elements, captureUpdate: CaptureUpdateAction.IMMEDIATELY })
+  return skipped
 }
 
 type Status =
@@ -305,8 +588,16 @@ export default function App() {
   const [creating, setCreating] = useState(false)
   const [renaming, setRenaming] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
-  const [hub, setHub] = useState<HubState>({ pending: [], agentWaiting: false, inbox: 0 })
+  const [hub, setHub] = useState<HubState>({ pending: [], agentWaiting: false, waitingAgents: [], inbox: 0, handoff: null })
   const [toast, setToast] = useState<string | null>(null)
+  const [filter, setFilter] = useState<AuthorFilter>('all')
+  const [seatInfo, setSeatInfo] = useState<{ seats: SeatEntry[]; hasAnonAgent: boolean }>({ seats: [], hasAnonAgent: false })
+  const filterRef = useRef<AuthorFilter>('all')
+  const hiddenStateRef = useRef<HiddenMap>(new Map())
+  const primaryAgentRef = useRef<string | null>(null)
+  const lastSeatsKeyRef = useRef<string>('')
+  const seatInfoRef = useRef(seatInfo)
+  seatInfoRef.current = seatInfo
   const hubRef = useRef(hub)
   hubRef.current = hub
 
@@ -317,19 +608,36 @@ export default function App() {
     return () => clearTimeout(t)
   }, [toast])
 
-  // 收件箱里的画被 agent 取走了：告诉用户一声
+  // 收件箱里的画被 agent 取走、或者画笔被接手：告诉用户一声
   const lastInbox = useRef(0)
   useEffect(() => {
     if (hub.inbox < lastInbox.current) setToast('agent 已经取走你的画')
     lastInbox.current = hub.inbox
   }, [hub.inbox])
+  const hadHandoff = useRef(false)
+  useEffect(() => {
+    if (hadHandoff.current && !hub.handoff && !hub.inbox) setToast('画笔已被接手')
+    hadHandoff.current = Boolean(hub.handoff)
+  }, [hub.handoff, hub.inbox])
+  useEffect(() => {
+    if (!filter.startsWith('seat:')) return
+    const seatName = filter.slice(5)
+    if (!seatInfo.seats.some((s) => s.name === seatName) && apiRef.current) {
+      filterRef.current = 'all'
+      setFilter('all')
+      applyAuthorFilter(apiRef.current, 'all', hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(seatInfo))
+    }
+  }, [seatInfo, filter])
   const [composing, setComposing] = useState(false)
   const [initialData] = useState(() =>
     window.flyingdraws.loadBoard().then((res) => {
       setBoardInfo({ board: res.board, title: res.title })
       setBoards(res.boards)
       setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
-      const scene = res.json ? (JSON.parse(res.json) as { appState?: Record<string, unknown> }) : {}
+      const scene = res.json ? (JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }) : {}
+      const info = extractSeats(scene.elements ?? [])
+      lastSeatsKeyRef.current = seatsKeyOf(info)
+      setSeatInfo(info)
       return { ...scene, appState: { ...scene.appState, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
     })
   )
@@ -361,6 +669,12 @@ export default function App() {
       const nextElements = parsed?.elements ?? []
       lastSavedVersion.current = elementsVersion(nextElements)
       latest.current = null
+      hiddenStateRef.current.clear()
+      filterRef.current = 'all'
+      setFilter('all')
+      const nextSeatInfo = extractSeats(nextElements)
+      lastSeatsKeyRef.current = seatsKeyOf(nextSeatInfo)
+      setSeatInfo(nextSeatInfo)
       currentApi.resetScene()
       if (parsed?.files && Object.keys(parsed.files).length > 0) {
         currentApi.addFiles(Object.values(parsed.files) as Parameters<Api['addFiles']>[0])
@@ -379,6 +693,7 @@ export default function App() {
       else void window.flyingdraws.listBoards().then((list) => setBoards(list.boards))
       if (res.hubState) {
         lastInbox.current = res.hubState.inbox
+        hadHandoff.current = Boolean(res.hubState.handoff)
         setHub(res.hubState)
       }
       setComposing(false)
@@ -400,7 +715,7 @@ export default function App() {
     if (!scene) return
     const [elements, appState, files] = scene
     try {
-      const json = serializeAsJSON(elements, appState, files, 'local')
+      const json = serializeAsJSON(unmaskElements(elements, hiddenStateRef.current), appState, files, 'local')
       const res = await window.flyingdraws.saveBoard(json)
       lastSavedVersion.current = elementsVersion(elements)
       setStatus({ kind: 'saved', path: res.path, version: res.version, savedAt: res.savedAt })
@@ -417,6 +732,12 @@ export default function App() {
         window.flyingdraws.setTheme(appState.theme === 'dark' ? 'dark' : 'light')
       }
       latest.current = [elements, appState, files]
+      const nextSeatInfo = extractSeats(elements)
+      const nextSeatsKey = seatsKeyOf(nextSeatInfo)
+      if (nextSeatsKey !== lastSeatsKeyRef.current) {
+        lastSeatsKeyRef.current = nextSeatsKey
+        setSeatInfo(nextSeatInfo)
+      }
       const version = elementsVersion(elements)
       if (lastSavedVersion.current === null) {
         // 第一次回调是载入已有画板，记下版本，不重复保存
@@ -455,10 +776,32 @@ export default function App() {
         if (!current) throw new Error('canvas is not ready')
         if (method === 'snapshot') {
           const withImage = Boolean((params as { image?: boolean })?.image)
-          window.flyingdraws.rpcReply(id, await snapshot(current, withImage))
+          window.flyingdraws.rpcReply(id, await snapshot(current, withImage, hiddenStateRef.current))
         } else if (method === 'applyPlan') {
-          const { plan, proposalId } = params as { plan: DrawPlan; proposalId: string | null }
-          window.flyingdraws.rpcReply(id, await applyPlan(current, plan, proposalId))
+          const { plan, proposalId, agent, seat, color } = params as {
+            plan: DrawPlan
+            proposalId: string | null
+            agent?: string | null
+            seat?: boolean
+            color?: string | null
+          }
+          const agentName = typeof agent === 'string' && agent.trim() ? agent.trim() : null
+          if (agentName) primaryAgentRef.current = agentName
+          window.flyingdraws.rpcReply(
+            id,
+            await applyPlan(
+              current,
+              plan,
+              proposalId,
+              agentName,
+              Boolean(seat),
+              color ?? null,
+              hiddenStateRef.current,
+              filterRef.current,
+              primaryAgentRef.current,
+              isDynamicSeats(seatInfoRef.current)
+            )
+          )
         } else if (method === 'loadScene') {
           const next = params as { board: string; title: string | null; version: number; json: string | null }
           applyLoadedScene(current, next)
@@ -495,7 +838,7 @@ export default function App() {
       const current = apiRef.current
       if (!current || targetBoard === boardInfo.board) return
       try {
-        const snap = await snapshot(current, false)
+        const snap = await snapshot(current, false, hiddenStateRef.current)
         const res = await window.flyingdraws.switchBoard({ board: targetBoard, currentSceneJson: snap.sceneJson })
         applyLoadedScene(current, res)
       } catch (err) {
@@ -510,7 +853,7 @@ export default function App() {
       const current = apiRef.current
       if (!current) return
       const trimmed = rawName.trim()
-      const snap = await snapshot(current, false)
+      const snap = await snapshot(current, false, hiddenStateRef.current)
       const res = await window.flyingdraws.createBoard({
         name: trimmed,
         title: /\s/.test(trimmed) ? trimmed : undefined,
@@ -527,7 +870,7 @@ export default function App() {
     const current = apiRef.current
     if (!current) return
     const trimmed = rawName.trim()
-    const snap = await snapshot(current, false)
+    const snap = await snapshot(current, false, hiddenStateRef.current)
     const res = await window.flyingdraws.renameBoard({
       board: boardInfo.board,
       name: trimmed,
@@ -548,7 +891,7 @@ export default function App() {
   const handleDeleteBoard = useCallback(async () => {
     const current = apiRef.current
     if (!current) return
-    const snap = await snapshot(current, false)
+    const snap = await snapshot(current, false, hiddenStateRef.current)
     const target = boardInfo.board
     const res = await window.flyingdraws.deleteBoard({
       board: target,
@@ -564,7 +907,7 @@ export default function App() {
       if (!apiRef.current) return
       // 有 agent 正等着（或者这是在回应它的请求）时，画会直接交到它手上；否则先放进收件箱
       const direct = requestId !== null || hubRef.current.agentWaiting
-      const snap = await snapshot(apiRef.current, true)
+      const snap = await snapshot(apiRef.current, true, hiddenStateRef.current)
       await window.flyingdraws.submit({ requestId, note, ...snap })
       if (direct) setToast('agent 已经收到你的画')
       lastSavedVersion.current = elementsVersion(apiRef.current.getSceneElements())
@@ -574,13 +917,25 @@ export default function App() {
   )
 
   // 回应 agent 的提议：先把提议层上的元素合并或删掉，再把结果发给 agent
-  const decide = useCallback(async (requestId: string, proposalId: string, accept: boolean, note: string) => {
+  const decide = useCallback(async (requestId: string, proposalId: string, accept: boolean, note: string, pending?: unknown) => {
     const current = apiRef.current
     if (!current) return
-    resolveProposal(current, proposalId, accept)
-    const snap = await snapshot(current, true)
-    await window.flyingdraws.submit({ requestId, note, decision: accept ? 'accepted' : 'rejected', ...snap })
+    const skipped = resolveProposal(current, proposalId, accept, (pending as PendingChanges | null | undefined) ?? null, hiddenStateRef.current)
+    if (filterRef.current !== 'all') {
+      applyAuthorFilter(current, filterRef.current, hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(seatInfoRef.current))
+    }
+    const snap = await snapshot(current, true, hiddenStateRef.current)
+    await window.flyingdraws.submit({ requestId, note, decision: accept ? 'accepted' : 'rejected', skipped, ...snap })
     lastSavedVersion.current = elementsVersion(current.getSceneElements())
+  }, [])
+
+  const selectFilter = useCallback((next: AuthorFilter) => {
+    const target: AuthorFilter = next !== 'all' && filterRef.current === next ? 'all' : next
+    filterRef.current = target
+    setFilter(target)
+    if (apiRef.current) {
+      applyAuthorFilter(apiRef.current, target, hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(seatInfoRef.current))
+    }
   }, [])
 
   // 请求按先来后到一个一个处理，横幅上写明后面还排着几个
@@ -616,12 +971,46 @@ export default function App() {
     }
   }
 
+  const onlineSeats = hub.onlineSeats ?? []
+
   return (
     <>
       {/* 自己画的标题栏：和画布一个颜色，整条可以拖动窗口 */}
       <div className="fd-titlebar">
         <span className="fd-titlebar-app">Flying draws</span>
         <span className="fd-titlebar-board">{boardInfo.title ? `${boardInfo.title} (${boardInfo.board})` : boardInfo.board}</span>
+        <div className="fd-seats" aria-label="在线 agent 席位">
+          {onlineSeats.length ? (
+            <>
+              <span className="fd-seats-label">在线</span>
+              {onlineSeats.map((s) => {
+                const canFilter = s.drawn && isDynamicSeats(seatInfo) && seatInfo.seats.some((item) => item.name === s.name)
+                const active = canFilter && filter === `seat:${s.name}`
+                const title = [
+                  `席位：${s.name}`,
+                  s.waiting ? '正在等待你的画' : '已接入',
+                  canFilter ? '点击筛选该席位元素' : s.drawn ? '当前画板已落笔' : '当前画板尚未落笔'
+                ].join(' · ')
+                return (
+                  <button
+                    key={s.name}
+                    type="button"
+                    className={`fd-seat-pill${s.waiting ? ' fd-seat-pill-waiting' : ''}${active ? ' fd-seat-pill-active' : ''}`}
+                    title={title}
+                    disabled={!canFilter}
+                    onClick={() => canFilter && selectFilter(`seat:${s.name}`)}
+                  >
+                    <span className="fd-seat-dot" style={{ background: s.color }} />
+                    <span className="fd-seat-name">{s.name}</span>
+                    {s.waiting ? <span className="fd-seat-badge">等待中</span> : null}
+                  </button>
+                )
+              })}
+            </>
+          ) : (
+            <span className="fd-seats-empty">暂无 agent 接入</span>
+          )}
+        </div>
       </div>
       <div className="fd-canvas">
       <Excalidraw
@@ -687,7 +1076,20 @@ export default function App() {
             </button>
           </div>
         )}
-      />
+      >
+        <MainMenu>
+          <MainMenu.DefaultItems.LoadScene />
+          <MainMenu.DefaultItems.SaveToActiveFile />
+          <MainMenu.DefaultItems.Export />
+          <MainMenu.DefaultItems.SaveAsImage />
+          <MainMenu.DefaultItems.SearchMenu />
+          <MainMenu.DefaultItems.Help />
+          <MainMenu.DefaultItems.ClearCanvas />
+          <MainMenu.Separator />
+          <MainMenu.DefaultItems.ToggleTheme />
+          <MainMenu.DefaultItems.ChangeCanvasBackground />
+        </MainMenu>
+      </Excalidraw>
       </div>
       {creating ? (
         <BoardNameModal
@@ -725,9 +1127,9 @@ export default function App() {
           title="agent 画了它的理解（蓝色虚线部分），可以直接在上面改："
           prompt={request.prompt}
           queued={queued}
-          onSend={(note) => decide(request.id, request.proposalId!, true, note)}
+          onSend={(note) => decide(request.id, request.proposalId!, true, note, request.pending)}
           sendLabel="对，就这样"
-          onCancel={(note) => decide(request.id, request.proposalId!, false, note)}
+          onCancel={(note) => decide(request.id, request.proposalId!, false, note, request.pending)}
           cancelLabel="不对，去掉"
         />
       ) : request ? (
@@ -753,7 +1155,13 @@ export default function App() {
           cancelLabel="取消"
         />
       ) : hub.agentWaiting ? (
-        <div className="fd-waiting fd-waiting-live">agent 正在等你：画好后点右上角「发给 agent」</div>
+        <div className="fd-waiting fd-waiting-live">
+          agent 正在等你{hub.waitingAgents?.length ? `（${hub.waitingAgents.join('、')}）` : ''}：画好后点右上角「发给 agent」
+        </div>
+      ) : hub.handoff ? (
+        <div className="fd-waiting">
+          {hub.handoff.from} 把画笔递给了 {hub.handoff.to ?? '其他席位'}：「{hub.handoff.note}」
+        </div>
       ) : hub.inbox > 0 ? (
         <div className="fd-waiting">
           已发出{hub.inbox > 1 ? ` ${hub.inbox} 份` : ''}，agent 还没来取。在聊天里跟它说一声「画好了」
@@ -764,6 +1172,62 @@ export default function App() {
           {toast}
         </div>
       ) : null}
+      <div className="fd-filter" role="tablist" aria-label="按作者筛选显示">
+        {isDynamicSeats(seatInfo) ? (
+          <>
+            <button role="tab" aria-selected={filter === 'all'} className={filter === 'all' ? 'fd-filter-active' : undefined} onClick={() => selectFilter('all')}>
+              全部
+            </button>
+            <button role="tab" aria-selected={filter === 'user'} className={filter === 'user' ? 'fd-filter-active' : undefined} onClick={() => selectFilter('user')}>
+              我画的
+            </button>
+            {seatInfo.seats.map((s) => {
+              const key: AuthorFilter = `seat:${s.name}`
+              return (
+                <button
+                  key={s.name}
+                  role="tab"
+                  aria-selected={filter === key}
+                  className={filter === key ? 'fd-filter-active' : undefined}
+                  onClick={() => selectFilter(key)}
+                >
+                  <span className="fd-seat-dot" style={{ background: s.color }} />
+                  {s.name}
+                </button>
+              )
+            })}
+            {seatInfo.hasAnonAgent ? (
+              <button
+                role="tab"
+                aria-selected={filter === 'agent'}
+                className={filter === 'agent' ? 'fd-filter-active' : undefined}
+                onClick={() => selectFilter('agent')}
+              >
+                agent 画的
+              </button>
+            ) : null}
+          </>
+        ) : (
+          (
+            [
+              ['all', '全部'],
+              ['user', '我画的'],
+              ['agent', 'agent 画的'],
+              ['other', '其他 agent']
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              role="tab"
+              aria-selected={filter === key}
+              className={filter === key ? 'fd-filter-active' : undefined}
+              onClick={() => selectFilter(key)}
+            >
+              {label}
+            </button>
+          ))
+        )}
+      </div>
     </>
   )
 }

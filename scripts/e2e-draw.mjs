@@ -96,7 +96,7 @@ const textOf = (res) => res.content.filter((c) => c.type === 'text').map((c) => 
 
 try {
   const tools = (await client.listTools()).tools.map((t) => t.name)
-  check(tools.includes('canvas_draw'), '工具列表里有 canvas_draw')
+  check(tools.includes('canvas_draw') && tools.includes('canvas_pass'), '工具列表里有 canvas_draw 和 canvas_pass')
 
   const first = textOf(await call('canvas_read', { image: 'never' }))
   check(/画板是空的/.test(first), '隔离的画板一开始是空的')
@@ -168,10 +168,11 @@ try {
   const bad = await call('canvas_draw', { ops: [{ op: 'add_edge', from: 'nope', to: 'N1' }], base_version: ver + 2 })
   check(bad.isError && /unknown node "nope"/.test(textOf(bad)), '引用不存在的节点：报错并说明原因')
 
-  // 落盘的文件里有作者标记，别的 Excalidraw 也能打开
+  // 落盘的文件里有作者和 agent 署名标记，别的 Excalidraw 也能打开
   const saved = JSON.parse(readFileSync(join(HOME, 'boards', 'default.excalidraw'), 'utf8'))
   const mine = saved.elements.filter((el) => el.customData?.flyingdraws?.author === 'agent' && !el.isDeleted)
   check(saved.type === 'excalidraw' && mine.length === saved.elements.filter((el) => !el.isDeleted).length, `画板文件里 ${mine.length} 个元素都标了 agent`)
+  check(mine.every((el) => el.customData?.flyingdraws?.agent === 'flying-draws-e2e-draw'), '元素记录了调用方 agent 名字')
   const arrow = saved.elements.find((el) => el.type === 'arrow')
   const target = saved.elements.find((el) => el.id === arrow.endBinding?.elementId)
   check(Boolean(target?.boundElements?.some((b) => b.id === arrow.id)), '箭头和节点互相记录了绑定关系')
@@ -233,22 +234,120 @@ try {
   const modShot = (await call('canvas_read', { image: 'always' })).content.find((c) => c.type === 'image')
   if (modShot) writeFileSync(join(OUT, 'draw-modified.png'), Buffer.from(modShot.data, 'base64'))
 
-  // 用户画的东西不能动
+  // agent 可以直接修改、改样式和删除用户画的内容（节点、独立文字）
   await user.js(`(() => {
     const api = window.__flyingdrawsApi
     const all = api.getSceneElementsIncludingDeleted()
-    const model = all.find((e) => !e.isDeleted && e.type === 'rectangle')
-    const mine = { ...model, id: 'user_box_0', x: model.x - 400, boundElements: null, strokeColor: '#1e1e1e' }
-    delete mine.customData
-    delete mine.index
-    api.updateScene({ elements: [...all, mine] })
+    const rectModel = all.find((e) => !e.isDeleted && e.type === 'rectangle')
+    const textModel = all.find((e) => !e.isDeleted && e.type === 'text' && !e.containerId)
+    const mine1 = { ...rectModel, id: 'user_box_0', x: rectModel.x - 450, y: rectModel.y, width: 120, height: 60, boundElements: null, strokeColor: '#1e1e1e', backgroundColor: 'transparent' }
+    const mine2 = { ...rectModel, id: 'user_box_keep', x: rectModel.x - 450, y: rectModel.y + 180, width: 120, height: 60, boundElements: null, strokeColor: '#1e1e1e', backgroundColor: 'transparent' }
+    const note = { ...textModel, id: 'user_note_0', x: rectModel.x - 450, y: rectModel.y - 60, text: '用户原注', originalText: '用户原注' }
+    for (const el of [mine1, mine2, note]) {
+      delete el.customData
+      delete el.index
+    }
+    api.updateScene({ elements: [...all, mine1, mine2, note] })
     return true
   })()`)
   const s2 = await readNow()
   const userBox = s2.t.match(/(N\d+) （无文字）矩形(?!【)/)?.[1]
-  const forbidden = await call('canvas_draw', { base_version: s2.v, ops: [{ op: 'delete_node', id: userBox }] })
-  check(Boolean(userBox) && forbidden.isError && /was drawn by the user/.test(textOf(forbidden)), `用户画的节点（${userBox}）agent 删不了`)
-  check((await readNow()).t.includes(`${userBox} （无文字）矩形`), '被拒绝后用户的节点还在')
+  const userNote = s2.t.match(/(T\d+) 「用户原注」/)?.[1]
+  const styled = await call('canvas_draw', {
+    base_version: s2.v,
+    ops: [
+      { op: 'set_style', id: userBox, color: '#e03131', fill: '#ffec99', shape: 'diamond', width: 200, height: 100 },
+      { op: 'update_node', id: userBox, label: '改名' },
+      { op: 'update_text', id: userNote, text: 'agent 改过的注释' }
+    ]
+  })
+  const styledText = textOf(styled)
+  check(
+    !styled.isError && /1 styled/.test(styledText) && /「改名」菱形/.test(styledText) && /「agent 改过的注释」/.test(styledText),
+    `agent 可直接给用户节点改样式/改字并修改独立文字（${userBox} / ${userNote}）`
+  )
+  const diskStyled = () => JSON.parse(readFileSync(join(HOME, 'boards', 'default.excalidraw'), 'utf8')).elements.filter((el) => !el.isDeleted)
+  const styledBoxOnDisk = diskStyled().find((el) => el.id === 'user_box_0')
+  check(
+    styledBoxOnDisk?.type === 'diamond' &&
+      styledBoxOnDisk?.strokeColor === '#e03131' &&
+      styledBoxOnDisk?.backgroundColor === '#ffec99' &&
+      styledBoxOnDisk?.width === 200 &&
+      styledBoxOnDisk?.height === 100,
+    'set_style 的形状、颜色、填充和尺寸已写入画板文件'
+  )
+
+  const s2b = await readNow()
+  const boxToDelete = s2b.t.match(/(N\d+) 「改名」菱形/)?.[1]
+  const delRes = await call('canvas_draw', { base_version: s2b.v, ops: [{ op: 'delete_node', id: boxToDelete }] })
+  check(!delRes.isError && !/「改名」/.test(textOf(delRes)), `agent 可直接删除用户节点（${boxToDelete}）`)
+
+  // 带改动的提议：生成虚线标记框，用户删掉其中一个标记框后点接受，被删掉的那处不执行并报回给 agent
+  const s2p = await readNow()
+  const keepBoxId = s2p.t.match(/(N\d+) （无文字）矩形(?!【)/)?.[1]
+  const noteToDel = s2p.t.match(/(T\d+) 「agent 改过的注释」/)?.[1]
+  const propMod = textOf(
+    await call('canvas_propose', {
+      base_version: s2p.v,
+      question: '（自动测试）把左下角框标绿、并删掉旁边那行注释，好吗？',
+      ops: [
+        { op: 'set_style', id: keepBoxId, color: '#2f9e44' },
+        { op: 'delete_text', id: noteToDel },
+        { op: 'add_node', id: 'prop_extra', label: '追加补充框' }
+      ]
+    })
+  )
+  const reqMod = propMod.match(/req_\w+/)?.[0]
+  check(Boolean(reqMod) && /2 edit marker\(s\)/.test(propMod), 'canvas_propose 带改动和删除时返回了 2 个标记框')
+  await user.waitForBanner()
+  // 模拟用户在画布上删掉代表"删除注释"的红色标记框，保留蓝色"改样式"标记框
+  const removedOneMarker = await user.js(`(() => {
+    const api = window.__flyingdrawsApi
+    const all = api.getSceneElementsIncludingDeleted()
+    const delFrame = all.find((e) => !e.isDeleted && e.customData?.flyingdraws?.role === 'marker' && e.type === 'rectangle' && e.strokeColor === '#e03131')
+    if (!delFrame) return false
+    const gid = delFrame.groupIds?.[0]
+    api.updateScene({
+      elements: all.map((e) => (e.id === delFrame.id || (gid && e.groupIds?.includes(gid)) ? { ...e, isDeleted: true, version: e.version + 1 } : e))
+    })
+    return true
+  })()`)
+  check(removedOneMarker === true, '（扮演用户）在画布上删掉其中一处删除标记框')
+  const wMod = call('canvas_wait', { request_id: reqMod, timeout_s: 30, image: 'never' })
+  await user.click('对，就这样')
+  const rMod = textOf(await wMod)
+  check(
+    /ACCEPTED/.test(rMod) && /不同意删除文字「agent 改过的注释」/.test(rMod) && /「agent 改过的注释」/.test(rMod) && /「追加补充框」矩形【agent 画的】/.test(rMod),
+    '接受提议后：被删标记框对应的删除被跳过并写进 changes，其余改动和新增生效'
+  )
+  const afterPropDisk = diskStyled()
+  check(
+    afterPropDisk.find((e) => e.id === 'user_box_keep')?.strokeColor === '#2f9e44' &&
+      !afterPropDisk.some((e) => e.customData?.flyingdraws?.role === 'marker'),
+    '保留的样式改动已落地且标记框全部清理'
+  )
+
+  // 底部按作者筛选标签：切到「我画的」只隐藏画布显示，不改磁盘也不影响 agent 读取
+  await user.click('我画的')
+  await sleep(200)
+  const filterState = await user.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements()
+    const userEl = els.find((e) => e.id === 'user_box_keep')
+    const agentEls = els.filter((e) => e.customData?.flyingdraws?.author === 'agent')
+    return {
+      userVisible: userEl ? userEl.opacity === 100 && !userEl.locked : false,
+      agentHidden: agentEls.length > 0 && agentEls.every((e) => e.opacity === 0 && e.locked === true)
+    }
+  })()`)
+  check(filterState.userVisible && filterState.agentHidden, '点「我画的」筛选标签：只显示用户元素，agent 元素隐藏且锁定')
+  const readWhileFiltered = textOf(await call('canvas_read', { image: 'never' }))
+  check(/「个人主页」矩形【agent 画的】/.test(readWhileFiltered), '筛选隐藏期间，agent 依然能读到完整画板')
+  await user.click('全部')
+  await sleep(200)
+  const restoredVisible = await user.js(
+    `window.__flyingdrawsApi.getSceneElements().filter((e) => e.customData?.flyingdraws?.author === 'agent').every((e) => e.opacity === 100 && !e.locked)`
+  )
+  check(restoredVisible === true, '点回「全部」筛选标签后，所有元素恢复显示和可编辑')
 
   // 冲突一：agent 读过之后，用户动了它想改的那个节点
   const s3 = await readNow()
@@ -546,6 +645,97 @@ try {
       deleteDisabledOnLast === true,
     'MCP canvas_delete 能删除指定画板；只剩最后一块画板时 UI 删除按钮禁用'
   )
+
+  // 第八次：多席位联手作画、动态席位配色/筛选与 canvas_pass 递画笔
+  await call('canvas_open', { board: 'collab', title: '联手作画' })
+  await sleep(300)
+  const client2 = new Client({ name: 'flying-draws-e2e-peer', version: '0.0.1' })
+  await client2.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [join(ROOT, 'out/bridge/index.js')],
+      env: { ...process.env, FLYINGDRAWS_HOME: HOME, FLYINGDRAWS_DEBUG_PORT: String(DEBUG_PORT) },
+      stderr: 'inherit'
+    })
+  )
+  const call2 = (name, args = {}) => client2.callTool({ name, arguments: args }, undefined, { timeout: 120000 })
+  try {
+    // 还没落笔前，先读一次画布声明席位，状态栏应该立刻显示两个在线席位
+    await call('canvas_read', { board: 'collab', as: '前端', image: 'never' })
+    await call2('canvas_read', { board: 'collab', as: '后端', image: 'never' })
+    await sleep(250)
+    const onlineBeforeDraw = await user3.js(`[...document.querySelectorAll('.fd-seat-pill .fd-seat-name')].map((s) => s.textContent.trim())`)
+    check(
+      onlineBeforeDraw.includes('前端') && onlineBeforeDraw.includes('后端'),
+      '两个席位只需读一次画布，还没落笔也会实时出现在顶部在线席位栏'
+    )
+
+    await call('canvas_draw', { board: 'collab', as: '前端', ops: [{ op: 'add_node', id: 'h1', label: '前端草图' }] })
+    const peerRead = textOf(
+      await call2('canvas_draw', { board: 'collab', as: '后端', ops: [{ op: 'add_node', id: 'f1', label: '后端接口' }] })
+    )
+    check(
+      /「前端草图」矩形【其他 agent（前端）画的】/.test(peerRead) && /「后端接口」矩形【agent 画的】/.test(peerRead),
+      '两个席位画在同一画板上，互读时准确标出「其他 agent（xxx）」'
+    )
+    const collabDisk = JSON.parse(readFileSync(join(HOME, 'boards', 'collab.excalidraw'), 'utf8')).elements.filter((el) => !el.isDeleted)
+    const hEl = collabDisk.find((el) => el.customData?.flyingdraws?.agent === '前端')
+    const fEl = collabDisk.find((el) => el.customData?.flyingdraws?.agent === '后端')
+    check(
+      hEl?.strokeColor === '#1971c2' && fEl?.strokeColor === '#7048e8' && hEl?.customData?.flyingdraws?.seat === true,
+      '两个席位自动分配不同专属颜色并写入席位标记'
+    )
+    await sleep(300)
+    const filterTabs = await user3.js(`[...document.querySelectorAll('.fd-filter button')].map((b) => b.textContent.trim())`)
+    check(
+      filterTabs.includes('前端') && filterTabs.includes('后端'),
+      '页面底部动态出现「前端」「后端」席位筛选按钮'
+    )
+    await user3.click('后端')
+    await sleep(200)
+    const onlyPeerVisible = await user3.js(`(() => {
+      const els = window.__flyingdrawsApi.getSceneElements()
+      const h = els.find((e) => e.customData?.flyingdraws?.agent === '前端')
+      const f = els.find((e) => e.customData?.flyingdraws?.agent === '后端')
+      return h?.opacity === 0 && h?.locked === true && f?.opacity === 100 && !f?.locked
+    })()`)
+    check(onlyPeerVisible === true, '点击「后端」席位标签只显示后端画的内容，隐藏前端的内容')
+    await user3.click('全部')
+    await sleep(200)
+
+    // 递画笔场景一：后端正在等待，前端直接递过去立即唤醒
+    const peerWaiting = call2('canvas_wait', { board: 'collab', as: '后端', timeout_s: 20, image: 'never' })
+    await until(async () => /正在等你（后端）/.test((await user3.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)) ?? ''))
+    const passDirect = textOf(await call('canvas_pass', { board: 'collab', as: '前端', to: '后端', note: '前端框好了，请补接口' }))
+    const peerGot = textOf(await peerWaiting)
+    check(
+      /directly to waiting seat "后端"/.test(passDirect) && /passed the brush to you/.test(peerGot) && /前端框好了，请补接口/.test(peerGot),
+      'canvas_pass 直接唤醒正在 canvas_wait 的目标席位并送达附言与画布'
+    )
+
+    // 递画笔场景二：对方还没等，先挂在画板上再由对方 canvas_read 接手
+    const passQueued = textOf(await call2('canvas_pass', { board: 'collab', as: '后端', to: '前端', note: '接口补好了，请核对' }))
+    await sleep(200)
+    const handoffNotice = await user3.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)
+    check(
+      /queued/.test(passQueued) && /后端 把画笔递给了 前端：「接口补好了，请核对」/.test(handoffNotice),
+      '对方尚未等待时，canvas_pass 挂起交接并在画布顶部提示'
+    )
+    const readTaken = textOf(await call('canvas_read', { board: 'collab', as: '前端', image: 'never' }))
+    await sleep(200)
+    const handoffCleared = await user3.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)
+    check(
+      /Agent "后端" passed the brush to you: "接口补好了，请核对"/.test(readTaken) && !handoffCleared,
+      '目标席位调用 canvas_read 时自动接走画笔并清除顶部交接提示'
+    )
+  } finally {
+    await client2.close()
+  }
+  await sleep(300)
+  const onlineAfterPeerClose = await user3.js(`[...document.querySelectorAll('.fd-seat-pill .fd-seat-name')].map((s) => s.textContent.trim())`)
+  check(!onlineAfterPeerClose.includes('后端') && onlineAfterPeerClose.includes('前端'), '第二个桥接断开后，「后端」立即从在线席位栏撤下')
+  await call('canvas_delete', { board: 'collab' })
+  await sleep(300)
 
   // 界面截图：浅色和深色各一张，菜单开着
   await user3.screenshot(join(OUT, 'ui-menu.png'))

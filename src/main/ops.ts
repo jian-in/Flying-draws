@@ -1,26 +1,42 @@
 // agent 的绘图指令（ops）→ 一份"绘图计划"：每个新元素的 id、位置、大小都在这里定好。
 // 纯函数，不依赖 Electron。页面拿到计划后只负责把它变成 Excalidraw 元素。
 //
-// 新增：add_node、add_edge、add_text。改动：update_node、delete_node、update_edge、delete_edge（只能动 agent 自己画的）。
+// 新增：add_node、add_edge、add_text。
+// 改动：update_node、delete_node、update_edge、delete_edge、update_text、delete_text、delete_strokes、set_style。
+// 改动可以用在任何人画的东西上（用户的、别的 agent 的都行，design.md 12.4）；还在等用户确认的提议除外。
 // 排版：这一批里没指定坐标的新节点交给 dagre 排成一块，整块放在已有内容下方；
-// 已有元素一律不动。
+// 已有元素不会被挪动。
 import dagre from '@dagrejs/dagre'
+// 带 .ts 后缀：单元测试是用 node 直接跑这些文件的，node 不会自己补后缀
+import { exitPoint, type ShapeBox } from './geometry.ts'
 import type { Bbox, SemanticGraph } from './semantic'
 
 export type NodeShape = 'rectangle' | 'ellipse' | 'diamond'
 export type Direction = 'right' | 'down'
 
+export interface StyleProps {
+  color?: string // 线条和文字的颜色
+  fill?: string // 填充色，只对节点有用；"transparent" 表示不填充
+  shape?: NodeShape // 只对节点有用
+  width?: number // 只对节点有用；中心不动
+  height?: number
+}
+
 export type DrawOp =
   | { op: 'add_node'; id: string; label?: string; shape?: NodeShape; x?: number; y?: number }
   | { op: 'add_edge'; from: string; to: string; label?: string }
   | { op: 'add_text'; text: string; near?: string; x?: number; y?: number }
-  // 下面四种会改动已有元素。agent 只能改自己画的（design.md 12.4），而且只能用在 canvas_draw 里。
+  // 下面这些会改动已有元素
   | { op: 'update_node'; id: string; label: string }
   | { op: 'delete_node'; id: string }
   | { op: 'update_edge'; from: string; to: string; label: string }
   | { op: 'delete_edge'; from: string; to: string }
+  | { op: 'update_text'; id: string; text: string } // 独立文字（T1 这类编号）
+  | { op: 'delete_text'; id: string }
+  | { op: 'delete_strokes'; id: string } // 一组手写或一笔手绘（S1 这类编号）
+  | ({ op: 'set_style'; id?: string; from?: string; to?: string } & StyleProps) // id 是节点、文字或手绘；from + to 指一条连线
 
-export const MODIFY_OPS = ['update_node', 'delete_node', 'update_edge', 'delete_edge']
+export const MODIFY_OPS = ['update_node', 'delete_node', 'update_edge', 'delete_edge', 'update_text', 'delete_text', 'delete_strokes', 'set_style']
 
 export interface PlannedNode {
   key: string // agent 在 ops 里起的名字
@@ -54,10 +70,47 @@ export interface DrawPlan {
   nodes: PlannedNode[]
   edges: PlannedEdge[]
   texts: PlannedText[]
-  updates: { elementId: string; textId: string; label: string | null }[] // 换掉节点里或连线上的文字；textId 是新文字元素的 id
-  deletes: string[] // 要删的节点或连线。绑在上面的文字、连着被删节点的 agent 连线由页面一并处理
+  // 换掉节点里或连线上的文字；textId 是新文字元素的 id。relayout 为 true 表示文字没变，只是节点改了形状或大小，要重新摆一下
+  updates: { elementId: string; textId: string; label: string | null; relayout?: boolean }[]
+  textEdits: { elementId: string; text: string }[] // 改独立文字的内容
+  styles: PlannedStyle[]
+  deletes: string[] // 要删的元素（节点、连线、独立文字、手绘笔画）。绑在上面的文字、连着被删节点的 agent 连线由页面一并处理
+  markers: PlannedMarker[] // 只有提议里才有：改动先不执行，画一个标记框告诉用户"打算改这里"
+  targetGroups: string[][] // 每条改动指令对应的元素。一组手写是好几个元素，要合在一起标记
   existingRefs: string[] // 这批指令引用到的已有元素（Excalidraw id），页面执行前要确认它们还在
   modifiedRefs: string[] // 其中要被改动或删除的。这些元素在 agent 读过之后不能被别人动过
+}
+
+export interface PlannedStyle {
+  elementId: string
+  color?: string
+  fill?: string
+  shape?: NodeShape
+  w?: number
+  h?: number
+}
+
+// 提议里的一处改动：围着目标画一个虚线框，旁边写上打算怎么改。用户把框删掉就表示不同意这一处。
+export interface PlannedMarker {
+  frameId: string
+  noteId: string
+  x: number
+  y: number
+  w: number
+  h: number
+  tone: 'delete' | 'change' // 删除用红色，其他改动用蓝色
+  note: string // 写在框旁边的话，如"删除"、"改成「登录」"
+  targets: string[] // 这个标记对应的元素
+  summary: string // 给 agent 看的一句话，如"删除节点「登录」"
+}
+
+// 提议被接受时才执行的改动。存在请求上，跟着 pending.json 落盘。
+export interface PendingChanges {
+  updates: DrawPlan['updates']
+  textEdits: DrawPlan['textEdits']
+  styles: PlannedStyle[]
+  deletes: string[]
+  markers: { frameId: string; targets: string[]; summary: string }[]
 }
 
 // agent 上一次读到的编号 → 现在的编号。
@@ -70,7 +123,12 @@ export function rebaseOps(
 ): { ops: DrawOp[]; gone: string[] } {
   const fresh = new Set(ops.flatMap((op) => (op.op === 'add_node' ? [String(op.id)] : [])))
   const refOf = new Map(base.map((n) => [n.id, n.ref]))
-  const nowOf = new Map(graph.nodes.map((n) => [n.ref, n.id]))
+  // 元素 → 现在的编号。手绘分组里每一笔都指向那一组：只要当时那组的第一笔还在，就认作同一组
+  const nowOf = new Map<string, string>()
+  for (const n of graph.nodes) nowOf.set(n.ref, n.id)
+  for (const n of graph.notes) nowOf.set(n.ref, n.id)
+  for (const s of graph.strokes) nowOf.set(s.ref, s.id)
+  for (const g of graph.strokeGroups) for (const ref of g.refs) nowOf.set(ref, g.id)
   const gone = new Set<string>()
   const fix = <T>(id: T): T => {
     if (typeof id !== 'string' || fresh.has(id)) return id
@@ -93,7 +151,12 @@ export function rebaseOps(
         return { ...op, near: fix(op.near) }
       case 'update_node':
       case 'delete_node':
+      case 'update_text':
+      case 'delete_text':
+      case 'delete_strokes':
         return { ...op, id: fix(op.id) }
+      case 'set_style':
+        return { ...op, id: fix(op.id), from: fix(op.from), to: fix(op.to) }
       default:
         return op
     }
@@ -140,27 +203,8 @@ function nodeSize(shape: NodeShape, label: string | null): { w: number; h: numbe
   }
 }
 
-interface Box extends Bbox {
-  shape: string // rectangle / ellipse / diamond，其他类型都按矩形算
-}
-
-// 从图形中心朝 (tx, ty) 方向走，走到图形轮廓再往外 gap 的那个点
-export function exitPoint(b: Box, tx: number, ty: number, gap: number): [number, number] {
-  const cx = b.x + b.w / 2
-  const cy = b.y + b.h / 2
-  const dx = tx - cx
-  const dy = ty - cy
-  const len = Math.hypot(dx, dy)
-  if (len === 0) return [cx, cy]
-  const a = b.w / 2
-  const c = b.h / 2
-  let t: number // 中心到轮廓的距离占 (dx, dy) 的比例
-  if (b.shape === 'ellipse') t = 1 / Math.hypot(dx / a, dy / c)
-  else if (b.shape === 'diamond') t = 1 / (Math.abs(dx) / a + Math.abs(dy) / c)
-  else t = Math.min(dx === 0 ? Infinity : a / Math.abs(dx), dy === 0 ? Infinity : c / Math.abs(dy))
-  t += gap / len
-  return [cx + dx * t, cy + dy * t]
-}
+type Box = ShapeBox
+export { exitPoint }
 
 function centerOf(b: Bbox): [number, number] {
   return [b.x + b.w / 2, b.y + b.h / 2]
@@ -172,6 +216,40 @@ function isFiniteNumber(v: unknown): v is number {
 
 function cleanLabel(v: unknown): string | null {
   return typeof v === 'string' && v.trim() ? v.trim() : null
+}
+
+const COLOR_RE = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i
+const SIZE_MIN = 20
+const SIZE_MAX = 4000
+
+// 校验 set_style 里的样式，只留下真正给了的那几项
+function styleProps(op: StyleProps, where: string): Omit<PlannedStyle, 'elementId'> {
+  const out: Omit<PlannedStyle, 'elementId'> = {}
+  if (op.color !== undefined) {
+    if (typeof op.color !== 'string' || !COLOR_RE.test(op.color)) throw new OpsError(`${where}: "color" must be a hex color like "#e03131"`)
+    out.color = op.color.toLowerCase()
+  }
+  if (op.fill !== undefined) {
+    if (typeof op.fill !== 'string' || (op.fill !== 'transparent' && !COLOR_RE.test(op.fill))) {
+      throw new OpsError(`${where}: "fill" must be a hex color like "#ffec99", or "transparent"`)
+    }
+    out.fill = op.fill.toLowerCase()
+  }
+  if (op.shape !== undefined) {
+    if (!['rectangle', 'ellipse', 'diamond'].includes(op.shape)) throw new OpsError(`${where}: unknown shape "${String(op.shape)}"`)
+    out.shape = op.shape
+  }
+  const size = (v: unknown, name: string): number | undefined => {
+    if (v === undefined) return undefined
+    if (!isFiniteNumber(v) || v < SIZE_MIN || v > SIZE_MAX) throw new OpsError(`${where}: "${name}" must be a number between ${SIZE_MIN} and ${SIZE_MAX}`)
+    return Math.round(v)
+  }
+  const w = size(op.width, 'width')
+  const h = size(op.height, 'height')
+  if (w !== undefined) out.w = w
+  if (h !== undefined) out.h = h
+  if (!Object.keys(out).length) throw new OpsError(`${where}: set_style needs at least one of color, fill, shape, width, height`)
+  return out
 }
 
 export function planOps(
@@ -228,21 +306,19 @@ export function planOps(
   const edgeOps: { from: string; to: string; label: string | null }[] = []
   const textOps: { text: string; near: string | null; x: number | null; y: number | null }[] = []
 
-  // 改动和删除：只能动 agent 自己画的、已经在正式层上的东西
+  // 改动和删除：谁画的都能动（用户的、别的 agent 的），只有还在等用户确认的提议不行
   const updates: DrawPlan['updates'] = []
+  const textEdits: DrawPlan['textEdits'] = []
+  const styles = new Map<string, PlannedStyle>()
+  const relayout = new Map<string, string>() // 改了形状或大小的节点 → 它里面的文字（要重新摆）
+  const targetGroups: string[][] = []
   const deletes = new Set<string>()
   const modifiedRefs = new Set<string>()
   const deletedKeys = new Set<string>()
-  const own = (item: { author: string; proposed: boolean }, what: string, where: string): void => {
-    if (item.author !== 'agent') {
-      throw new OpsError(
-        `${where}: ${what} was drawn by the user. You can only change or delete things you drew yourself. ` +
-          'To suggest a change to the user\'s drawing, say it in the chat, or draw your version with canvas_propose.'
-      )
-    }
+  const settled = (item: { proposed: boolean }, what: string, where: string): void => {
     if (item.proposed) throw new OpsError(`${where}: ${what} is part of a proposal the user has not answered yet. Wait for their answer (canvas_wait) first.`)
   }
-  const ownNode = (key: string, where: string) => {
+  const oldNode = (key: string, where: string) => {
     const node = existing.get(key)
     if (!node) {
       throw new OpsError(
@@ -251,24 +327,46 @@ export function planOps(
           : `${where}: unknown node "${key}". Use a node id (like N1) from your latest canvas_read`
       )
     }
-    own(node, `node ${key}`, where)
+    settled(node, `node ${key}`, where)
     return node
   }
-  const ownEdge = (from: string, to: string, where: string) => {
+  const oldEdge = (from: string, to: string, where: string) => {
     for (const key of [from, to]) if (!existing.has(key)) throw new OpsError(`${where}: unknown node "${key}". Use node ids (like N1) from your latest canvas_read`)
     const edge =
       graph.edges.find((e) => e.from === from && e.to === to) ??
       graph.edges.find((e) => e.directed !== 'forward' && e.from === to && e.to === from) // 没有方向或双向的线，两头反着说也认
     if (!edge) throw new OpsError(`${where}: there is no arrow from ${from} to ${to} on the canvas`)
-    own(edge, `the arrow from ${from} to ${to}`, where)
+    settled(edge, `the arrow from ${from} to ${to}`, where)
     return edge
+  }
+  const notesById = new Map(graph.notes.map((n) => [n.id, n]))
+  const oldText = (key: string, where: string) => {
+    const note = notesById.get(key)
+    if (!note) throw new OpsError(`${where}: unknown text "${key}". Use a text id (like T1) from your latest canvas_read`)
+    settled(note, `text ${key}`, where)
+    return note
+  }
+  const strokeRefs = new Map<string, string[]>([
+    ...graph.strokeGroups.map((g): [string, string[]] => [g.id, g.refs]),
+    ...graph.strokes.map((s): [string, string[]] => [s.id, [s.ref]])
+  ])
+  const oldStrokes = (key: string, where: string): string[] => {
+    const refs = strokeRefs.get(key)
+    if (!refs) throw new OpsError(`${where}: unknown hand-drawn strokes "${key}". Use a stroke id (like S1) from your latest canvas_read`)
+    return refs
+  }
+  const touch = (refs: string[]): void => {
+    for (const ref of refs) {
+      existingRefs.add(ref)
+      modifiedRefs.add(ref)
+    }
+    targetGroups.push(refs)
   }
 
   ops.forEach((op, i) => {
     if (op.op === 'update_node' || op.op === 'delete_node') {
-      const node = ownNode(String(op.id ?? ''), `ops[${i}].id`)
-      existingRefs.add(node.ref)
-      modifiedRefs.add(node.ref)
+      const node = oldNode(String(op.id ?? ''), `ops[${i}].id`)
+      touch([node.ref])
       if (op.op === 'delete_node') {
         deletes.add(node.ref)
         deletedKeys.add(node.id)
@@ -276,11 +374,58 @@ export function planOps(
         updates.push({ elementId: node.ref, textId: newId(), label: cleanLabel(op.label) })
       }
     } else if (op.op === 'update_edge' || op.op === 'delete_edge') {
-      const edge = ownEdge(String(op.from ?? ''), String(op.to ?? ''), `ops[${i}]`)
-      existingRefs.add(edge.ref)
-      modifiedRefs.add(edge.ref)
+      const edge = oldEdge(String(op.from ?? ''), String(op.to ?? ''), `ops[${i}]`)
+      touch([edge.ref])
       if (op.op === 'delete_edge') deletes.add(edge.ref)
       else updates.push({ elementId: edge.ref, textId: newId(), label: cleanLabel(op.label) })
+    } else if (op.op === 'update_text' || op.op === 'delete_text') {
+      const note = oldText(String(op.id ?? ''), `ops[${i}].id`)
+      touch([note.ref])
+      if (op.op === 'delete_text') {
+        deletes.add(note.ref)
+      } else {
+        const text = String(op.text ?? '').trim()
+        if (!text) throw new OpsError(`ops[${i}]: update_text needs "text". To remove the text, use delete_text`)
+        textEdits.push({ elementId: note.ref, text })
+      }
+    } else if (op.op === 'delete_strokes') {
+      const refs = oldStrokes(String(op.id ?? ''), `ops[${i}].id`)
+      touch(refs)
+      for (const ref of refs) deletes.add(ref)
+    } else if (op.op === 'set_style') {
+      const where = `ops[${i}]`
+      const props = styleProps(op, where)
+      let refs: string[]
+      let what: string
+      let shaped = false // 只有矩形、椭圆、菱形能改填充、形状和大小
+      const key = typeof op.id === 'string' ? op.id.trim() : ''
+      if (key) {
+        if (existing.has(key) || byKey.has(key)) {
+          const node = oldNode(key, `${where}.id`)
+          refs = [node.ref]
+          what = `node ${key}`
+          shaped = ['rectangle', 'ellipse', 'diamond'].includes(node.kind)
+          if (shaped && node.label && (props.shape || props.w || props.h)) relayout.set(node.ref, node.label)
+        } else if (notesById.has(key)) {
+          refs = [oldText(key, `${where}.id`).ref]
+          what = `text ${key}`
+        } else if (strokeRefs.has(key)) {
+          refs = oldStrokes(key, `${where}.id`)
+          what = `hand-drawn strokes ${key}`
+        } else {
+          throw new OpsError(`${where}.id: unknown id "${key}". Use a node (N1), text (T1) or stroke (S1) id from your latest canvas_read`)
+        }
+      } else if (op.from && op.to) {
+        refs = [oldEdge(String(op.from), String(op.to), where).ref]
+        what = `the arrow from ${op.from} to ${op.to}`
+      } else {
+        throw new OpsError(`${where}: set_style needs "id" (a node, text or stroke id), or "from" and "to" for an arrow`)
+      }
+      if (!shaped && (props.fill || props.shape || props.w || props.h)) {
+        throw new OpsError(`${where}: only "color" can be changed on ${what}; fill, shape, width and height work on rectangle, ellipse and diamond nodes`)
+      }
+      touch(refs)
+      for (const ref of refs) styles.set(ref, { ...styles.get(ref), ...props, elementId: ref })
     } else if (op.op === 'add_edge') {
       const from = check(String(op.from ?? ''), `ops[${i}].from`)
       const to = check(String(op.to ?? ''), `ops[${i}].to`)
@@ -298,10 +443,16 @@ export function planOps(
       })
     } else if (op.op !== 'add_node') {
       throw new OpsError(
-        `ops[${i}]: unknown op "${String((op as { op?: unknown }).op)}". Supported: add_node, add_edge, add_text, update_node, delete_node, update_edge, delete_edge`
+        `ops[${i}]: unknown op "${String((op as { op?: unknown }).op)}". Supported: add_node, add_edge, add_text, ` +
+          'update_node, delete_node, update_edge, delete_edge, update_text, delete_text, delete_strokes, set_style'
       )
     }
   })
+  // 节点改了形状或大小，里面的文字要重新摆；这一批里已经在改它的字、或者要删它的就不用了
+  for (const [ref, label] of relayout) {
+    if (deletes.has(ref) || updates.some((u) => u.elementId === ref)) continue
+    updates.push({ elementId: ref, textId: newId(), label, relayout: true })
+  }
   // 同一批里又删又用同一个节点，说明指令自相矛盾
   for (const e of edgeOps) {
     for (const key of [e.from, e.to]) if (deletedKeys.has(key)) throw new OpsError(`this call deletes node ${key} and also adds an arrow to it`)
@@ -447,5 +598,91 @@ export function planOps(
     return { elementId: newId(), text: t.text, x, y }
   })
 
-  return { nodes, edges, texts, updates, deletes: [...deletes], existingRefs: [...existingRefs], modifiedRefs: [...modifiedRefs] }
+  return {
+    nodes,
+    edges,
+    texts,
+    updates,
+    textEdits,
+    styles: [...styles.values()],
+    deletes: [...deletes],
+    markers: [],
+    targetGroups,
+    existingRefs: [...existingRefs],
+    modifiedRefs: [...modifiedRefs]
+  }
+}
+
+const SHAPE_WORDS: Record<NodeShape, string> = { rectangle: '矩形', ellipse: '椭圆', diamond: '菱形' }
+const MARKER_PAD = 10
+const clip = (s: string, max = 30): string => (s.length > max ? `${s.slice(0, max)}…` : s)
+
+// 把一份带改动的计划变成"提议"：新增的照常画在提议层上，改动先不执行，
+// 每处改动换成一个标记框（围着目标的虚线框加一句说明），真正的改动放进 pending，等用户接受时再做。
+// info.box 给出元素现在的位置，info.name 给出给 agent 看的叫法（如"节点「登录」"）。
+export function toProposalPlan(
+  plan: DrawPlan,
+  info: { box: (ref: string) => Bbox | null; name: (refs: string[]) => string },
+  newId: () => string
+): { plan: DrawPlan; pending: PendingChanges | null } {
+  const seen = new Set<string>()
+  const markers: PlannedMarker[] = []
+  for (const refs of plan.targetGroups) {
+    const key = refs[0]
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    const boxes = refs.map((ref) => info.box(ref)).filter((b) => b !== null)
+    if (!boxes.length) continue
+    const x0 = Math.min(...boxes.map((b) => b.x)) - MARKER_PAD
+    const y0 = Math.min(...boxes.map((b) => b.y)) - MARKER_PAD
+    const x1 = Math.max(...boxes.map((b) => b.x + b.w)) + MARKER_PAD
+    const y1 = Math.max(...boxes.map((b) => b.y + b.h)) + MARKER_PAD
+
+    const parts: string[] = []
+    const removed = refs.every((ref) => plan.deletes.includes(ref))
+    if (removed) {
+      parts.push('删除')
+    } else {
+      const update = plan.updates.find((u) => u.elementId === key && !u.relayout)
+      if (update) parts.push(update.label ? `改成「${clip(update.label)}」` : '去掉文字')
+      const edit = plan.textEdits.find((t) => t.elementId === key)
+      if (edit) parts.push(`改成「${clip(edit.text)}」`)
+      const style = plan.styles.find((s) => s.elementId === key)
+      if (style) {
+        const bits = [
+          style.color ? `颜色 ${style.color}` : '',
+          style.fill ? `填充 ${style.fill === 'transparent' ? '去掉' : style.fill}` : '',
+          style.shape ? `形状 ${SHAPE_WORDS[style.shape]}` : '',
+          style.w || style.h ? `大小 ${style.w ?? '不变'}×${style.h ?? '不变'}` : ''
+        ].filter(Boolean)
+        parts.push(`改样式：${bits.join('、')}`)
+      }
+    }
+    if (!parts.length) continue
+    const note = parts.join('，')
+    const name = info.name(refs)
+    markers.push({
+      frameId: newId(),
+      noteId: newId(),
+      x: x0,
+      y: y0,
+      w: x1 - x0,
+      h: y1 - y0,
+      tone: removed ? 'delete' : 'change',
+      note,
+      targets: refs,
+      summary: removed ? `删除${name}` : `把${name}${note}`
+    })
+  }
+  if (!markers.length) return { plan, pending: null }
+  return {
+    plan: { ...plan, updates: [], textEdits: [], styles: [], deletes: [], markers },
+    pending: {
+      updates: plan.updates,
+      textEdits: plan.textEdits,
+      styles: plan.styles,
+      deletes: plan.deletes,
+      markers: markers.map(({ frameId, targets, summary }) => ({ frameId, targets, summary }))
+    }
+  }
 }

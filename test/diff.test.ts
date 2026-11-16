@@ -87,3 +87,30 @@ test('用户自己加的东西单独列出来，agent 后来画的不算', () =>
   ]
   assert.deepEqual(diffProposal(baseline(), now), ['自己加了：节点「写缓存」、1 条连线、2 笔手绘'])
 })
+
+test('提议里的改动预览标记框不进入底稿，接受后删掉也不误报', () => {
+  const markerFrame: DiffElement = {
+    id: 'mk_f',
+    type: 'rectangle',
+    x: -10,
+    y: -10,
+    width: 120,
+    height: 80,
+    customData: { flyingdraws: { author: 'agent', layer: 'proposal', proposal: 'p1', role: 'marker' } }
+  }
+  const markerNote: DiffElement = {
+    id: 'mk_n',
+    type: 'text',
+    x: -10,
+    y: -36,
+    width: 40,
+    height: 20,
+    text: '删除',
+    containerId: null,
+    customData: { flyingdraws: { author: 'agent', layer: 'proposal', proposal: 'p1', role: 'marker' } }
+  }
+  const b = captureBaseline([...scene(), markerFrame, markerNote], 'p1')
+  assert.equal(b.items.length, 4)
+  const accepted = scene().map((el) => (el.customData ? { ...el, customData: { flyingdraws: { author: 'agent', layer: 'final' } } } : el))
+  assert.deepEqual(diffProposal(b, accepted), [])
+})

@@ -2,6 +2,7 @@
 // flying-draws-mcp：agent 通过 stdio 启动的轻量桥接进程。
 // 只负责把 MCP 工具调用转发给桌面应用的本地服务；应用没开时自动拉起来。
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import http from 'node:http'
 import { homedir } from 'node:os'
@@ -112,9 +113,21 @@ async function ensureDaemon(): Promise<DaemonInfo> {
   return launching
 }
 
+const BRIDGE_ID = randomUUID()
+
 async function daemon(path: string, body: unknown, timeoutMs = 15_000): Promise<Record<string, unknown>> {
   const info = await ensureDaemon()
-  return call(info, path, body, timeoutMs)
+  const agent = clientAgentName()
+  const payload =
+    body && typeof body === 'object' && !Array.isArray(body)
+      ? {
+          bridge_id: BRIDGE_ID,
+          ...(agent && !('agent' in body) ? { agent } : {}),
+          ...(sessionSeat && !('as' in body) ? { as: sessionSeat } : {}),
+          ...(body as Record<string, unknown>)
+        }
+      : body
+  return call(info, path, payload, timeoutMs)
 }
 
 type Content = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
@@ -155,8 +168,40 @@ const boardSchema = z
   .min(1)
   .optional()
   .describe('Optional board id/name (e.g. "default", "login-flow"). Omit to use the currently active board.')
+const asSchema = z
+  .string()
+  .min(1)
+  .optional()
+  .describe('Optional seat/author name for collaborative drawing (e.g. "architect", "reviewer"). Gives your drawings a distinct color and seat tag; remembered for subsequent calls in this session.')
+
+let sessionSeat: string | undefined = process.env.FLYINGDRAWS_SEAT?.trim() || undefined
+const rememberSeat = (as: string | undefined): string | undefined => {
+  if (as && as.trim()) sessionSeat = as.trim()
+  return sessionSeat
+}
 
 const server = new McpServer({ name: 'flying-draws', version: '0.1.0' })
+const clientAgentName = (): string | undefined => server.server.getClientVersion()?.name?.trim() || undefined
+
+// 桌面应用开着时主动报个到，不自动拉起应用；退出时通知主进程撤下在线席位
+function announceSeat(leave = false): Promise<void> {
+  const info = readInfo()
+  if (!info) return Promise.resolve()
+  const agent = clientAgentName()
+  return call(
+    info,
+    '/seat',
+    {
+      bridge_id: BRIDGE_ID,
+      ...(agent ? { agent } : {}),
+      ...(sessionSeat ? { as: sessionSeat } : {}),
+      ...(leave ? { leave: true } : {})
+    },
+    leave ? 500 : 1000
+  )
+    .then(() => undefined)
+    .catch(() => undefined)
+}
 
 server.registerTool(
   'canvas_open',
@@ -167,11 +212,12 @@ server.registerTool(
       'Optionally pass "board" to switch to another board or create a new blank board if it does not exist yet.',
     inputSchema: {
       board: z.string().min(1).optional().describe('Optional board id/name to open or create. Omit to open the current active board.'),
-      title: z.string().min(1).optional().describe('Optional human-readable title when creating or naming a board.')
+      title: z.string().min(1).optional().describe('Optional human-readable title when creating or naming a board.'),
+      as: asSchema
     }
   },
-  ({ board, title }) => guarded(async () => {
-    const res = await daemon('/open', { board, title })
+  ({ board, title, as }) => guarded(async () => {
+    const res = await daemon('/open', { board, title, as: rememberSeat(as) })
     const action = res.created ? 'Created and opened canvas' : 'Canvas'
     const label = res.title ? `${res.board}" ("${res.title}")` : `${res.board}"`
     return text(`${action} "${label} is open (version ${res.version}). The user can draw on it now.`)
@@ -183,10 +229,10 @@ server.registerTool(
   {
     title: 'List Flying draws canvas boards',
     description: 'List all available boards in Flying draws, showing which one is currently active, its title, version, and element count.',
-    inputSchema: {}
+    inputSchema: { as: asSchema }
   },
-  () => guarded(async () => {
-    const res = await daemon('/list', {})
+  ({ as }) => guarded(async () => {
+    const res = await daemon('/list', { as: rememberSeat(as) })
     const boards = (Array.isArray(res.boards) ? res.boards : []) as {
       board: string
       title: string | null
@@ -245,20 +291,28 @@ server.registerTool(
   {
     title: 'Read the canvas',
     description:
-      'Read what is currently drawn on the Flying draws canvas. Returns a description of nodes (boxes with their text), ' +
-      'arrows between them, free text notes and where they sit, and hand-drawn strokes. ' +
-      'The first line shows the canvas version (e.g. v12). Node ids like N1 are valid only for that version. Use this right away when the user says they drew something, sent you the canvas, or refers to "the canvas" / "my sketch": ' +
+      'Read what is currently drawn on the Flying draws canvas. Returns a description of nodes (boxes with their text, id like N1), ' +
+      'arrows between them, free text notes (id like T1) and where they sit, and hand-drawn strokes/groups (id like S1). ' +
+      'The first line shows the canvas version (e.g. v12). Element ids (N1, T1, S1) are valid only for that version. Use this right away when the user says they drew something, sent you the canvas, or refers to "the canvas" / "my sketch": ' +
       'the canvas cannot notify you by itself, so a drawing the user sent just waits until you read it.',
-    inputSchema: { board: boardSchema, format: formatSchema, image: imageSchema }
+    inputSchema: { board: boardSchema, format: formatSchema, image: imageSchema, as: asSchema }
   },
-  ({ board, format, image }) => guarded(async () => {
-    const res = await daemon('/read', { board, format: format ?? 'summary', image: image ?? 'auto' }, 20_000)
-    // 用户之前主动点过"发给 agent"的，这次读取一并交给 agent
+  ({ board, format, image, as }) => guarded(async () => {
+    const res = await daemon('/read', { board, format: format ?? 'summary', image: image ?? 'auto', as: rememberSeat(as) }, 20_000)
+    // 用户之前主动点过"发给 agent"的，以及别的席位递过来的画笔，这次读取一并交给 agent
     const sent = (Array.isArray(res.sent) ? res.sent : []) as { note: string }[]
-    const notes = sent.map((s) => s.note).filter(Boolean)
-    const header = sent.length
-      ? `The user pressed "Send to agent" on the canvas${notes.length ? ` with this note: ${notes.map((n) => `"${n}"`).join(' / ')}` : ' (no note)'}. This is the canvas now:`
-      : undefined
+    const handoffs = (Array.isArray(res.handoffs) ? res.handoffs : []) as { from: string; note: string }[]
+    const headers: string[] = []
+    if (sent.length) {
+      const notes = sent.map((s) => s.note).filter(Boolean)
+      headers.push(
+        `The user pressed "Send to agent" on the canvas${notes.length ? ` with this note: ${notes.map((n) => `"${n}"`).join(' / ')}` : ' (no note)'}.`
+      )
+    }
+    for (const h of handoffs) {
+      headers.push(`Agent "${h.from}" passed the brush to you${h.note ? `: "${h.note}"` : ''}.`)
+    }
+    const header = headers.length ? `${headers.join(' ')} This is the canvas now:` : undefined
     return { content: boardContent(res, header) }
   })
 )
@@ -273,11 +327,12 @@ server.registerTool(
       'Then call canvas_wait with that request_id to get the drawing.',
     inputSchema: {
       prompt: z.string().min(1).describe('What you want the user to draw, in the user\'s language. Shown on the canvas.'),
-      board: boardSchema
+      board: boardSchema,
+      as: asSchema
     }
   },
-  ({ prompt, board }) => guarded(async () => {
-    const res = await daemon('/request', { prompt, board })
+  ({ prompt, board, as }) => guarded(async () => {
+    const res = await daemon('/request', { prompt, board, as: rememberSeat(as) })
     return text(
       `Request ${res.request_id} is shown on the canvas "${res.board}". Now call canvas_wait with request_id "${res.request_id}" to receive the drawing.`
     )
@@ -287,22 +342,23 @@ server.registerTool(
 server.registerTool(
   'canvas_wait',
   {
-    title: 'Wait for the user\'s drawing',
+    title: 'Wait for the user\'s drawing or another seat\'s handoff',
     description:
-      'Wait until the user presses "Send" on the canvas, for at most timeout_s seconds (max 45). ' +
-      'With request_id: waits for the answer to that canvas_request or canvas_propose. Without it: waits for the user to send the canvas on their own. ' +
-      'If the result says the user is still drawing, call canvas_wait again. After about 3 empty waits, stop and tell the user in the chat that you are waiting for their drawing instead of retrying silently.',
+      'Wait until the user presses "Send" on the canvas or another agent seat passes the brush via canvas_pass, for at most timeout_s seconds (max 45). ' +
+      'With request_id: waits for the answer to that canvas_request or canvas_propose. Without it: waits for the user to send the canvas or another seat to pass the brush to you. ' +
+      'If the result says still waiting, call canvas_wait again. After about 3 empty waits, stop and tell the user in the chat instead of retrying silently.',
     inputSchema: {
       request_id: z.string().optional().describe('The id returned by canvas_request or canvas_propose.'),
       board: boardSchema,
+      as: asSchema,
       timeout_s: z.number().int().min(1).max(45).optional().describe('How long to wait, in seconds. Default 40.'),
       format: formatSchema,
       image: imageSchema
     }
   },
-  ({ request_id, board, timeout_s, format, image }) => guarded(async () => {
+  ({ request_id, board, as, timeout_s, format, image }) => guarded(async () => {
     const wait = timeout_s ?? 40
-    const res = await daemon('/wait', { request_id, board, timeout_s: wait, format: format ?? 'summary', image: image ?? 'auto' }, (wait + 10) * 1000)
+    const res = await daemon('/wait', { request_id, board, as: rememberSeat(as), timeout_s: wait, format: format ?? 'summary', image: image ?? 'auto' }, (wait + 10) * 1000)
     switch (res.status) {
       case 'submitted': {
         const note = res.note ? `The user's note: "${res.note}"` : 'The user added no note.'
@@ -321,6 +377,13 @@ server.registerTool(
         }
         return { content: boardContent(res, `The user sent the canvas. ${note}`) }
       }
+      case 'handoff':
+        return {
+          content: boardContent(
+            res,
+            `Agent "${res.from}" passed the brush to you${res.note ? ` with note: "${res.note}"` : ''}. This is the canvas now:`
+          )
+        }
       case 'waiting':
         return text(`The user has not sent anything yet (still drawing). Call canvas_wait again${request_id ? ` with request_id "${request_id}"` : ''}.`)
       case 'cancelled':
@@ -333,12 +396,38 @@ server.registerTool(
   })
 )
 
+server.registerTool(
+  'canvas_pass',
+  {
+    title: 'Pass the brush to another agent seat',
+    description:
+      'Hand off the canvas to another agent seat (or any other waiting seat if "to" is omitted) with a note explaining what to do next. ' +
+      'If the target seat is already waiting via canvas_wait, it receives your snapshot and note immediately; otherwise the handoff waits on the board until that seat calls canvas_wait or canvas_read.',
+    inputSchema: {
+      board: boardSchema,
+      as: asSchema,
+      to: z.string().min(1).optional().describe('Target seat name (e.g. "reviewer"). Omit to pass to any other seat.'),
+      note: z.string().min(1).describe('Instructions or context for the next agent.')
+    }
+  },
+  ({ board, as, to, note }) => guarded(async () => {
+    const res = await daemon('/pass', { board, as: rememberSeat(as), to, note })
+    const target = res.to ? `seat "${res.to}"` : 'the next seat'
+    if (res.status === 'delivered') {
+      return text(`Passed the brush from "${res.from}" directly to waiting ${target} on board "${res.board}" (v${res.version}).`)
+    }
+    return text(`Handoff from "${res.from}" to ${target} is queued on board "${res.board}" (v${res.version}). It will be delivered when they call canvas_wait or canvas_read.`)
+  })
+)
+
 const existingNode = 'An existing node id like "N1" from your latest canvas_read.'
+const existingText = 'An existing free text id like "T1" from your latest canvas_read.'
+const existingStrokes = 'An existing hand-drawn stroke or stroke group id like "S1" from your latest canvas_read.'
 const modifyOps = [
   z.object({ op: z.literal('update_node'), id: z.string().min(1).describe(existingNode), label: z.string().describe('The new text inside the node.') }),
   z.object({
     op: z.literal('delete_node'),
-    id: z.string().min(1).describe(existingNode + ' Arrows you drew that touch it are deleted with it.')
+    id: z.string().min(1).describe(existingNode + ' Arrows drawn by agents that touch it are deleted with it.')
   }),
   z.object({
     op: z.literal('update_edge'),
@@ -346,7 +435,21 @@ const modifyOps = [
     to: z.string().min(1).describe(existingNode),
     label: z.string().describe('The new text on the arrow. Empty string removes it.')
   }),
-  z.object({ op: z.literal('delete_edge'), from: z.string().min(1).describe(existingNode), to: z.string().min(1).describe(existingNode) })
+  z.object({ op: z.literal('delete_edge'), from: z.string().min(1).describe(existingNode), to: z.string().min(1).describe(existingNode) }),
+  z.object({ op: z.literal('update_text'), id: z.string().min(1).describe(existingText), text: z.string().min(1).describe('The new text content.') }),
+  z.object({ op: z.literal('delete_text'), id: z.string().min(1).describe(existingText) }),
+  z.object({ op: z.literal('delete_strokes'), id: z.string().min(1).describe(existingStrokes) }),
+  z.object({
+    op: z.literal('set_style'),
+    id: z.string().min(1).optional().describe('Target element id: a node ("N1"), text ("T1"), or stroke ("S1").'),
+    from: z.string().min(1).optional().describe('Start node id when styling an arrow instead of passing "id".'),
+    to: z.string().min(1).optional().describe('End node id when styling an arrow instead of passing "id".'),
+    color: z.string().optional().describe('Stroke and text color as hex, e.g. "#e03131".'),
+    fill: z.string().optional().describe('Background fill color as hex (e.g. "#ffec99"), or "transparent" (nodes only).'),
+    shape: z.enum(['rectangle', 'ellipse', 'diamond']).optional().describe('New shape (rectangle/ellipse/diamond nodes only).'),
+    width: z.number().optional().describe('New width in px (20-4000), centered on current position (nodes only).'),
+    height: z.number().optional().describe('New height in px (20-4000), centered on current position (nodes only).')
+  })
 ] as const
 
 const addOps = [
@@ -373,8 +476,7 @@ const addOps = [
   })
 ] as const
 
-const opSchema = z.discriminatedUnion('op', [...addOps]) // canvas_propose：只能新增
-const drawOpSchema = z.discriminatedUnion('op', [...addOps, ...modifyOps]) // canvas_draw：还能改、删自己画的
+const drawOpSchema = z.discriminatedUnion('op', [...addOps, ...modifyOps])
 
 const directionSchema = z
   .enum(['right', 'down'])
@@ -384,7 +486,7 @@ const baseVersionSchema = z
   .number()
   .int()
   .optional()
-  .describe('The canvas version shown by the read (or draw result) where you saw the node ids you are using. Required when ops refer to existing nodes (N1, N2, ...); otherwise optional.')
+  .describe('The canvas version shown by the read (or draw result) where you saw the element ids (N1, T1, S1) you are using. Required when ops refer to existing elements; otherwise optional.')
 
 // 画图没成功时（版本冲突、指令有问题）给 agent 的说明，canvas_draw 和 canvas_propose 共用
 function drawFailure(res: Record<string, unknown>, baseVersion: number | undefined): { content: Content[]; isError: true } | null {
@@ -415,29 +517,33 @@ server.registerTool(
   {
     title: 'Draw your understanding and ask the user to confirm',
     description:
-      'Draw your understanding or plan on the canvas as a proposal (shown in dashed blue) and ask the user to confirm it. ' +
-      'Use this instead of canvas_draw when you are not sure you understood the user: they can accept it, reject it, or fix it directly on the canvas and then accept. ' +
-      'Takes the same ops as canvas_draw. Returns a request_id immediately; then call canvas_wait with that request_id to get the answer. ' +
-      'If accepted, the proposal becomes part of the canvas and you are told exactly what the user changed in it first. If rejected, it is removed. ' +
+      'Draw your understanding, plan, or suggested edits on the canvas as a proposal and ask the user to confirm it. ' +
+      'Use this instead of canvas_draw when you are not sure you understood the user, or want confirmation before changing/deleting their elements: ' +
+      'new elements appear in dashed blue, and proposed edits/deletions/restyles are shown as dashed preview markers (the user can delete any marker frame to decline that single change). ' +
+      'Takes the same ops as canvas_draw (including modifications to user or other-agent elements). Returns a request_id immediately; then call canvas_wait with that request_id to get the answer. ' +
+      'If accepted, additions and approved changes become part of the canvas and you are told what the user changed or declined. If rejected, the proposal is removed. ' +
       'The request survives a restart of the canvas app, so keep using the same request_id.',
     inputSchema: {
       board: boardSchema,
-      ops: z.array(opSchema).min(1).describe('What to draw as the proposal, applied together as one batch.'),
+      as: asSchema,
+      ops: z.array(drawOpSchema).min(1).describe('What to add, change, restyle, or delete as the proposal, applied together as one batch.'),
       question: z.string().min(1).describe('What you want the user to confirm, in the user\'s language, e.g. "Is this the flow you meant?". Shown on the canvas.'),
       direction: directionSchema,
       base_version: baseVersionSchema
     }
   },
-  ({ board, ops, question, direction, base_version }) => guarded(async () => {
-    const res = await daemon('/propose', { board, ops, question, direction, base_version }, 30_000)
+  ({ board, as, ops, question, direction, base_version }) => guarded(async () => {
+    const res = await daemon('/propose', { board, as: rememberSeat(as), ops, question, direction, base_version }, 30_000)
     const failure = drawFailure(res, base_version)
     if (failure) return failure
     if (res.status !== 'proposed') return text(JSON.stringify(res))
     const ids = newNodeIds(res)
+    const changed = (res.changed ?? {}) as { proposed?: number }
+    const markerNote = changed.proposed ? ` (${changed.proposed} edit marker(s))` : ''
     return {
       content: boardContent(
         res,
-        `Proposal ${res.request_id} is shown on the canvas and the user is being asked: "${question}". ` +
+        `Proposal ${res.request_id} is shown on the canvas${markerNote} and the user is being asked: "${question}". ` +
           `Now call canvas_wait with request_id "${res.request_id}" to get their answer.` +
           (ids ? ` Your proposed nodes: ${ids}.` : '')
       )
@@ -450,31 +556,42 @@ server.registerTool(
   {
     title: 'Draw on the canvas',
     description:
-      'Draw nodes, arrows and text on the Flying draws canvas so the user can see your understanding or plan as a diagram. ' +
-      'You only say what to add; the canvas lays the new nodes out automatically, below whatever is already there. ' +
-      'You can also change the text of, or delete, nodes and arrows that YOU drew earlier (update_node, delete_node, update_edge, delete_edge). ' +
-      'You cannot change or delete what the user drew, and nothing can be moved. ' +
-      'To refer to nodes that are already on the canvas, pass the version from the read where you saw them as base_version; ' +
-      'it still works if the canvas changed since, unless a node you refer to was deleted or something you want to change was edited by the user. ' +
-      'Returns the updated canvas description. Things you drew are marked as drawn by the agent in later reads.',
+      'Draw, edit, restyle, or delete elements on the Flying draws canvas immediately. ' +
+      'New nodes are laid out automatically below existing content unless x/y are given. ' +
+      'You can modify, restyle (color, fill, shape, width, height), or delete any settled element on the canvas ' +
+      '(including those drawn by the user or other agents, except unanswered proposals): ' +
+      'update_node, delete_node, update_edge, delete_edge, update_text (T1), delete_text (T1), delete_strokes (S1), set_style. ' +
+      'To refer to elements already on the canvas (N1, T1, S1), pass the version from the read where you saw them as base_version; ' +
+      'it still works if unrelated parts of the canvas changed since, unless an element you modify was changed by someone else. ' +
+      'Returns the updated canvas description. Things you drew are tagged with your agent name in later reads.',
     inputSchema: {
       board: boardSchema,
-      ops: z.array(drawOpSchema).min(1).describe('What to add or change, applied together as one batch: either all of it happens or none.'),
+      as: asSchema,
+      ops: z.array(drawOpSchema).min(1).describe('What to add, change, restyle, or delete, applied together as one batch: either all of it happens or none.'),
       direction: directionSchema,
       base_version: baseVersionSchema
     }
   },
-  ({ board, ops, base_version, direction }) => guarded(async () => {
-    const res = await daemon('/draw', { board, ops, base_version, direction }, 30_000)
+  ({ board, as, ops, base_version, direction }) => guarded(async () => {
+    const res = await daemon('/draw', { board, as: rememberSeat(as), ops, base_version, direction }, 30_000)
     const failure = drawFailure(res, base_version)
     if (failure) return failure
     if (res.status !== 'drawn') return text(JSON.stringify(res))
     const added = res.added as { nodes: number; edges: number; texts: number }
-    const changed = (res.changed ?? { updated: 0, deleted: 0 }) as { updated: number; deleted: number }
+    const changed = (res.changed ?? { updated: 0, styled: 0, deleted: 0 }) as {
+      updated: number
+      styled?: number
+      deleted: number
+    }
+    const changeParts = [
+      changed.updated ? `${changed.updated} text(s) updated` : '',
+      changed.styled ? `${changed.styled} styled` : '',
+      changed.deleted ? `${changed.deleted} deleted` : ''
+    ].filter(Boolean)
     const ids = newNodeIds(res)
     const header =
       `Drawn: ${added.nodes} node(s), ${added.edges} arrow(s), ${added.texts} text(s).` +
-      (changed.updated || changed.deleted ? ` Changed: ${changed.updated} text(s) updated, ${changed.deleted} deleted.` : '') +
+      (changeParts.length ? ` Changed: ${changeParts.join(', ')}.` : '') +
       ` The canvas is now at version ${res.version}.` +
       (ids ? ` Your new nodes: ${ids}.` : '')
     return { content: boardContent(res, header) }
@@ -482,6 +599,27 @@ server.registerTool(
 )
 
 async function main(): Promise<void> {
+  let left = false
+  const leaveOnce = () => {
+    if (left) return
+    left = true
+    void announceSeat(true)
+  }
+  server.server.oninitialized = () => {
+    void announceSeat()
+  }
+  setInterval(() => {
+    if (!left) void announceSeat()
+  }, 30_000).unref()
+  process.stdin.once('end', leaveOnce)
+  process.stdin.once('close', leaveOnce)
+  const onSignal = () => {
+    leaveOnce()
+    setTimeout(() => process.exit(0), 150).unref()
+  }
+  process.once('SIGINT', onSignal)
+  process.once('SIGTERM', onSignal)
+
   await server.connect(new StdioServerTransport())
   log('ready')
 }

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGraph, summarize, type SceneElement } from '../src/main/semantic.ts'
-import { estimateTextWidth, exitPoint, OpsError, planOps, rebaseOps, type DrawOp } from '../src/main/ops.ts'
+import { estimateTextWidth, exitPoint, OpsError, planOps, rebaseOps, toProposalPlan, type DrawOp } from '../src/main/ops.ts'
 
 const ids = () => {
   let n = 0
@@ -225,11 +225,29 @@ test('改字和删除：只列出要动的元素，级联由页面处理', () =>
   assert.equal(new Set(plan.updates.map((u) => u.textId)).size, 2)
 })
 
-test('不能改用户画的东西，也不能改还没确认的提议', () => {
-  const g = buildGraph(mixed)
-  assert.throws(() => planOps([{ op: 'delete_node', id: 'N1' }], g, ids()), /node N1 was drawn by the user/)
-  assert.throws(() => planOps([{ op: 'update_node', id: 'N1', label: 'x' }], g, ids()), /drawn by the user/)
-  assert.throws(() => planOps([{ op: 'delete_edge', from: 'N1', to: 'N2' }], g, ids()), /the arrow from N1 to N2 was drawn by the user/)
+test('可以改删用户和别的 agent 画的已确认元素，但不能动还没确认的提议', () => {
+  const otherAgent: SceneElement = {
+    id: 'other',
+    type: 'rectangle',
+    x: 0,
+    y: 200,
+    width: 100,
+    height: 60,
+    customData: { flyingdraws: { author: 'agent', agent: 'codex', layer: 'final' } }
+  }
+  const g = buildGraph([...mixed, otherAgent])
+  const userPlan = planOps(
+    [
+      { op: 'update_node', id: 'N1', label: '入口（改）' },
+      { op: 'delete_edge', from: 'N1', to: 'N2' },
+      { op: 'delete_node', id: 'N5' }
+    ],
+    g,
+    ids()
+  )
+  assert.deepEqual(userPlan.updates.map((u) => [u.elementId, u.label]), [['u', '入口（改）']])
+  assert.deepEqual(userPlan.deletes.sort(), ['e1', 'other'])
+
   assert.throws(() => planOps([{ op: 'delete_node', id: 'N4' }], g, ids()), /proposal the user has not answered/)
   assert.throws(() => planOps([{ op: 'delete_edge', from: 'N3', to: 'N2' }], g, ids()), /no arrow from N3 to N2/)
   assert.throws(() => planOps([{ op: 'delete_node', id: 'nope' }], g, ids()), /unknown node "nope"/)
@@ -295,4 +313,184 @@ test('还没确认的提议和已经画上去的分开标', () => {
     [false, false, true]
   )
   assert.match(summarize(g, { board: 't', version: 1 }), /N3 （无文字）矩形【agent 的提议，用户还没确认】/)
+})
+
+test('update_text、delete_text 与 delete_strokes 可修改独立文字和手绘笔画', () => {
+  const stroke = (id: string, x: number): SceneElement => ({
+    id,
+    type: 'freedraw',
+    x,
+    y: 200,
+    width: 40,
+    height: 40,
+    points: [
+      [0, 0],
+      [40, 40]
+    ]
+  })
+  const scene: SceneElement[] = [
+    ...existing,
+    { id: 't1', type: 'text', x: 0, y: 80, width: 60, height: 20, text: '备注一', containerId: null },
+    { id: 't2', type: 'text', x: 300, y: 80, width: 60, height: 20, text: '备注二', containerId: null },
+    { id: 'tp', type: 'text', x: 500, y: 80, width: 60, height: 20, text: '待定', containerId: null, customData: { flyingdraws: { author: 'agent', layer: 'proposal' } } },
+    stroke('sg1', 0),
+    stroke('sg2', 15),
+    stroke('s_single', 500)
+  ]
+  const g = buildGraph(scene)
+  assert.deepEqual(g.notes.map((n) => n.id), ['T1', 'T2', 'T3'])
+  assert.deepEqual(g.strokeGroups.map((s) => s.id), ['S1'])
+  assert.deepEqual(g.strokes.map((s) => s.id), ['S2'])
+
+  const plan = planOps(
+    [
+      { op: 'update_text', id: 'T1', text: '已更新备注' },
+      { op: 'delete_text', id: 'T2' },
+      { op: 'delete_strokes', id: 'S1' },
+      { op: 'delete_strokes', id: 'S2' }
+    ],
+    g,
+    ids()
+  )
+  assert.deepEqual(plan.textEdits, [{ elementId: 't1', text: '已更新备注' }])
+  assert.deepEqual(plan.deletes.sort(), ['s_single', 'sg1', 'sg2', 't2'])
+  assert.deepEqual(plan.modifiedRefs.sort(), ['s_single', 'sg1', 'sg2', 't1', 't2'])
+
+  assert.throws(() => planOps([{ op: 'update_text', id: 'T1', text: '   ' }], g, ids()), /To remove the text, use delete_text/)
+  assert.throws(() => planOps([{ op: 'delete_text', id: 'T3' }], g, ids()), /proposal the user has not answered/)
+  assert.throws(() => planOps([{ op: 'delete_text', id: 'T9' }], g, ids()), /unknown text "T9"/)
+  assert.throws(() => planOps([{ op: 'delete_strokes', id: 'S9' }], g, ids()), /unknown hand-drawn strokes "S9"/)
+})
+
+test('set_style 支持改颜色、填充、形状、大小，并校验合法性与触发文字重排', () => {
+  const scene: SceneElement[] = [
+    ...mixed,
+    { id: 'note1', type: 'text', x: 0, y: 120, width: 60, height: 20, text: '旁注', containerId: null },
+    { id: 'f1', type: 'freedraw', x: 400, y: 120, width: 50, height: 10, points: [[0, 0], [50, 0]] }
+  ]
+  const g = buildGraph(scene)
+  const plan = planOps(
+    [
+      { op: 'set_style', id: 'N1', color: '#E03131', fill: '#FFEC99', shape: 'diamond', width: 180, height: 110 },
+      { op: 'set_style', id: 'N2', fill: 'transparent', shape: 'ellipse' },
+      { op: 'set_style', from: 'N1', to: 'N2', color: '#2f9e44' },
+      { op: 'set_style', id: 'T1', color: '#1971c2' },
+      { op: 'set_style', id: 'S1', color: '#9c36b5' }
+    ],
+    g,
+    ids()
+  )
+  assert.deepEqual(plan.styles, [
+    { elementId: 'u', color: '#e03131', fill: '#ffec99', shape: 'diamond', w: 180, h: 110 },
+    { elementId: 'a', fill: 'transparent', shape: 'ellipse' },
+    { elementId: 'e1', color: '#2f9e44' },
+    { elementId: 'note1', color: '#1971c2' },
+    { elementId: 'f1', color: '#9c36b5' }
+  ])
+  // N1 和 N2 都有文字且改了形状/大小，应自动生成 relayout: true 的文字更新
+  assert.deepEqual(
+    plan.updates.map((u) => [u.elementId, u.label, u.relayout]),
+    [
+      ['u', '入口', true],
+      ['a', '校验', true]
+    ]
+  )
+
+  assert.throws(() => planOps([{ op: 'set_style', id: 'N1' }], g, ids()), /needs at least one/)
+  assert.throws(() => planOps([{ op: 'set_style', id: 'N1', color: 'red' }], g, ids()), /hex color/)
+  assert.throws(() => planOps([{ op: 'set_style', id: 'N1', width: 10 }], g, ids()), /between 20 and 4000/)
+  assert.throws(() => planOps([{ op: 'set_style', id: 'T1', fill: '#fff' }], g, ids()), /only "color" can be changed/)
+  assert.throws(() => planOps([{ op: 'set_style', from: 'N1', to: 'N2', shape: 'diamond' }], g, ids()), /only "color" can be changed/)
+  assert.throws(() => planOps([{ op: 'set_style', color: '#000' }], g, ids()), /needs "id"/)
+})
+
+test('编号换算覆盖独立文字 T1 和手绘 S1，删除后记进 gone', () => {
+  const s = (id: string, x: number): SceneElement => ({
+    id,
+    type: 'freedraw',
+    x,
+    y: 300,
+    width: 30,
+    height: 30,
+    points: [[0, 0], [30, 30]]
+  })
+  const baseEls: SceneElement[] = [
+    { id: 't_old', type: 'text', x: 200, y: 0, width: 40, height: 20, text: '原注', containerId: null },
+    s('g1', 200),
+    s('g2', 210),
+    s('s_one', 600)
+  ]
+  const g0 = buildGraph(baseEls)
+  const items0 = [
+    ...g0.notes.map(({ id, ref, text }) => ({ id, ref, label: text })),
+    ...g0.strokeGroups.map((g) => ({ id: g.id, ref: g.refs[0], label: null })),
+    ...g0.strokes.map((st) => ({ id: st.id, ref: st.ref, label: null }))
+  ]
+  const g1 = buildGraph([
+    { id: 't_head', type: 'text', x: 0, y: 0, width: 40, height: 20, text: '插在前面', containerId: null },
+    s('g_head1', 0),
+    s('g_head2', 10),
+    ...baseEls.filter((el) => el.id !== 's_one')
+  ])
+  const rebased = rebaseOps(
+    [
+      { op: 'update_text', id: 'T1', text: '新文字' },
+      { op: 'set_style', id: 'S1', color: '#e03131' },
+      { op: 'delete_strokes', id: 'S2' }
+    ],
+    items0,
+    g1
+  )
+  assert.deepEqual(rebased.gone, ['S2'])
+  assert.deepEqual(rebased.ops[0], { op: 'update_text', id: 'T2', text: '新文字' })
+  assert.equal((rebased.ops[1] as { id?: string }).id, 'S2')
+  const rebasedPlan = planOps(rebased.ops.slice(0, 2), g1, ids())
+  assert.equal(rebasedPlan.textEdits[0].elementId, 't_old')
+  assert.deepEqual(rebasedPlan.styles.map((s) => s.elementId).sort(), ['g1', 'g2'])
+})
+
+test('toProposalPlan 把改动和删除转为标记框与 pending，新增保持不变', () => {
+  const g = buildGraph(mixed)
+  const plan = planOps(
+    [
+      { op: 'add_node', id: 'extra', label: '补充' },
+      { op: 'update_node', id: 'N1', label: '入口v2' },
+      { op: 'set_style', id: 'N2', color: '#e03131' },
+      { op: 'delete_node', id: 'N3' }
+    ],
+    g,
+    ids()
+  )
+  const elMap = new Map(mixed.map((el) => [el.id, el]))
+  const { plan: propPlan, pending } = toProposalPlan(
+    plan,
+    {
+      box: (ref) => {
+        const el = elMap.get(ref)
+        return el ? { x: el.x, y: el.y, w: el.width, h: el.height } : null
+      },
+      name: (refs) => {
+        const n = g.nodes.find((x) => x.ref === refs[0])
+        return n ? `节点「${n.label}」` : '元素'
+      }
+    },
+    ids()
+  )
+  assert.equal(propPlan.nodes.length, 1)
+  assert.deepEqual(propPlan.updates, [])
+  assert.deepEqual(propPlan.styles, [])
+  assert.deepEqual(propPlan.deletes, [])
+  assert.equal(propPlan.markers.length, 3)
+  assert.deepEqual(
+    propPlan.markers.map((m) => [m.tone, m.note, m.summary]),
+    [
+      ['change', '改成「入口v2」', '把节点「入口」改成「入口v2」'],
+      ['change', '改样式：颜色 #e03131', '把节点「校验」改样式：颜色 #e03131'],
+      ['delete', '删除', '删除节点「入库」']
+    ]
+  )
+  assert.ok(pending && pending.updates.length === 1 && pending.styles.length === 1 && pending.deletes.length === 1)
+
+  const pureAdd = planOps([{ op: 'add_node', id: 'only', label: '纯新增' }], g, ids())
+  assert.equal(toProposalPlan(pureAdd, { box: () => null, name: () => '' }, ids()).pending, null)
 })

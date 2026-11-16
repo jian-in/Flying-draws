@@ -1,10 +1,21 @@
 export {}
 
 declare global {
+  interface OnlineSeat {
+    name: string
+    color: string
+    explicit: boolean
+    waiting: boolean
+    drawn: boolean
+  }
+
   interface HubState {
-    pending: { id: string; kind: 'draw' | 'proposal'; proposalId: string | null; prompt: string; createdAt: string }[]
+    pending: { id: string; kind: 'draw' | 'proposal'; proposalId: string | null; pending?: unknown; prompt: string; createdAt: string }[]
     agentWaiting: boolean
+    waitingAgents?: string[]
     inbox: number
+    handoff?: { from: string; to: string | null; note: string } | null
+    onlineSeats?: OnlineSeat[]
   }
 
   interface BoardSummary {
@@ -54,6 +65,7 @@ declare global {
         sceneJson: string
         pngBase64: string | null
         decision?: 'accepted' | 'rejected' | null
+        skipped?: string[]
       }) => Promise<{ version: number }>
       cancel: (requestId: string) => Promise<boolean>
       onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => () => void

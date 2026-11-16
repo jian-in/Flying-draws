@@ -28,7 +28,7 @@ export interface SceneElement {
   groupIds?: readonly string[]
   frameId?: string | null
   name?: string | null
-  customData?: { flyingdraws?: { author?: string; layer?: string } } | null
+  customData?: { flyingdraws?: { author?: string; layer?: string; agent?: string; seat?: boolean; color?: string; role?: string } } | null
 }
 
 export type Author = 'user' | 'agent'
@@ -38,9 +38,20 @@ export function authorOf(el: SceneElement): Author {
   return el.customData?.flyingdraws?.author === 'agent' ? 'agent' : 'user'
 }
 
+// 是哪个 agent 画的（桥接报上来的客户端名字）。用户画的、或者早先没记名字的 agent 元素都是 null。
+export function agentOf(el: SceneElement): string | null {
+  const name = el.customData?.flyingdraws?.agent
+  return authorOf(el) === 'agent' && typeof name === 'string' && name ? name : null
+}
+
+// 提议里"要改这里"的标记框和说明文字：只是给用户看的示意，不算画板内容
+export function isMarker(el: SceneElement): boolean {
+  return el.customData?.flyingdraws?.role === 'marker'
+}
+
 // 作者，以及是不是还在提议层上（agent 画的提议，用户还没确认）
-function provenance(el: SceneElement): { author: Author; proposed: boolean } {
-  return { author: authorOf(el), proposed: el.customData?.flyingdraws?.layer === 'proposal' }
+function provenance(el: SceneElement): { author: Author; agent: string | null; proposed: boolean } {
+  return { author: authorOf(el), agent: agentOf(el), proposed: el.customData?.flyingdraws?.layer === 'proposal' }
 }
 
 export interface SemanticNode {
@@ -50,6 +61,7 @@ export interface SemanticNode {
   label: string | null
   bbox: Bbox
   author: Author
+  agent: string | null // 哪个 agent 画的；用户画的或没记名字时为 null
   proposed: boolean // true 表示这是 agent 的提议，用户还没确认
 }
 
@@ -61,20 +73,24 @@ export interface SemanticEdge {
   directed: 'forward' | 'both' | 'none'
   inferred: boolean // true 表示箭头端点没有真正绑定，是按距离猜的
   author: Author
+  agent: string | null
   proposed: boolean // true 表示这是 agent 的提议，用户还没确认
 }
 
 export interface SemanticNote {
+  id: string // 给 agent 看的短编号：T1、T2……
   ref: string
   text: string
   attachedTo: { kind: 'node' | 'edge'; id: string } | null
   position: string | null // 相对位置，如"下方"
   bbox: Bbox
   author: Author
+  agent: string | null
   proposed: boolean // true 表示这是 agent 的提议，用户还没确认
 }
 
 export interface SemanticStroke {
+  id: string // 给 agent 看的短编号：S1、S2……和手绘分组共用一套编号，分组排在前面
   ref: string
   shape: 'loop' | 'straight' | 'curve'
   bbox: Bbox
@@ -84,6 +100,7 @@ export interface SemanticStroke {
 
 // 挨得近的几笔手绘合成一组（手写字、多笔涂鸦）。语义层不猜内容，只说在哪、有几笔，内容交给截图。
 export interface SemanticStrokeGroup {
+  id: string
   refs: string[]
   count: number
   bbox: Bbox
@@ -127,7 +144,7 @@ const GROUP_GAP_MIN = 30
 const GROUP_GAP_MAX = 150
 const GROUP_SAMPLE_POINTS = 24 // 算两笔之间的距离时，每笔最多取这么多个点
 
-function bboxOf(el: SceneElement): Bbox {
+export function bboxOf(el: SceneElement): Bbox {
   // 线条和箭头的宽高可能是负的，统一成左上角加正宽高
   const x = el.width < 0 ? el.x + el.width : el.x
   const y = el.height < 0 ? el.y + el.height : el.y
@@ -198,7 +215,7 @@ function classifyStroke(el: SceneElement): SemanticStroke['shape'] {
   return maxDev < len * 0.08 ? 'straight' : 'curve'
 }
 
-function unionBbox(boxes: Bbox[]): Bbox {
+export function unionBbox(boxes: Bbox[]): Bbox {
   const x0 = Math.min(...boxes.map((b) => b.x))
   const y0 = Math.min(...boxes.map((b) => b.y))
   const x1 = Math.max(...boxes.map((b) => b.x + b.w))
@@ -290,7 +307,7 @@ function bboxToPolyline(b: Bbox, samples: [number, number][]): { d: number; at: 
 }
 
 export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph {
-  const elements = rawElements.filter((el) => !el.isDeleted)
+  const elements = rawElements.filter((el) => !el.isDeleted && !isMarker(el))
   const byId = new Map(elements.map((el) => [el.id, el]))
 
   // 绑定在容器里的文字 → 容器的标签
@@ -398,6 +415,7 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
       }
     }
     notes.push({
+      id: `T${notes.length + 1}`,
       ref: el.id,
       text: (el.text ?? '').trim(),
       attachedTo: best,
@@ -456,7 +474,7 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     clusters.get(root)!.push(s)
   })
 
-  const strokes: SemanticStroke[] = []
+  const strokes: Omit<SemanticStroke, 'id'>[] = []
   const groupDrafts: { refs: string[]; bbox: Bbox }[] = []
   for (const members of clusters.values()) {
     // 整簇都是误点大小的，忽略
@@ -501,9 +519,10 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     ...lines.map((l) => l.bbox)
   ]
   const overall = allBoxes.length ? unionBbox(allBoxes) : null
-  const strokeGroups: SemanticStrokeGroup[] = groupDrafts.map((g) => {
+  const strokeGroups: SemanticStrokeGroup[] = groupDrafts.map((g, i) => {
     const near = nearestTo(g.bbox)
     return {
+      id: `S${i + 1}`,
       refs: g.refs,
       count: g.refs.length,
       bbox: g.bbox,
@@ -519,7 +538,9 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     strokes.length > MAX_LISTED_STROKES ||
     strokes.some((s) => s.shape === 'curve')
 
-  return { nodes, edges, notes, strokes, strokeGroups, containment, images, lines, needsImage }
+  // 单笔接着分组往下编号
+  const numbered: SemanticStroke[] = strokes.map((s, i) => ({ id: `S${strokeGroups.length + i + 1}`, ...s }))
+  return { nodes, edges, notes, strokes: numbered, strokeGroups, containment, images, lines, needsImage }
 }
 
 function nodeName(nodes: Map<string, SemanticNode>, id: string | null): string {
@@ -529,7 +550,8 @@ function nodeName(nodes: Map<string, SemanticNode>, id: string | null): string {
   return n.label ? `${n.id}「${n.label}」` : `${n.id}（无文字${KIND_NAMES[n.kind] ?? n.kind}）`
 }
 
-export function summarize(graph: SemanticGraph, meta: { board: string; version: number }): string {
+// viewer：正在读这份描述的 agent 的名字。别的 agent 画的东西会单独标出来。
+export function summarize(graph: SemanticGraph, meta: { board: string; version: number; viewer?: string | null }): string {
   const nodes = new Map(graph.nodes.map((n) => [n.id, n]))
   const edgeByRef = new Map(graph.edges.map((e) => [e.ref, e]))
   const strokeTotal = graph.strokes.length + graph.strokeGroups.reduce((sum, g) => sum + g.count, 0)
@@ -543,8 +565,11 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
   ].filter(Boolean)
   const out: string[] = [`画板「${meta.board}」v${meta.version}：${counts.join('，')}`]
   // 没标的都是用户画的；agent 自己画的单独标出来，方便它分清哪些是用户的原意
-  const byAgent = (x: { author: Author; proposed: boolean }): string =>
-    x.proposed ? '【agent 的提议，用户还没确认】' : x.author === 'agent' ? '【agent 画的】' : ''
+  const byAgent = (x: { author: Author; agent: string | null; proposed: boolean }): string => {
+    if (x.proposed) return '【agent 的提议，用户还没确认】'
+    if (x.author !== 'agent') return ''
+    return x.agent && meta.viewer && x.agent !== meta.viewer ? `【其他 agent（${x.agent}）画的】` : '【agent 画的】'
+  }
 
   if (graph.nodes.length === 0 && graph.notes.length === 0 && strokeTotal === 0 && graph.images.length === 0) {
     out.push('（画板是空的）')
@@ -580,7 +605,7 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
         const e = edgeByRef.get(note.attachedTo.id)
         if (e) where = `（在连线 ${e.from ?? '?'}→${e.to ?? '?'} 的${note.position}）`
       }
-      out.push(`  「${note.text}」${where}${byAgent(note)}`)
+      out.push(`  ${note.id} 「${note.text}」${where}${byAgent(note)}`)
     }
   }
 
@@ -588,11 +613,11 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
     out.push('手绘：')
     for (const g of graph.strokeGroups) {
       const where = g.near ? `，在 ${nodeName(nodes, g.near.id)} ${g.near.position}` : g.region ? `，在画面${g.region}` : ''
-      out.push(`  一组手写或涂鸦（${g.count} 笔）${where}，内容请看附图`)
+      out.push(`  ${g.id} 一组手写或涂鸦（${g.count} 笔）${where}，内容请看附图`)
     }
     const shapeName = { loop: '一个圈', straight: '一条直线', curve: '一条曲线或涂鸦' }
     for (const s of graph.strokes.slice(0, MAX_LISTED_STROKES)) {
-      const parts = [shapeName[s.shape]]
+      const parts = [`${s.id} ${shapeName[s.shape]}`]
       if (s.encloses.length) parts.push(`圈住了 ${s.encloses.map((id) => (nodes.has(id) ? nodeName(nodes, id) : id)).join('、')}`)
       if (s.near) parts.push(`在 ${nodeName(nodes, s.near.id)} ${s.near.position}`)
       out.push(`  ${parts.join('，')}`)

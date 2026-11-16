@@ -79,6 +79,10 @@ docs/           设计文档
 
 本地服务只监听 `127.0.0.1`，端口和随机 token 写在 `~/.flyingdraws/daemon.json`；拒绝带 `Origin` 头的浏览器请求和 Host 不是 `127.0.0.1` 的请求。应用里不内置任何模型，也不联网。
 
+## 致谢
+
+画布渲染与交互底层基于 [Excalidraw](https://github.com/excalidraw/excalidraw)（MIT License）构建。
+
 ## 许可证
 
 MIT

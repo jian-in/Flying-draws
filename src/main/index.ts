@@ -4,9 +4,10 @@ import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
-import { buildGraph, summarize, type SceneElement } from './semantic'
-import { MODIFY_OPS, OpsError, planOps, rebaseOps, type DrawOp, type DrawPlan } from './ops'
-import { RequestHub, type DrawRequest, type HubState, type Submission, type WaitResult } from './requests'
+import { bboxOf, buildGraph, summarize, type SceneElement } from './semantic'
+import { OpsError, planOps, rebaseOps, toProposalPlan, type DrawOp, type DrawPlan, type PendingChanges } from './ops'
+import { RequestHub, type DrawRequest, type Handoff, type HubState, type Submission, type WaitResult } from './requests'
+import { SEAT_COLORS, SeatRegistry } from './seats'
 import { captureBaseline, diffProposal, type DiffElement, type ProposalBaseline } from './diff'
 import { startDaemon } from './daemon'
 import {
@@ -58,6 +59,8 @@ interface BoardSession {
   lastElementsKey: number | null
   hub: RequestHub
   history: Map<number, VersionRecord>
+  seats: Map<string, string>
+  drawnAgents: Set<string>
 }
 
 interface BoardInfo extends BoardMeta {
@@ -65,6 +68,7 @@ interface BoardInfo extends BoardMeta {
 }
 
 const sessions = new Map<string, BoardSession>()
+const seatRegistry = new SeatRegistry()
 const requestBoard = new Map<string, string>() // request_id → boardId
 let saveCount = 0
 
@@ -91,7 +95,16 @@ function getSession(id: string): BoardSession {
   let s = sessions.get(id)
   if (!s) {
     const hub = new RequestHub()
-    const session: BoardSession = { id, title: null, version: 0, lastElementsKey: null, hub, history: new Map() }
+    const session: BoardSession = {
+      id,
+      title: null,
+      version: 0,
+      lastElementsKey: null,
+      hub,
+      history: new Map(),
+      seats: new Map(),
+      drawnAgents: new Set()
+    }
     hub.onChange(() => {
       if (session.id === currentBoardId) pushHubState()
       persistPending()
@@ -101,6 +114,45 @@ function getSession(id: string): BoardSession {
   }
   return s
 }
+
+function syncBoardSeats(boardId: string, elements: readonly SceneElement[]): void {
+  const session = getSession(boardId)
+  const drawn = new Set<string>()
+  for (const el of elements) {
+    if (el.isDeleted) continue
+    const mark = el.customData?.flyingdraws
+    if (mark?.role === 'marker' || mark?.author !== 'agent') continue
+    if (typeof mark.agent === 'string' && mark.agent) {
+      drawn.add(mark.agent)
+      if (!session.seats.has(mark.agent)) {
+        const existingColor =
+          typeof mark.color === 'string' && mark.color ? mark.color : SEAT_COLORS[session.seats.size % SEAT_COLORS.length]
+        session.seats.set(mark.agent, existingColor)
+      }
+    }
+  }
+  session.drawnAgents = drawn
+}
+
+const allWaitingAgents = (): string[] => [...sessions.values()].flatMap((s) => s.hub.state().waitingAgents)
+
+function buildHubState(boardId = currentBoardId): HubState {
+  const session = getSession(boardId)
+  const base = session.hub.state()
+  return {
+    ...base,
+    onlineSeats: seatRegistry.list({
+      boardSeats: session.seats,
+      drawnNames: session.drawnAgents,
+      waitingAgents: base.waitingAgents
+    })
+  }
+}
+
+seatRegistry.onChange(() => pushHubState())
+setInterval(() => {
+  if (seatRegistry.hasEntries()) seatRegistry.prune(allWaitingAgents())
+}, 30_000).unref()
 
 function updateWindowTitle(): void {
   if (!win || win.isDestroyed()) return
@@ -144,11 +196,13 @@ async function loadBoard(id = currentBoardId): Promise<{ board: string; title: s
     session.version = Number(scene?.flyingdraws?.version) || 1
     session.title = typeof scene?.flyingdraws?.title === 'string' && scene.flyingdraws.title.trim() ? scene.flyingdraws.title.trim() : null
     session.lastElementsKey = elementsKey(scene.elements ?? [])
+    syncBoardSeats(id, (scene.elements ?? []) as SceneElement[])
     return { board: id, title: session.title, version: session.version, json, path }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       session.version = 0
       session.lastElementsKey = null
+      session.drawnAgents = new Set()
       return { board: id, title: session.title, version: session.version, json: null, path }
     }
     throw err
@@ -160,6 +214,7 @@ async function acceptScene(json: string, id = currentBoardId): Promise<number> {
   const session = getSession(id)
   const path = boardFilePath(BOARDS_DIR, id)
   const scene = JSON.parse(json)
+  syncBoardSeats(id, (scene.elements ?? []) as SceneElement[])
   const key = elementsKey(scene.elements ?? [])
   if (key === session.lastElementsKey) return session.version
   session.lastElementsKey = key
@@ -167,6 +222,7 @@ async function acceptScene(json: string, id = currentBoardId): Promise<number> {
   scene.flyingdraws = { version: session.version, ...(session.title ? { title: session.title } : {}) }
   await atomicWriteJson(path, scene)
   saveCount += 1
+  if (id === currentBoardId) pushHubState()
   return session.version
 }
 
@@ -279,7 +335,7 @@ async function switchBoard(
     json: loaded.json,
     created: !exists,
     boards: await listBoards(),
-    hubState: getSession(targetId).hub.state()
+    hubState: buildHubState(targetId)
   }
 }
 
@@ -344,7 +400,7 @@ async function renameBoard(
   if (toId === currentBoardId) pushHubState()
 
   const boards = await listBoards()
-  const hubState = getSession(currentBoardId).hub.state()
+  const hubState = buildHubState(currentBoardId)
   if (opts.updateRenderer && win && !win.isDestroyed()) {
     await rpc('syncBoards', {
       board: currentBoardId,
@@ -417,7 +473,7 @@ async function deleteBoard(
   updateWindowTitle()
   pushHubState()
   const boards = await listBoards()
-  const hubState = getSession(currentBoardId).hub.state()
+  const hubState = buildHubState(currentBoardId)
 
   if (opts.updateRenderer && win && !win.isDestroyed()) {
     if (deletedActive) {
@@ -538,7 +594,7 @@ function createWindow(): void {
 }
 
 function pushHubState(): void {
-  if (win && !win.isDestroyed()) win.webContents.send('hub:state', getSession(currentBoardId).hub.state())
+  if (win && !win.isDestroyed()) win.webContents.send('hub:state', buildHubState(currentBoardId))
 }
 
 // ---------- 还在等用户回应的请求与未取走的收件箱：存盘，重启后恢复 ----------
@@ -547,7 +603,11 @@ function pushHubState(): void {
 
 let lastPendingKey = '#'
 
-function pendingStateKey(boards: Record<string, DrawRequest[]>, inbox: Record<string, Submission[]>): string {
+function pendingStateKey(
+  boards: Record<string, DrawRequest[]>,
+  inbox: Record<string, Submission[]>,
+  handoffs: Record<string, Handoff[]>
+): string {
   const reqKey = Object.entries(boards)
     .filter(([, list]) => list.length > 0)
     .map(([id, list]) => `${id}:${list.map((r) => r.id).join(',')}`)
@@ -558,25 +618,38 @@ function pendingStateKey(boards: Record<string, DrawRequest[]>, inbox: Record<st
     .map(([id, list]) => `${id}:${list.map((s) => `${s.at}:${s.version}`).join(',')}`)
     .sort()
     .join('|')
-  return `${reqKey}#${inboxKey}`
+  const handoffKey = Object.entries(handoffs)
+    .filter(([, list]) => list.length > 0)
+    .map(([id, list]) => `${id}:${list.map((h) => `${h.at}:${h.from}:${h.to ?? ''}`).join(',')}`)
+    .sort()
+    .join('|')
+  return `${reqKey}#${inboxKey}#${handoffKey}`
 }
 
 function persistPending(): void {
   const boards: Record<string, DrawRequest[]> = {}
   const inbox: Record<string, Submission[]> = {}
+  const handoffs: Record<string, Handoff[]> = {}
   for (const [id, session] of sessions) {
     const waiting = session.hub.waiting()
     if (waiting.length) boards[id] = waiting
     const queued = session.hub.queuedInbox()
     if (queued.length) inbox[id] = queued
+    const queuedPasses = session.hub.queuedHandoffs()
+    if (queuedPasses.length) handoffs[id] = queuedPasses
   }
-  const key = pendingStateKey(boards, inbox)
+  const key = pendingStateKey(boards, inbox, handoffs)
   if (key === lastPendingKey) return // 只是有 agent 开始或结束等待，请求和收件箱本身没变
   lastPendingKey = key
   try {
     mkdirSync(HOME, { recursive: true })
     const tmp = `${pendingPath}.tmp`
-    const payload = { version: 2, boards, ...(Object.keys(inbox).length ? { inbox } : {}) }
+    const payload = {
+      version: 2,
+      boards,
+      ...(Object.keys(inbox).length ? { inbox } : {}),
+      ...(Object.keys(handoffs).length ? { handoffs } : {})
+    }
     // 同步原子写盘，保证应用被强杀前已落盘且不留半截文件
     writeFileSync(tmp, JSON.stringify(payload), 'utf8')
     renameSync(tmp, pendingPath)
@@ -588,6 +661,7 @@ function persistPending(): void {
 function restorePending(): void {
   let perBoard: Record<string, DrawRequest[]> = {}
   let perInbox: Record<string, Submission[]> = {}
+  let perHandoffs: Record<string, Handoff[]> = {}
   try {
     const raw = JSON.parse(readFileSync(pendingPath, 'utf8')) as {
       version?: number
@@ -595,10 +669,12 @@ function restorePending(): void {
       requests?: DrawRequest[]
       boards?: Record<string, DrawRequest[]>
       inbox?: Record<string, Submission[]>
+      handoffs?: Record<string, Handoff[]>
     }
     if (raw.version === 2) {
       if (raw.boards && typeof raw.boards === 'object') perBoard = raw.boards
       if (raw.inbox && typeof raw.inbox === 'object') perInbox = raw.inbox
+      if (raw.handoffs && typeof raw.handoffs === 'object') perHandoffs = raw.handoffs
     } else if (Array.isArray(raw.requests)) {
       perBoard = { [raw.board && isValidBoardId(raw.board) ? raw.board : DEFAULT_BOARD_ID]: raw.requests }
     }
@@ -607,7 +683,8 @@ function restorePending(): void {
   }
   const restoredBoards: Record<string, DrawRequest[]> = {}
   const restoredInbox: Record<string, Submission[]> = {}
-  const allBoardIds = new Set([...Object.keys(perBoard), ...Object.keys(perInbox)])
+  const restoredHandoffs: Record<string, Handoff[]> = {}
+  const allBoardIds = new Set([...Object.keys(perBoard), ...Object.keys(perInbox), ...Object.keys(perHandoffs)])
   for (const boardId of allBoardIds) {
     if (!isValidBoardId(boardId)) continue
     const boardPath = boardFilePath(BOARDS_DIR, boardId)
@@ -615,6 +692,7 @@ function restorePending(): void {
     if (!boardExists && boardId !== currentBoardId) continue
     const saved = Array.isArray(perBoard[boardId]) ? perBoard[boardId] : []
     const savedInbox = Array.isArray(perInbox[boardId]) ? perInbox[boardId] : []
+    const savedHandoffs = Array.isArray(perHandoffs[boardId]) ? perHandoffs[boardId] : []
     // 提议对应的元素要是已经不在画板上了（比如用户手动删光了），这个提议就不用再问
     let proposalsOnBoard = new Set<string>()
     if (boardExists) {
@@ -627,13 +705,15 @@ function restorePending(): void {
     }
     const usable = saved.filter((r) => r && typeof r.id === 'string' && (r.kind !== 'proposal' || (r.proposalId && proposalsOnBoard.has(r.proposalId))))
     const usableInbox = savedInbox.filter((s) => s && typeof s.sceneJson === 'string' && typeof s.at === 'string')
-    if (!usable.length && !usableInbox.length) continue
+    const usableHandoffs = savedHandoffs.filter((h) => h && typeof h.from === 'string' && typeof h.sceneJson === 'string' && typeof h.at === 'string')
+    if (!usable.length && !usableInbox.length && !usableHandoffs.length) continue
     if (usable.length) restoredBoards[boardId] = usable
     if (usableInbox.length) restoredInbox[boardId] = usableInbox
+    if (usableHandoffs.length) restoredHandoffs[boardId] = usableHandoffs
     for (const r of usable) requestBoard.set(r.id, boardId)
-    getSession(boardId).hub.restore(usable, usableInbox)
+    getSession(boardId).hub.restore(usable, usableInbox, usableHandoffs)
   }
-  lastPendingKey = pendingStateKey(restoredBoards, restoredInbox)
+  lastPendingKey = pendingStateKey(restoredBoards, restoredInbox, restoredHandoffs)
 }
 
 // ---------- 给 agent 的响应 ----------
@@ -661,15 +741,28 @@ function fingerprints(elements: readonly VersionedElement[]): Map<string, string
 function remember(boardId: string, ver: number, elements: readonly VersionedElement[], graph: ReturnType<typeof buildGraph>): void {
   const history = getSession(boardId).history
   history.delete(ver)
-  history.set(ver, { nodes: graph.nodes.map(({ id, ref, label }) => ({ id, ref, label })), fingerprints: fingerprints(elements) })
+  const items = [
+    ...graph.nodes.map(({ id, ref, label }) => ({ id, ref, label })),
+    ...graph.notes.map(({ id, ref, text }) => ({ id, ref, label: text })),
+    ...graph.strokeGroups.filter((g) => g.refs.length > 0).map((g) => ({ id: g.id, ref: g.refs[0], label: null })),
+    ...graph.strokes.map((s) => ({ id: s.id, ref: s.ref, label: null }))
+  ]
+  history.set(ver, { nodes: items, fingerprints: fingerprints(elements) })
   while (history.size > HISTORY_LIMIT) history.delete(history.keys().next().value as number)
 }
 
-function describe(sceneJson: string, ver: number, opts: { format: string; image: ImageMode }, png: string | null, boardId = currentBoardId) {
+function describe(
+  sceneJson: string,
+  ver: number,
+  opts: { format: string; image: ImageMode },
+  png: string | null,
+  boardId = currentBoardId,
+  viewer: string | null = null
+) {
   const scene = JSON.parse(sceneJson)
   const graph = buildGraph((scene.elements ?? []) as SceneElement[])
   remember(boardId, ver, (scene.elements ?? []) as VersionedElement[], graph)
-  let summary = summarize(graph, { board: boardId, version: ver })
+  let summary = summarize(graph, { board: boardId, version: ver, viewer })
   const wantImage = opts.image === 'always' || (opts.image === 'auto' && graph.needsImage)
   const attached = wantImage && Boolean(png)
   if (graph.needsImage) {
@@ -717,26 +810,49 @@ async function ensureBoard(rawBoard: unknown): Promise<string> {
   return targetId
 }
 
+const viewerOf = (body: Record<string, unknown>): string | null =>
+  typeof body.agent === 'string' && body.agent.trim() ? body.agent.trim() : null
+
+const actorOf = (body: Record<string, unknown>): string | null =>
+  typeof body.as === 'string' && body.as.trim() ? body.as.trim() : viewerOf(body)
+
+function resolveActor(
+  boardId: string,
+  body: Record<string, unknown>,
+  elements: readonly SceneElement[] = []
+): { agent: string | null; seat: boolean; color: string } {
+  const session = getSession(boardId)
+  syncBoardSeats(boardId, elements)
+  const asName = typeof body.as === 'string' && body.as.trim() ? body.as.trim() : null
+  const agent = asName || viewerOf(body)
+  if (!agent) return { agent: null, seat: false, color: SEAT_COLORS[0] }
+  let color = session.seats.get(agent)
+  if (!color) {
+    color = SEAT_COLORS[session.seats.size % SEAT_COLORS.length]
+    session.seats.set(agent, color)
+  }
+  return { agent, seat: Boolean(asName), color }
+}
+
 // /draw 和 /propose 共用：把一批指令画到画布上。proposalId 不为空时画在提议层上。
 // 要在 serialized() 里面调用。
 async function drawOps(
   body: Record<string, unknown>,
   proposalId: string | null
-): Promise<{ ok: boolean; result: Record<string, unknown>; sceneJson?: string; boardId: string }> {
+): Promise<{ ok: boolean; result: Record<string, unknown>; sceneJson?: string; pending?: PendingChanges | null; boardId: string }> {
   const boardId = await ensureBoard(body.board)
   const session = getSession(boardId)
   // 先拿页面上的最新状态，版本号以它为准（用户刚画的几笔可能还没落盘）
   const snap = await takeSnapshot(false)
   const ver = await acceptScene(snap.sceneJson, boardId)
   const elements = (JSON.parse(snap.sceneJson).elements ?? []) as VersionedElement[]
+  const actor = resolveActor(boardId, body, elements)
+  const viewer = actor.agent
   const graph = buildGraph(elements)
-  const current = () => describe(snap.sceneJson, ver, { format: 'summary', image: 'never' }, null, boardId)
+  const current = () => describe(snap.sceneJson, ver, { format: 'summary', image: 'never' }, null, boardId, viewer)
   const fail = (status: 'invalid' | 'conflict', message: string) => ({ ok: false, boardId, result: { status, error: message, ...current() } })
 
   let ops = (Array.isArray(body.ops) ? body.ops : []) as DrawOp[]
-  if (proposalId && ops.some((op) => MODIFY_OPS.includes(op?.op))) {
-    return fail('invalid', 'A proposal can only add things (add_node, add_edge, add_text). Use canvas_draw to change or delete what you drew.')
-  }
 
   // agent 是基于哪个版本下的指令。和当前版本不一样时，先把指令里的旧编号换算成现在的。
   const base = Number(body.base_version)
@@ -776,15 +892,56 @@ async function drawOps(
     const now = fingerprints(elements)
     const touched = plan.modifiedRefs.filter((ref) => record.fingerprints.get(ref) !== now.get(ref))
     if (touched.length) {
-      const names = touched.map((ref) => {
-        const node = graph.nodes.find((n) => n.ref === ref)
-        return node ? `${node.id}${node.label ? ` ("${node.label}")` : ''}` : 'an arrow'
-      })
-      return fail('conflict', `${names.join(', ')} ${touched.length > 1 ? 'were' : 'was'} changed by someone else after version ${base}.`)
+      const names = [
+        ...new Set(
+          touched.map((ref) => {
+            const node = graph.nodes.find((n) => n.ref === ref)
+            if (node) return `${node.id}${node.label ? ` ("${node.label}")` : ''}`
+            const note = graph.notes.find((n) => n.ref === ref)
+            if (note) return `${note.id} ("${note.text}")`
+            const sg = graph.strokeGroups.find((g) => g.refs.includes(ref))
+            if (sg) return sg.id
+            const st = graph.strokes.find((s) => s.ref === ref)
+            if (st) return st.id
+            return 'an arrow'
+          })
+        )
+      ]
+      return fail('conflict', `${names.join(', ')} ${names.length > 1 ? 'were' : 'was'} changed by someone else after version ${base}.`)
     }
   }
 
-  const applied = await rpc<{ sceneJson: string }>('applyPlan', { plan, proposalId }, 12_000)
+  let pending: PendingChanges | null = null
+  if (proposalId) {
+    const elById = new Map(elements.filter((el) => !el.isDeleted).map((el) => [el.id, el]))
+    const box = (ref: string) => {
+      const el = elById.get(ref)
+      return el ? bboxOf(el) : null
+    }
+    const name = (refs: string[]) => {
+      const first = refs[0]
+      const node = graph.nodes.find((n) => n.ref === first)
+      if (node) return node.label ? `节点「${node.label}」` : `节点 ${node.id}`
+      const edge = graph.edges.find((e) => e.ref === first)
+      if (edge) return `连线 ${edge.from ?? '?'}→${edge.to ?? '?'}`
+      const note = graph.notes.find((n) => n.ref === first)
+      if (note) return `文字「${note.text}」`
+      const sg = graph.strokeGroups.find((g) => g.refs.includes(first))
+      if (sg) return `手绘 ${sg.id}`
+      const st = graph.strokes.find((s) => s.ref === first)
+      if (st) return `手绘 ${st.id}`
+      return '元素'
+    }
+    const converted = toProposalPlan(plan, { box, name }, newElementId)
+    plan = converted.plan
+    pending = converted.pending
+  }
+
+  const applied = await rpc<{ sceneJson: string }>(
+    'applyPlan',
+    { plan, proposalId, agent: actor.agent, seat: actor.seat, color: actor.color },
+    12_000
+  )
   const newVer = await acceptScene(applied.sceneJson, boardId)
   const after = buildGraph((JSON.parse(applied.sceneJson).elements ?? []) as SceneElement[])
   const nodeIds: Record<string, string> = {}
@@ -796,18 +953,43 @@ async function drawOps(
     ok: true,
     boardId,
     sceneJson: applied.sceneJson,
+    pending,
     result: {
       added: { nodes: plan.nodes.length, edges: plan.edges.length, texts: plan.texts.length },
-      changed: { updated: plan.updates.length, deleted: plan.deletes.length },
+      changed: {
+        updated: plan.updates.filter((u) => !u.relayout).length + plan.textEdits.length,
+        styled: plan.styles.length,
+        deleted: plan.deletes.length,
+        proposed: plan.markers.length
+      },
       node_ids: nodeIds,
-      ...describe(applied.sceneJson, newVer, { format: 'summary', image: 'never' }, null, boardId)
+      ...describe(applied.sceneJson, newVer, { format: 'summary', image: 'never' }, null, boardId, viewer)
     }
   }
 }
 
+function touchSeat(body: Record<string, unknown>): void {
+  seatRegistry.touch({
+    bridgeId: typeof body.bridge_id === 'string' ? body.bridge_id : null,
+    agent: typeof body.agent === 'string' ? body.agent : null,
+    as: typeof body.as === 'string' ? body.as : null
+  })
+}
+
 const routes = {
-  '/open': (body: Record<string, unknown>) =>
-    serialized(async () => {
+  '/seat': async (body: Record<string, unknown>) => {
+    if (body.leave) {
+      const bridgeId = typeof body.bridge_id === 'string' ? body.bridge_id : ''
+      seatRegistry.leave(bridgeId)
+    } else {
+      touchSeat(body)
+    }
+    return { ok: true, seats: buildHubState(currentBoardId).onlineSeats ?? [] }
+  },
+
+  '/open': (body: Record<string, unknown>) => {
+    touchSeat(body)
+    return serialized(async () => {
       bringToFront()
       await windowReady
       const rawBoard = typeof body.board === 'string' && body.board.trim() ? body.board : null
@@ -824,15 +1006,20 @@ const routes = {
       }
       const session = getSession(currentBoardId)
       return { board: currentBoardId, title: session.title, version: session.version, created: false, window: 'shown' }
-    }),
+    })
+  },
 
-  '/list': async () => ({
-    current: currentBoardId,
-    boards: await listBoards()
-  }),
+  '/list': async (body: Record<string, unknown>) => {
+    touchSeat(body)
+    return {
+      current: currentBoardId,
+      boards: await listBoards()
+    }
+  },
 
-  '/rename': (body: Record<string, unknown>) =>
-    serialized(async () => {
+  '/rename': (body: Record<string, unknown>) => {
+    touchSeat(body)
+    return serialized(async () => {
       const fromBoard = typeof body.board === 'string' && body.board.trim() ? body.board : undefined
       const rawNew = String(body.new_board ?? '')
       const explicitTitle = body.title === null ? null : typeof body.title === 'string' ? body.title : undefined
@@ -844,10 +1031,12 @@ const routes = {
         title: renamed.title,
         version: renamed.version
       }
-    }),
+    })
+  },
 
-  '/delete': (body: Record<string, unknown>) =>
-    serialized(async () => {
+  '/delete': (body: Record<string, unknown>) => {
+    touchSeat(body)
+    return serialized(async () => {
       const targetBoard = typeof body.board === 'string' && body.board.trim() ? body.board : undefined
       const res = await deleteBoard(targetBoard, { updateRenderer: true })
       return {
@@ -856,10 +1045,13 @@ const routes = {
         title: res.title,
         version: res.version
       }
-    }),
+    })
+  },
 
   '/read': async (body: Record<string, unknown>) => {
+    touchSeat(body)
     const image = imageMode(body.image)
+    const viewer = actorOf(body)
     if (!win) {
       bringToFront()
     }
@@ -870,28 +1062,32 @@ const routes = {
     // 先不要图，算完语义发现需要时再要，省一次导出
     let snap = await takeSnapshot(image === 'always')
     const ver = await acceptScene(snap.sceneJson, boardId)
-    let res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId)
+    let res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId, viewer)
     if (image === 'auto' && res.needs_image && !snap.pngBase64) {
       snap = await takeSnapshot(true)
-      res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId)
+      res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId, viewer)
     }
+    const hub = getSession(boardId).hub
     // 用户之前点过"发给 agent"但还没人来取的，这次读取就算取走了：把附言带上
-    const sent = getSession(boardId)
-      .hub.takeInbox()
-      .map((s) => ({ note: s.note, at: s.at }))
-    return { ...res, sent }
+    const sent = hub.takeInbox().map((s) => ({ note: s.note, at: s.at }))
+    // 其他席位递过来的画笔一并交给这个席位
+    const handoffs = hub.takeHandoffs(viewer).map((h) => ({ from: h.from, to: h.to, note: h.note, at: h.at }))
+    return { ...res, sent, handoffs }
   },
 
-  '/draw': (body: Record<string, unknown>) =>
-    serialized(async () => {
+  '/draw': (body: Record<string, unknown>) => {
+    touchSeat(body)
+    return serialized(async () => {
       if (!win || win.isMinimized()) bringToFront()
       const res = await drawOps(body, null)
       return res.ok ? { status: 'drawn', ...res.result } : res.result
-    }),
+    })
+  },
 
   // 画在提议层上，并弹出横幅请用户确认。结果用 /wait 等。
-  '/propose': (body: Record<string, unknown>) =>
-    serialized(async () => {
+  '/propose': (body: Record<string, unknown>) => {
+    touchSeat(body)
+    return serialized(async () => {
       const question = String(body.question ?? '').trim()
       if (!question) throw new Error('question is required')
       const proposalId = `prop_${randomBytes(6).toString('hex')}`
@@ -900,14 +1096,16 @@ const routes = {
       // 画成功了才弹横幅，不然用户会看到一个没有内容的确认请求
       // 记下提议刚画上去的样子，用户表态时拿来比出改了哪里
       const baseline = captureBaseline((JSON.parse(res.sceneJson ?? '{}').elements ?? []) as DiffElement[], proposalId)
-      const req = getSession(res.boardId).hub.create(question, proposalId, baseline)
+      const req = getSession(res.boardId).hub.create(question, proposalId, baseline, res.pending ?? null)
       requestBoard.set(req.id, res.boardId)
       bringToFront()
       return { status: 'proposed', request_id: req.id, ...res.result }
-    }),
+    })
+  },
 
-  '/request': (body: Record<string, unknown>) =>
-    serialized(async () => {
+  '/request': (body: Record<string, unknown>) => {
+    touchSeat(body)
+    return serialized(async () => {
       const prompt = String(body.prompt ?? '').trim()
       if (!prompt) throw new Error('prompt is required')
       const boardId = await ensureBoard(body.board)
@@ -915,17 +1113,59 @@ const routes = {
       requestBoard.set(req.id, boardId)
       bringToFront()
       return { request_id: req.id, board: boardId, status: 'waiting' }
-    }),
+    })
+  },
+
+  '/pass': (body: Record<string, unknown>) => {
+    touchSeat(body)
+    return serialized(async () => {
+      const note = String(body.note ?? '').trim()
+      if (!note) throw new Error('note is required')
+      if (!win || win.isMinimized()) bringToFront()
+      const boardId = await ensureBoard(body.board)
+      const snap = await takeSnapshot(true)
+      const ver = await acceptScene(snap.sceneJson, boardId)
+      const elements = (JSON.parse(snap.sceneJson).elements ?? []) as SceneElement[]
+      const actor = resolveActor(boardId, body, elements)
+      const from = actor.agent || 'agent'
+      const to = typeof body.to === 'string' && body.to.trim() ? body.to.trim() : null
+      if (to && to === from) throw new Error('cannot pass the brush to the same seat')
+      const delivered = getSession(boardId).hub.passBaton({
+        from,
+        to,
+        note,
+        sceneJson: snap.sceneJson,
+        pngBase64: snap.pngBase64,
+        version: ver,
+        at: new Date().toISOString()
+      })
+      return { status: delivered ? 'delivered' : 'queued', from, to, board: boardId, version: ver }
+    })
+  },
 
   '/wait': async (body: Record<string, unknown>) => {
+    touchSeat(body)
     const seconds = Math.min(Math.max(Number(body.timeout_s) || WAIT_DEFAULT_S, 1), WAIT_MAX_S)
     const requestId = typeof body.request_id === 'string' && body.request_id ? body.request_id : null
+    const viewer = actorOf(body)
     const boardId = requestId
       ? (requestBoard.get(requestId) ?? currentBoardId)
       : typeof body.board === 'string' && body.board.trim()
         ? validateBoardId(body.board)
         : currentBoardId
-    const result: WaitResult = await getSession(boardId).hub.wait(requestId ? { requestId } : { inbox: true }, seconds * 1000)
+    const result: WaitResult = await getSession(boardId).hub.wait(requestId ? { requestId } : { inbox: true, agent: viewer }, seconds * 1000)
+    touchSeat(body)
+    if (result.status === 'handoff') {
+      const h = result.handoff
+      return {
+        status: 'handoff',
+        from: h.from,
+        to: h.to,
+        note: h.note,
+        submitted_at: h.at,
+        ...describe(h.sceneJson, h.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, h.pngBase64, boardId, viewer)
+      }
+    }
     if (result.status !== 'submitted') return { ...result, request_id: requestId }
     const sub = result.submission
     return {
@@ -935,7 +1175,7 @@ const routes = {
       changes: sub.changes ?? null,
       note: sub.note,
       submitted_at: sub.at,
-      ...describe(sub.sceneJson, sub.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, sub.pngBase64, boardId)
+      ...describe(sub.sceneJson, sub.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, sub.pngBase64, boardId, viewer)
     }
   }
 }
@@ -990,8 +1230,15 @@ ipcMain.handle('board:reveal', () => {
   mkdirSync(BOARDS_DIR, { recursive: true })
   return shell.openPath(BOARDS_DIR)
 })
-ipcMain.handle('hub:state', () => getSession(currentBoardId).hub.state())
-type SubmitPayload = { requestId: string | null; note: string; sceneJson: string; pngBase64: string | null; decision?: 'accepted' | 'rejected' | null }
+ipcMain.handle('hub:state', () => buildHubState(currentBoardId))
+type SubmitPayload = {
+  requestId: string | null
+  note: string
+  sceneJson: string
+  pngBase64: string | null
+  decision?: 'accepted' | 'rejected' | null
+  skipped?: string[]
+}
 ipcMain.handle('hub:submit', async (_e, payload: SubmitPayload) => {
   const boardId = currentBoardId
   const hub = getSession(boardId).hub
@@ -1000,8 +1247,10 @@ ipcMain.handle('hub:submit', async (_e, payload: SubmitPayload) => {
   // 回应提议时，比出用户在提议上改了什么。拒绝时提议已经被删掉，只看用户自己加了什么没有意义，不比。
   const req = payload.requestId ? hub.get(payload.requestId) : undefined
   let changes: string[] | null = null
-  if (decision === 'accepted' && req?.kind === 'proposal' && req.baseline) {
-    changes = diffProposal(req.baseline as ProposalBaseline, (JSON.parse(payload.sceneJson).elements ?? []) as DiffElement[])
+  if (decision === 'accepted' && req?.kind === 'proposal') {
+    const diff = req.baseline ? diffProposal(req.baseline as ProposalBaseline, (JSON.parse(payload.sceneJson).elements ?? []) as DiffElement[]) : []
+    const skipped = Array.isArray(payload.skipped) ? payload.skipped.filter((s): s is string => typeof s === 'string' && Boolean(s)) : []
+    changes = [...skipped, ...diff]
   }
   const sub: Submission = {
     requestId: payload.requestId,

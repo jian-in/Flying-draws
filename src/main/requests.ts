@@ -1,5 +1,6 @@
 // agent 的绘图请求和用户的"发送"，以及 agent 端的长轮询等待。
 // 不依赖 Electron，可以单独测试。
+import type { OnlineSeat } from './seats.ts'
 
 export interface Submission {
   requestId: string | null // null 表示用户主动发送，不是回应某个请求
@@ -12,6 +13,16 @@ export interface Submission {
   changes?: string[] | null // 回应提议时：用户在提议上改了什么（中文句子）
 }
 
+export interface Handoff {
+  from: string
+  to: string | null // null 表示递给任意其他 agent
+  note: string
+  sceneJson: string
+  pngBase64: string | null
+  version: number
+  at: string
+}
+
 export type RequestKind = 'draw' | 'proposal' // draw：请用户画；proposal：agent 画了提议，请用户确认
 
 export interface DrawRequest {
@@ -19,6 +30,7 @@ export interface DrawRequest {
   kind: RequestKind
   proposalId: string | null // 提议层元素上打的标记，页面靠它找到这批元素
   baseline: unknown // 提议画上去时的底稿，用户表态时拿来比出改了什么；这里不关心它的结构
+  pending?: unknown // 提议里包含的修改/删除，用户点接受时才执行
   prompt: string
   createdAt: string
   status: 'waiting' | 'submitted' | 'cancelled'
@@ -27,11 +39,12 @@ export interface DrawRequest {
 
 export type WaitResult =
   | { status: 'submitted'; submission: Submission }
+  | { status: 'handoff'; handoff: Handoff }
   | { status: 'cancelled'; requestId: string }
   | { status: 'waiting'; waitingFor: 'user' }
   | { status: 'unknown_request'; requestId: string }
 
-export type WaitTarget = { requestId: string } | { inbox: true }
+export type WaitTarget = { requestId: string } | { inbox: true; agent?: string | null }
 
 interface Waiter {
   target: WaitTarget
@@ -40,14 +53,18 @@ interface Waiter {
 }
 
 export interface HubState {
-  pending: { id: string; kind: RequestKind; proposalId: string | null; prompt: string; createdAt: string }[]
+  pending: { id: string; kind: RequestKind; proposalId: string | null; pending?: unknown; prompt: string; createdAt: string }[]
   agentWaiting: boolean // 有 agent 正在长轮询等待用户
+  waitingAgents: string[] // 正在长轮询等待的席位名列表
   inbox: number // 用户主动发出、agent 还没取走的画有几份
+  handoff: { from: string; to: string | null; note: string } | null // 尚未被接走的最新一棒
+  onlineSeats?: OnlineSeat[] // 当前连着画布的在线 agent 席位
 }
 
 export class RequestHub {
   private requests = new Map<string, DrawRequest>()
   private inbox: Submission[] = []
+  private handoffs: Handoff[] = []
   private waiters = new Set<Waiter>()
   private seq = 0
   private listener: ((s: HubState) => void) | null = null
@@ -59,8 +76,63 @@ export class RequestHub {
   state(): HubState {
     const pending = [...this.requests.values()]
       .filter((r) => r.status === 'waiting')
-      .map(({ id, kind, proposalId, prompt, createdAt }) => ({ id, kind, proposalId, prompt, createdAt }))
-    return { pending, agentWaiting: this.waiters.size > 0, inbox: this.inbox.length }
+      .map(({ id, kind, proposalId, pending: pendingChanges, prompt, createdAt }) => ({
+        id,
+        kind,
+        proposalId,
+        pending: pendingChanges ?? null,
+        prompt,
+        createdAt
+      }))
+    const waitingAgents = [
+      ...new Set(
+        [...this.waiters]
+          .map((w) => ('inbox' in w.target && w.target.agent ? w.target.agent : null))
+          .filter((a): a is string => Boolean(a))
+      )
+    ]
+    const lastHandoff = this.handoffs.length ? this.handoffs[this.handoffs.length - 1] : null
+    return {
+      pending,
+      agentWaiting: this.waiters.size > 0,
+      waitingAgents,
+      inbox: this.inbox.length,
+      handoff: lastHandoff ? { from: lastHandoff.from, to: lastHandoff.to, note: lastHandoff.note } : null
+    }
+  }
+
+  private canTakeHandoff(h: Handoff, agent: string | null | undefined): boolean {
+    if (agent && agent === h.from) return false
+    if (h.to) return Boolean(agent && agent === h.to)
+    return true
+  }
+
+  // 一个席位把画笔递给另一个席位：目标已在等待时立即唤醒，否则先挂在画板队列里
+  passBaton(h: Handoff): boolean {
+    const woke = this.settle((t) => 'inbox' in t && this.canTakeHandoff(h, t.agent), { status: 'handoff', handoff: h }, true)
+    if (woke) {
+      this.emit()
+      return true
+    }
+    this.handoffs.push(h)
+    this.emit()
+    return false
+  }
+
+  // 目标席位来读画板时，顺便取走递给它的画笔
+  takeHandoffs(agent: string | null): Handoff[] {
+    if (!this.handoffs.length) return []
+    const taken: Handoff[] = []
+    const kept: Handoff[] = []
+    for (const h of this.handoffs) {
+      if (this.canTakeHandoff(h, agent)) taken.push(h)
+      else kept.push(h)
+    }
+    if (taken.length) {
+      this.handoffs = kept
+      this.emit()
+    }
+    return taken
   }
 
   // agent 直接读画布时，顺便把收件箱里还没取走的都交给它
@@ -86,8 +158,13 @@ export class RequestHub {
     return [...this.inbox]
   }
 
-  // 应用重启后把存盘的请求和收件箱放回来，编号不变，agent 手里的 request_id 还能用
-  restore(saved: readonly DrawRequest[], savedInbox: readonly Submission[] = []): void {
+  // 还没被接走的递画笔接力，随 pending.json 存盘
+  queuedHandoffs(): Handoff[] {
+    return [...this.handoffs]
+  }
+
+  // 应用重启后把存盘的请求、收件箱和递画笔交接放回来，编号不变，agent 手里的 request_id 还能用
+  restore(saved: readonly DrawRequest[], savedInbox: readonly Submission[] = [], savedHandoffs: readonly Handoff[] = []): void {
     for (const r of saved) {
       if (!r?.id || this.requests.has(r.id)) continue
       this.requests.set(r.id, { ...r, status: 'waiting', submission: null })
@@ -100,16 +177,25 @@ export class RequestHub {
       seenInbox.add(key)
       this.inbox.push({ ...s, requestId: null })
     }
+    const seenHandoffs = new Set(this.handoffs.map((h) => `${h.at}:${h.from}:${h.to ?? ''}:${h.note}`))
+    for (const h of savedHandoffs) {
+      if (!h || typeof h.from !== 'string' || typeof h.sceneJson !== 'string' || typeof h.at !== 'string') continue
+      const key = `${h.at}:${h.from}:${h.to ?? ''}:${h.note ?? ''}`
+      if (seenHandoffs.has(key)) continue
+      seenHandoffs.add(key)
+      this.handoffs.push({ ...h, to: h.to || null })
+    }
     this.emit()
   }
 
-  create(prompt: string, proposalId: string | null = null, baseline: unknown = null): DrawRequest {
+  create(prompt: string, proposalId: string | null = null, baseline: unknown = null, pending: unknown = null): DrawRequest {
     this.seq += 1
     const req: DrawRequest = {
       id: `req_${Date.now().toString(36)}_${this.seq}`,
       kind: proposalId ? 'proposal' : 'draw',
       proposalId,
       baseline,
+      pending,
       prompt,
       createdAt: new Date().toISOString(),
       status: 'waiting',
@@ -160,6 +246,10 @@ export class RequestHub {
       this.inbox = []
       changed = true
     }
+    if (this.handoffs.length) {
+      this.handoffs = []
+      changed = true
+    }
     if (changed) this.emit()
   }
 
@@ -173,6 +263,13 @@ export class RequestHub {
       const submission = this.inbox.shift()!
       this.emit() // 让画布知道这一份被取走了
       return Promise.resolve({ status: 'submitted', submission })
+    } else {
+      const idx = this.handoffs.findIndex((h) => this.canTakeHandoff(h, target.agent))
+      if (idx !== -1) {
+        const [handoff] = this.handoffs.splice(idx, 1)
+        this.emit()
+        return Promise.resolve({ status: 'handoff', handoff })
+      }
     }
 
     return new Promise((resolve) => {

@@ -43,6 +43,74 @@ body {
   text-overflow: ellipsis;
 }
 
+.fd-seats {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+}
+
+.fd-seats-label,
+.fd-seats-empty {
+  font-size: 11px;
+  color: var(--fd-muted);
+  flex: none;
+}
+
+.fd-seat-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--fd-border);
+  background: var(--fd-surface);
+  color: var(--fd-text);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.12s;
+}
+
+.fd-seat-pill:disabled {
+  cursor: default;
+}
+
+.fd-seat-pill:not(:disabled):hover {
+  background: var(--fd-surface-hover);
+}
+
+.fd-seat-pill.fd-seat-pill-active {
+  background: var(--fd-primary);
+  color: var(--fd-on-primary);
+  font-weight: 600;
+}
+
+.fd-seat-pill-waiting .fd-seat-dot {
+  animation: fd-pulse 1.6s ease-in-out infinite;
+}
+
+.fd-seat-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fd-seat-badge {
+  margin-left: 5px;
+  font-size: 10px;
+  color: var(--fd-muted);
+}
+
+.fd-seat-pill-active .fd-seat-badge {
+  color: var(--fd-on-primary);
+}
+
 .fd-canvas {
   flex: 1;
   min-height: 0;
@@ -128,6 +196,11 @@ body {
   --color-primary-light: #4a401c;
   --color-primary-light-darker: #5a4d20;
   --button-hover-bg: #3a3628;
+}
+
+/* 桌面本地画布不需要帮助弹窗顶部的 Excalidraw 外链入口 */
+.excalidraw .HelpDialog__header {
+  display: none;
 }
 
 /* ---------- 按钮和输入框 ---------- */
@@ -484,7 +557,8 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .fd-waiting-live::before {
+  .fd-waiting-live::before,
+  .fd-seat-pill-waiting .fd-seat-dot {
     animation: none;
   }
 }
@@ -528,4 +602,62 @@ body {
 
 .fd-waiting {
   box-shadow: 2px 2px 0 var(--fd-ink);
+}
+
+/* ---------- 底部按作者筛选显示 ---------- */
+
+.fd-filter {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--fd-surface);
+  border: var(--fd-line) solid var(--fd-border);
+  box-shadow: var(--fd-shadow);
+}
+
+.fd-filter button {
+  height: 28px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fd-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.12s, color 0.12s;
+}
+
+.fd-filter button:hover {
+  background: var(--fd-surface-hover);
+  color: var(--fd-text);
+}
+
+.fd-filter button.fd-filter-active {
+  background: var(--fd-primary);
+  color: var(--fd-on-primary);
+  font-weight: 600;
+}
+
+.fd-filter button:focus-visible {
+  outline: 2px solid var(--fd-primary);
+  outline-offset: 1px;
+}
+
+.fd-seat-dot {
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
 }

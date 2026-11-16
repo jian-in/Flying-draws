@@ -200,3 +200,58 @@ test('有曲线涂鸦时建议附图', () => {
   assert.equal(g.strokes[0].shape, 'curve')
   assert.equal(g.needsImage, true)
 })
+
+test('游离文字和手绘按 T/S 编号，标记框被忽略，多 agent 署名区分自己与其他 agent', () => {
+  const mine: SceneElement = {
+    id: 'n_mine',
+    type: 'rectangle',
+    x: 0,
+    y: 0,
+    width: 100,
+    height: 60,
+    customData: { flyingdraws: { author: 'agent', agent: 'claude-code', layer: 'final' } }
+  }
+  const other: SceneElement = {
+    id: 'n_other',
+    type: 'rectangle',
+    x: 300,
+    y: 0,
+    width: 100,
+    height: 60,
+    customData: { flyingdraws: { author: 'agent', agent: 'codex', layer: 'final' } }
+  }
+  const marker: SceneElement = {
+    id: 'mk_1',
+    type: 'rectangle',
+    x: -10,
+    y: -10,
+    width: 120,
+    height: 80,
+    customData: { flyingdraws: { author: 'agent', layer: 'proposal', role: 'marker' } }
+  }
+  const markerText: SceneElement = {
+    id: 'mk_t',
+    type: 'text',
+    x: -10,
+    y: -36,
+    width: 40,
+    height: 20,
+    text: '删除',
+    containerId: null,
+    customData: { flyingdraws: { author: 'agent', layer: 'proposal', role: 'marker' } }
+  }
+  const noteEl = text(0, 90, '旁注')
+  const g = buildGraph([mine, other, marker, markerText, noteEl, ...handwrittenChar(500, 0), stroke([800, 0], [900, 0])])
+  assert.equal(g.nodes.length, 2, 'marker 矩形不进入节点列表')
+  assert.equal(g.notes.length, 1, 'marker 说明文字不进入旁注列表')
+  assert.equal(g.notes[0].id, 'T1')
+  assert.equal(g.strokeGroups[0].id, 'S1')
+  assert.equal(g.strokes[0].id, 'S2')
+
+  const s = summarize(g, { board: 't', version: 1, viewer: 'claude-code' })
+  assert.match(s, /N1 （无文字）矩形【agent 画的】/)
+  assert.match(s, /N2 （无文字）矩形【其他 agent（codex）画的】/)
+  assert.match(s, /T1 「旁注」/)
+  assert.match(s, /S1 一组手写或涂鸦/)
+  assert.match(s, /S2 一条直线/)
+})
