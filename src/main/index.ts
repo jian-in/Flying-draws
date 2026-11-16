@@ -20,7 +20,6 @@ import {
   parseBoardMeta,
   pickFallbackBoard,
   updateBoardSceneTitle,
-  upgradeLegacyScene,
   validateBoardId,
   type BoardMeta
 } from './boards'
@@ -29,21 +28,6 @@ import {
 // 测试用它开一个和用户画板完全隔离的实例（单实例锁也是按 userData 目录算的）。
 const HOME = process.env['FLYINGDRAWS_HOME'] || join(homedir(), '.flyingdraws')
 if (process.env['FLYINGDRAWS_HOME']) app.setPath('userData', join(HOME, 'electron-data'))
-else migrateLegacyDirs()
-
-// 项目原来叫 Sketchlink。第一次用新名字启动时，把旧的数据目录 ~/.sketchlink 整个改名过来
-// （画板、待处理请求、当前画板记录）。新目录已经存在就什么都不做，不会覆盖任何东西。
-// 改名失败只记一行日志，不拦住应用启动。Electron 自己的数据目录（缓存之类）不搬，里面没有用户的东西。
-function migrateLegacyDirs(): void {
-  const from = join(homedir(), '.sketchlink')
-  try {
-    if (existsSync(HOME) || !existsSync(from)) return
-    renameSync(from, HOME)
-    console.error(`[flyingdraws] moved ${from} to ${HOME}`)
-  } catch (err) {
-    console.error('[flyingdraws] could not move the legacy data directory:', err)
-  }
-}
 // 端到端测试要在页面里点按钮，用这个变量打开 Chrome DevTools 端口。只在隔离实例上认。
 if (process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']) {
   app.commandLine.appendSwitch('remote-debugging-port', String(Number(process.env['FLYINGDRAWS_DEBUG_PORT'])))
@@ -155,7 +139,7 @@ async function loadBoard(id = currentBoardId): Promise<{ board: string; title: s
     await rename(legacyM0Path, path)
   }
   try {
-    const json = upgradeLegacyScene(await readFile(path, 'utf8'))
+    const json = await readFile(path, 'utf8')
     const scene = JSON.parse(json)
     session.version = Number(scene?.flyingdraws?.version) || 1
     session.title = typeof scene?.flyingdraws?.title === 'string' && scene.flyingdraws.title.trim() ? scene.flyingdraws.title.trim() : null
@@ -203,7 +187,7 @@ async function listBoards(): Promise<BoardInfo[]> {
     const file = boardFilePath(BOARDS_DIR, id)
     try {
       const [json, st] = await Promise.all([readFile(file, 'utf8'), stat(file)])
-      items.push({ ...parseBoardMeta(id, upgradeLegacyScene(json), st.mtime.toISOString()), active: id === currentBoardId })
+      items.push({ ...parseBoardMeta(id, json, st.mtime.toISOString()), active: id === currentBoardId })
     } catch {}
   }
   if (!seen.has(currentBoardId)) {
@@ -272,7 +256,7 @@ async function switchBoard(
     await atomicWriteJson(targetPath, emptyBoardScene({ title: nextTitle }))
   } else if (nextTitle !== undefined) {
     try {
-      const updated = updateBoardSceneTitle(upgradeLegacyScene(await readFile(targetPath, 'utf8')), nextTitle)
+      const updated = updateBoardSceneTitle(await readFile(targetPath, 'utf8'), nextTitle)
       await atomicWriteJson(targetPath, JSON.parse(updated))
     } catch {}
   }
@@ -331,7 +315,7 @@ async function renameBoard(
     throw new Error(`画板「${toId}」已存在`)
   }
 
-  const rawJson = fromExists ? upgradeLegacyScene(await readFile(fromPath, 'utf8')) : JSON.stringify(emptyBoardScene())
+  const rawJson = fromExists ? await readFile(fromPath, 'utf8') : JSON.stringify(emptyBoardScene())
   const nextTitle = opts.title !== undefined ? normalizeBoardTitle(opts.title) : null
   const updatedScene = JSON.parse(updateBoardSceneTitle(rawJson, nextTitle)) as Record<string, unknown>
   await atomicWriteJson(toPath, updatedScene)
@@ -635,7 +619,7 @@ function restorePending(): void {
     let proposalsOnBoard = new Set<string>()
     if (boardExists) {
       try {
-        const elements = (JSON.parse(upgradeLegacyScene(readFileSync(boardPath, 'utf8'))).elements ?? []) as DiffElement[]
+        const elements = (JSON.parse(readFileSync(boardPath, 'utf8')).elements ?? []) as DiffElement[]
         proposalsOnBoard = new Set(
           elements.filter((el) => !el.isDeleted && el.customData?.flyingdraws?.layer === 'proposal').map((el) => String(el.customData?.flyingdraws?.proposal))
         )

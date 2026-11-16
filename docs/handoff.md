@@ -20,8 +20,8 @@ Flying draws：本地桌面画布（Electron + Excalidraw），通过 MCP 接任
 | 多画板新建与切换（M4 提前引入） | ✅ 页面右上角支持切换画板和「+ 新建画板」，MCP 新增 `canvas_list`、`canvas_open(board?, title?)` 及各读写工具可选 `board` 参数 | 见 git log / 待提交 |
 | 画板重命名/删除与收件箱持久化 | ✅ 页面支持「重命名」「删除」（至少保留一块，非切换操作走 `syncBoards` 保留撤销栈）；MCP 新增 `canvas_rename`、`canvas_delete`；未取走的「发给 agent」收件箱随 `pending.json` 持久化并在重启后恢复 | 待提交 |
 
-- 远程：GitHub 仓库 `jian-in/Freedom-draw`，本地 `master` 跟踪 `origin/master`。
-- 项目名定为 **Flying draws**（原暂定名 Sketchlink），显示的名字和内部标识符都改了：数据目录 `~/.flyingdraws`、页面接口 `window.flyingdraws`、元素标记 `customData.flyingdraws`、画板元数据 `scene.flyingdraws`、环境变量 `FLYINGDRAWS_HOME` / `FLYINGDRAWS_DEBUG_PORT`、npm 包名和 MCP 服务名 `flying-draws`、样式前缀 `fd-` / `--fd-`。兼容旧数据靠两处：主进程启动时把 `~/.sketchlink` 整个改名成 `~/.flyingdraws`（`index.ts` 的 `migrateLegacyDirs()`，新目录已存在就不动）；读画板文件时 `boards.ts` 的 `upgradeLegacyScene()` 把旧名字下的元数据和作者标记挪到新名字下。代码里还出现 `sketchlink` 的只有这两处。发布前仍要查 GitHub / npm 重名。
+- 远程：GitHub 仓库 `jian-in/Flying-draws`，本地 `master` 跟踪 `origin/master`。
+- 项目名是 **Flying draws**，内部标识符统一用这个名字：数据目录 `~/.flyingdraws`、页面接口 `window.flyingdraws`、元素标记 `customData.flyingdraws`、画板元数据 `scene.flyingdraws`、环境变量 `FLYINGDRAWS_HOME` / `FLYINGDRAWS_DEBUG_PORT`、npm 包名和 MCP 服务名 `flying-draws`、样式前缀 `fd-` / `--fd-`。发布前仍要查 GitHub / npm 重名。
 
 ## 怎么跑
 
@@ -116,7 +116,7 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 
 ## 开发与本地调试提示
 
-- MCP 服务 `flying-draws` 已用 `claude mcp add` 注册在 **/path/to/flying-draws 项目的 local scope**，命令 `node /path/to/flying-draws/out/bridge/index.js`（旧的 `sketchlink` 注册已删除）。只有在这个文件夹里新开的会话才有这几个工具，工具全名是 `mcp__flying-draws__canvas_*`。旧的 Electron 缓存目录 `%APPDATA%/sketchlink` 还留着，里面没有用户数据，可以手动删。
+- MCP 服务 `flying-draws` 已用 `claude mcp add` 注册在 **/path/to/flying-draws 项目的 local scope**，命令 `node /path/to/flying-draws/out/bridge/index.js`。只有在这个文件夹里新开的会话才有这几个工具，工具全名是 `mcp__flying-draws__canvas_*`。
 - 用户的画板 `~/.flyingdraws/boards/default.excalidraw` 里有**用户自己画的东西**（手写字、涂鸦），测试时只读，不要清空或覆盖。
 - npm 用的是 npmmirror 镜像，Electron 也从镜像下载。
 
