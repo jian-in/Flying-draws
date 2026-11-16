@@ -1,7 +1,7 @@
 # 接手文档
 
 > 新会话动手前先读这份，再按需看 [design.md](design.md)。
-> 最后更新：2026-11-16，允许 agent 干预用户画布内容（T/S 编号、改样式、提议标记框预览、多 agent 署名与按作者筛选）后。
+> 最后更新：2026-11-16，「发给 agent」支持点选目标席位、没人在等时复制取画指令到剪贴板之后。
 
 ## 一句话
 
@@ -21,6 +21,7 @@ Flying draws：本地桌面画布（Electron + Excalidraw），通过 MCP 接任
 | 画板重命名/删除与收件箱持久化 | ✅ 页面支持「重命名」「删除」（至少保留一块，非切换操作走 `syncBoards` 保留撤销栈）；MCP 新增 `canvas_rename`、`canvas_delete`；未取走的「发给 agent」收件箱随 `pending.json` 持久化并在重启后恢复 | `2f341c6` |
 | agent 干预用户内容、改样式与作者筛选 | ✅ 独立文字（`T1`）和手绘（`S1`）纳入编号与改删；新增 `update_text` / `delete_text` / `delete_strokes` / `set_style`；`canvas_draw` 与 `canvas_propose` 均可改删任意已确认元素（提议中以虚线标记框预览，支持单处删除拒绝）；记录 `agent` 署名并在页面底部提供作者筛选标签 | 见 git log |
 | 多席位联手作画与「递画笔」接力 | ✅ 工具支持 `as` 声明席位并自动分配 6 色固定色板；底部筛选栏按实际席位动态生成带色点标签；新增 `canvas_pass` 工具，支持与 `canvas_wait` / `canvas_read` 席位间直接或挂起交接画笔 | 见 git log |
+| 点选席位发送与剪贴板兜底（「叫醒 agent」第 1 步） | ✅ 两个以上席位在线时，「发给 agent」横幅可点选「所有 agent / @某席位」；点选了席位的画只有那个席位能取（`canvas_read` / `canvas_wait`）。对方正在等就直接送达，否则进收件箱，并把一句带画板、版本、席位的取画指令放进剪贴板 | 见 git log |
 
 - 远程：GitHub 仓库 `jian-in/Flying-draws`，本地 `master` 跟踪 `origin/master`。
 - 项目名是 **Flying draws**，内部标识符统一用这个名字：数据目录 `~/.flyingdraws`、页面接口 `window.flyingdraws`、元素标记 `customData.flyingdraws`、画板元数据 `scene.flyingdraws`、环境变量 `FLYINGDRAWS_HOME` / `FLYINGDRAWS_DEBUG_PORT`、npm 包名和 MCP 服务名 `flying-draws`、样式前缀 `fd-` / `--fd-`。发布前仍要查 GitHub / npm 重名。
@@ -63,7 +64,7 @@ src/main/semantic.ts   语义层（纯函数，不依赖 Electron）：buildGrap
 src/main/ops.ts        绘图指令 → 绘图计划（纯函数）：校验 ops、编号换算（N/T/S）、定好元素位置大小与样式、toProposalPlan() 把改动转为标记框预览
 src/main/diff.ts       提议的底稿和改动对比（纯函数）：用户在提议上改了什么（跳过 role: 'marker' 标记框）
 src/main/daemon.ts     本地 HTTP 服务：127.0.0.1 随机端口 + token，信息写 ~/.flyingdraws/daemon.json
-src/main/requests.ts   请求队列：agent 请求作画、提议（含 pending 改动）、用户发送/取消、长轮询等待、主动发送的收件箱与席位间递画笔交接（含重启恢复与批量清理）
+src/main/requests.ts   请求队列：agent 请求作画、提议（含 pending 改动）、用户发送/取消、长轮询等待、主动发送的收件箱（可指定目标席位 `to`）与席位间递画笔交接（含重启恢复与批量清理）、剪贴板取画指令 `pickupHint()`
 src/main/seats.ts      在线席位登记表 SeatRegistry（纯逻辑，不依赖 Electron）：跟踪连着画布的桥接或调用方、分配 6 色色板、离场或超时后清理
 src/preload/index.ts   页面能调用的全部接口（含画板新建/切换/重命名/删除/列表，以及可清理的监听器）
 src/renderer/src/App.tsx  画布、右上角状态栏、底部动态席位/作者筛选标签、请求横幅、交接提示、"发给 agent"、响应主进程 RPC（snapshot / applyPlan / loadScene / syncBoards）
@@ -110,7 +111,7 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 | `canvas_list` | 列出 `~/.flyingdraws/boards/` 下的所有画板（含当前激活标记、标题、版本号、元素数） |
 | `canvas_rename` | 重命名指定（或当前）画板，并可选设置/清空显示标题（`title: null` 清空），保留当前会话和撤销历史 |
 | `canvas_delete` | 删除指定（或当前）画板及其 `.excalidraw` 文件（不能删最后一块）；若删除当前画板会自动切换到剩余画板 |
-| `canvas_read` | 可选 `board`、`as`；`format: summary/graph`，`image: auto/always/never`；输出节点（`N*`）、独立文字（`T*`）、手绘（`S*`），并按调用席位区分本 agent 与其他 agent，顺带取走发给自己的收件箱或递画笔交接；auto 只在有涂鸦、图片、线条时附图 |
+| `canvas_read` | 可选 `board`、`as`；`format: summary/graph`，`image: auto/always/never`；输出节点（`N*`）、独立文字（`T*`）、手绘（`S*`），并按调用席位区分本 agent 与其他 agent，顺带取走收件箱里发给自己或没指定席位的画，以及递画笔交接；auto 只在有涂鸦、图片、线条时附图 |
 | `canvas_request` | 可选 `board`、`as`；弹出请求横幅，立即返回 `request_id` |
 | `canvas_wait` | 最多等 45 秒，可选 `as`；带 `request_id` 等那个请求（自动路由到对应画板），不带就等当前或指定 `board` 上用户主动"发给 agent"或别的席位递过来的画笔（`handoff`） |
 | `canvas_pass` | 递画笔给另一个席位（可选 `to` 和 `board`/`as`，必填 `note`）；若目标席位正在 `canvas_wait` 则立即唤醒，否则挂在画板上等对方调用 `canvas_wait` 或 `canvas_read` 时接走 |
@@ -162,8 +163,13 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 - M2 的代码到这里做完了。下一步是在真实 agent 会话里走一遍主演示（画草图 → agent 读 → agent 提议 → 用户改一笔接受 → agent 知道改了哪里），再决定 M3 做什么
 
 **其他待定**
+- **叫醒 agent 的路线（已定，做到第 1 步）**：
+  1. ✅ 点选席位发送 + 剪贴板兜底，三家客户端通用。隔离的测试实例（同时设了 `FLYINGDRAWS_HOME` 和 `FLYINGDRAWS_DEBUG_PORT`）不写系统剪贴板，只把那句话放在 `hub:submit` 的返回值 `hint` 里。
+  2. 待做：给 Claude Code 做 channels 适配，让桥接把「某画板更新了，请去读」推进会话。channels 是预览功能，动手前先查文档确认现状。画布到桥接这一段用长轮询（桥接后台挂 `GET /events?seat=…&after=<游标>`），不用 webhook；事件只当门铃，不带画布内容，带递增 `id` 供断线续传。事件通道要单独用一条不复用的连接（见踩坑第 2 条）。
+  3. Codex 和 Antigravity 没有公开的会话注入入口，停在第 1 步观望。
 - **画布没法主动叫醒 agent**（MCP 是 agent 来问工具）。用户点了"发给 agent"而 agent 没在等时，画只能放在收件箱里（现已持久化到 `pending.json`，重启不丢失），要用户在聊天里说一声。画布上现在会明说这一点：发送前提示"要在聊天里说一声"，发出后显示"已发出，agent 还没来取"，被取走时提示"agent 已经取走你的画"。`canvas_read` 和不带 `request_id` 的 `canvas_wait` 都会取走收件箱里的画和附言。想真正做到"发了就到"，得用 MCP 的资源订阅通知（design.md 第 7 节末尾），而且客户端要支持
 - 桥接靠 `require('electron')` 找可执行文件，Electron 现在是 devDependency；做成可分发的 npm 包时要重新设计启动方式
 - **多画板当前限制**：目前仍是单窗口渲染，agent 在 `canvas_read`/`draw`/`propose`/`request` 传入非当前 `board` 时会把窗口切换到该画板（且要求该画板已存在，新画板需先通过 `canvas_open` 或界面创建）；支持重命名与删除，但重命名非当前激活画板后窗口不会切过去
 - **升级提示**：如果本机之前已经开着旧版 Flying draws 窗口，重新 `npm run build` 后需要重启一次画布应用窗口（或在宿主里重连 MCP），新加的工具和接口才会生效
 - 摘要只有中文
+- `npm run e2e:draw` 偶尔会在「UI 重命名画板」「MCP canvas_rename」两项上失败（四次里出现过一次，重跑即过），像是时序问题，还没查

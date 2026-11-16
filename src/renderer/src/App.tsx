@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ComponentProps } from 'react'
+import { useCallback, useEffect, useRef, useState, type ComponentProps, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import {
   CaptureUpdateAction,
@@ -588,7 +588,7 @@ export default function App() {
   const [creating, setCreating] = useState(false)
   const [renaming, setRenaming] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
-  const [hub, setHub] = useState<HubState>({ pending: [], agentWaiting: false, waitingAgents: [], inbox: 0, handoff: null })
+  const [hub, setHub] = useState<HubState>({ pending: [], agentWaiting: false, waitingAgents: [], inbox: 0, inboxTargets: [], handoff: null })
   const [toast, setToast] = useState<string | null>(null)
   const [filter, setFilter] = useState<AuthorFilter>('all')
   const [seatInfo, setSeatInfo] = useState<{ seats: SeatEntry[]; hasAnonAgent: boolean }>({ seats: [], hasAnonAgent: false })
@@ -629,6 +629,7 @@ export default function App() {
     }
   }, [seatInfo, filter])
   const [composing, setComposing] = useState(false)
+  const [sendTo, setSendTo] = useState<string | null>(null) // 「发给 agent」时点选的席位，null 是所有 agent
   const [initialData] = useState(() =>
     window.flyingdraws.loadBoard().then((res) => {
       setBoardInfo({ board: res.board, title: res.title })
@@ -903,13 +904,14 @@ export default function App() {
   }, [applyLoadedScene, boardInfo.board])
 
   const submit = useCallback(
-    async (requestId: string | null, note: string) => {
+    async (requestId: string | null, note: string, to: string | null = null) => {
       if (!apiRef.current) return
-      // 有 agent 正等着（或者这是在回应它的请求）时，画会直接交到它手上；否则先放进收件箱
-      const direct = requestId !== null || hubRef.current.agentWaiting
       const snap = await snapshot(apiRef.current, true, hiddenStateRef.current)
-      await window.flyingdraws.submit({ requestId, note, ...snap })
-      if (direct) setToast('agent 已经收到你的画')
+      // 有 agent 正等着（或者这是在回应它的请求）时，画会直接交到它手上；否则先放进收件箱，
+      // 主进程同时把一句取画的话放进剪贴板
+      const res = await window.flyingdraws.submit({ requestId, note, to, ...snap })
+      if (res.delivered) setToast(`${to ?? 'agent'} 已经收到你的画`)
+      else if (res.hint) setToast(`已复制一句话，去${to ? `「${to}」的` : ''}聊天里粘贴，它就会来取`)
       lastSavedVersion.current = elementsVersion(apiRef.current.getSceneElements())
       setComposing(false)
     },
@@ -972,6 +974,10 @@ export default function App() {
   }
 
   const onlineSeats = hub.onlineSeats ?? []
+  // 点选的席位中途离场了就退回「所有 agent」
+  const sendTarget = sendTo && onlineSeats.some((s) => s.name === sendTo) ? sendTo : null
+  const sendTargetWaiting = sendTarget ? onlineSeats.some((s) => s.name === sendTarget && s.waiting) : hub.agentWaiting
+  const sendTargetName = sendTarget ?? 'agent'
 
   return (
     <>
@@ -1146,14 +1152,38 @@ export default function App() {
         <Banner
           title="把当前画布发给 agent"
           prompt={
-            hub.agentWaiting
-              ? 'agent 正在等你的画，发出后它马上就能看到。'
-              : 'agent 现在没在等。发出后要在聊天里跟它说一声「画好了」，它才会来取。'
+            sendTargetWaiting
+              ? `${sendTargetName} 正在等你的画，发出后它马上就能看到。`
+              : `${sendTargetName} 现在没在等。发出后会复制一句话到剪贴板，去它的聊天里粘贴一下，它才会来取。`
           }
-          onSend={(note) => submit(null, note)}
+          onSend={(note) => submit(null, note, sendTarget)}
           onCancel={() => setComposing(false)}
           cancelLabel="取消"
-        />
+        >
+          {/* 只有一个 agent 时不用选；两个以上才问发给谁 */}
+          {onlineSeats.length > 1 ? (
+            <div className="fd-send-to" role="radiogroup" aria-label="发给谁">
+              <button type="button" role="radio" aria-checked={!sendTarget} className={!sendTarget ? 'fd-send-to-active' : undefined} onClick={() => setSendTo(null)}>
+                所有 agent
+              </button>
+              {onlineSeats.map((s) => (
+                <button
+                  key={s.name}
+                  type="button"
+                  role="radio"
+                  aria-checked={sendTarget === s.name}
+                  className={sendTarget === s.name ? 'fd-send-to-active' : undefined}
+                  title={s.waiting ? '正在等你的画' : '没在等，发出后要去它的聊天里说一声'}
+                  onClick={() => setSendTo(s.name)}
+                >
+                  <span className="fd-seat-dot" style={{ background: s.color }} />
+                  {`@${s.name}`}
+                  {s.waiting ? <span className="fd-seat-badge">等待中</span> : null}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </Banner>
       ) : hub.agentWaiting ? (
         <div className="fd-waiting fd-waiting-live">
           agent 正在等你{hub.waitingAgents?.length ? `（${hub.waitingAgents.join('、')}）` : ''}：画好后点右上角「发给 agent」
@@ -1164,7 +1194,7 @@ export default function App() {
         </div>
       ) : hub.inbox > 0 ? (
         <div className="fd-waiting">
-          已发出{hub.inbox > 1 ? ` ${hub.inbox} 份` : ''}，agent 还没来取。在聊天里跟它说一声「画好了」
+          已发出{hub.inbox > 1 ? ` ${hub.inbox} 份` : ''}，{hub.inboxTargets?.length ? hub.inboxTargets.join('、') : 'agent'} 还没来取。在聊天里跟它说一声「画好了」
         </div>
       ) : null}
       {toast ? (
@@ -1343,6 +1373,7 @@ function Banner(props: {
   sendLabel?: string
   onCancel: (note: string) => void | Promise<void>
   cancelLabel: string
+  children?: ReactNode // 提示语和附言之间的额外内容，比如点选发给哪个席位
 }) {
   const [note, setNote] = useState('')
   const [sending, setSending] = useState(false)
@@ -1363,6 +1394,7 @@ function Banner(props: {
       <div className="fd-banner-title">{props.title}</div>
       <div className="fd-banner-prompt">{props.prompt}</div>
       {props.queued ? <div className="fd-banner-queued">处理完这个，后面还有 {props.queued} 个请求</div> : null}
+      {props.children}
       <input
         className="fd-banner-note"
         placeholder="想补充一句话吗？（可不填）"

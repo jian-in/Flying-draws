@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { RequestHub, type DrawRequest, type Handoff, type Submission } from '../src/main/requests.ts'
+import { pickupHint, RequestHub, type DrawRequest, type Handoff, type Submission } from '../src/main/requests.ts'
 
 function sampleSubmission(overrides: Partial<Submission> = {}): Submission {
   return {
@@ -139,4 +139,75 @@ test('passBaton 未立即送达时入队并可通过 takeHandoffs / wait / resto
   assert.equal(taken.length, 1)
   assert.equal(taken[0].note, '给任意其他席位')
   assert.equal(restored.state().handoff, null)
+})
+
+test('点选了席位的画只交给那个席位：别的席位读不走、等不到', async () => {
+  const hub = new RequestHub()
+  assert.equal(hub.submit(sampleSubmission({ note: '给接口组的', to: '接口组' })), false)
+  assert.deepEqual(hub.state().inboxTargets, ['接口组'])
+
+  assert.deepEqual(hub.takeInbox('架构组'), [])
+  assert.deepEqual(hub.takeInbox(), [])
+  const other = await hub.wait({ inbox: true, agent: '架构组' }, 20)
+  assert.equal(other.status, 'waiting')
+  assert.equal(hub.state().inbox, 1)
+
+  const mine = await hub.wait({ inbox: true, agent: '接口组' }, 20)
+  assert.equal(mine.status, 'submitted')
+  if (mine.status === 'submitted') assert.equal(mine.submission.note, '给接口组的')
+  assert.equal(hub.state().inbox, 0)
+  assert.deepEqual(hub.state().inboxTargets, [])
+})
+
+test('点选的席位正在等时直接送达；只有别的席位在等时进收件箱，没点选的仍交给任意等待者', async () => {
+  const hub = new RequestHub()
+  const boss = hub.wait({ inbox: true, agent: '架构组' }, 200)
+  // 老大在等，但这份是给接口组的：不能交给老大
+  assert.equal(hub.submit(sampleSubmission({ note: '给接口组的', to: '接口组' })), false)
+  assert.equal(hub.state().inbox, 1)
+
+  const second = hub.wait({ inbox: true, agent: '接口组' }, 200)
+  const got = await second
+  assert.equal(got.status, 'submitted')
+
+  // 没点选席位的，交给还在等的老大
+  assert.equal(hub.submit(sampleSubmission({ note: '给大家的', at: '2026-11-16T08:00:00.000Z' })), true)
+  const bossGot = await boss
+  assert.equal(bossGot.status, 'submitted')
+  if (bossGot.status === 'submitted') assert.equal(bossGot.submission.note, '给大家的')
+
+  // 老二正在等时点选老二：直接送达，不进收件箱
+  const again = hub.wait({ inbox: true, agent: '接口组' }, 200)
+  assert.equal(hub.submit(sampleSubmission({ note: '再给接口组', to: '接口组', at: '2026-11-16T08:01:00.000Z' })), true)
+  assert.equal((await again).status, 'submitted')
+  assert.equal(hub.state().inbox, 0)
+})
+
+test('takeInbox 按席位取：拿走发给自己的和没点选的，留下发给别人的；重启恢复后目标席位不丢', () => {
+  const hub = new RequestHub()
+  hub.restore(
+    [],
+    [
+      sampleSubmission({ note: '给大家的', at: '2026-11-16T08:00:00.000Z' }),
+      sampleSubmission({ note: '给接口组的', to: '接口组', at: '2026-11-16T08:01:00.000Z' }),
+      sampleSubmission({ note: '给架构组的', to: '架构组', at: '2026-11-16T08:02:00.000Z' })
+    ]
+  )
+  assert.deepEqual(hub.takeInbox('架构组').map((s) => s.note), ['给大家的', '给架构组的'])
+  assert.deepEqual(hub.queuedInbox().map((s) => [s.note, s.to]), [['给接口组的', '接口组']])
+})
+
+test('回应请求时不带目标席位，并算作已送达', () => {
+  const hub = new RequestHub()
+  const req = hub.create('请画流程图')
+  assert.equal(hub.submit(sampleSubmission({ requestId: req.id, to: '接口组' })), true)
+  assert.equal(hub.get(req.id)?.submission?.to, null)
+})
+
+test('pickupHint 写清画板、版本、目标席位和取画方式', () => {
+  assert.equal(
+    pickupHint({ board: 'login-flow', title: '登录流程', version: 6, to: '接口组' }),
+    '我在 Flying draws 画板「登录流程」（login-flow）上画好了（v6），发给席位「接口组」。请调用 canvas_read（board: "login-flow"，as: "接口组"）来取。'
+  )
+  assert.equal(pickupHint({ board: 'default', version: 2 }), '我在 Flying draws 画板「default」上画好了（v2）。请调用 canvas_read（board: "default"）来取。')
 })

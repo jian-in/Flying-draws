@@ -14,6 +14,7 @@ declare global {
     agentWaiting: boolean
     waitingAgents?: string[]
     inbox: number
+    inboxTargets?: string[]
     handoff?: { from: string; to: string | null; note: string } | null
     onlineSeats?: OnlineSeat[]
   }
@@ -66,7 +67,8 @@ declare global {
         pngBase64: string | null
         decision?: 'accepted' | 'rejected' | null
         skipped?: string[]
-      }) => Promise<{ version: number }>
+        to?: string | null
+      }) => Promise<{ version: number; delivered: boolean; hint: string | null }>
       cancel: (requestId: string) => Promise<boolean>
       onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => () => void
       rpcReply: (id: number, result: unknown, error?: string) => void

@@ -11,6 +11,7 @@ export interface Submission {
   at: string
   decision?: 'accepted' | 'rejected' | null // 只有回应提议时才有
   changes?: string[] | null // 回应提议时：用户在提议上改了什么（中文句子）
+  to?: string | null // 用户主动发送时点选的目标席位；没选就是发给任意 agent
 }
 
 export interface Handoff {
@@ -23,7 +24,14 @@ export interface Handoff {
   at: string
 }
 
-export type RequestKind = 'draw' | 'proposal' // draw：请用户画；proposal：agent 画了提议，请用户确认
+// agent 没在等时，放进剪贴板让用户粘贴到聊天里的一句话：说清是哪块画板、哪个版本、发给谁、怎么取
+export function pickupHint(p: { board: string; title?: string | null; version: number; to?: string | null }): string {
+  const name = p.title ? `「${p.title}」（${p.board}）` : `「${p.board}」`
+  const args = [`board: "${p.board}"`, ...(p.to ? [`as: "${p.to}"`] : [])].join('，')
+  return `我在 Flying draws 画板${name}上画好了（v${p.version}）${p.to ? `，发给席位「${p.to}」` : ''}。请调用 canvas_read（${args}）来取。`
+}
+
+export type RequestKind ='draw' | 'proposal' // draw：请用户画；proposal：agent 画了提议，请用户确认
 
 export interface DrawRequest {
   id: string
@@ -57,6 +65,7 @@ export interface HubState {
   agentWaiting: boolean // 有 agent 正在长轮询等待用户
   waitingAgents: string[] // 正在长轮询等待的席位名列表
   inbox: number // 用户主动发出、agent 还没取走的画有几份
+  inboxTargets: string[] // 其中指定了席位的那些，是发给谁的（去重）
   handoff: { from: string; to: string | null; note: string } | null // 尚未被接走的最新一棒
   onlineSeats?: OnlineSeat[] // 当前连着画布的在线 agent 席位
 }
@@ -97,6 +106,7 @@ export class RequestHub {
       agentWaiting: this.waiters.size > 0,
       waitingAgents,
       inbox: this.inbox.length,
+      inboxTargets: [...new Set(this.inbox.map((s) => s.to).filter((t): t is string => Boolean(t)))],
       handoff: lastHandoff ? { from: lastHandoff.from, to: lastHandoff.to, note: lastHandoff.note } : null
     }
   }
@@ -135,12 +145,24 @@ export class RequestHub {
     return taken
   }
 
-  // agent 直接读画布时，顺便把收件箱里还没取走的都交给它
-  takeInbox(): Submission[] {
+  // 用户点选了席位的画只交给那个席位；没点选的谁来都能取
+  private canTakeSubmission(s: Submission, agent: string | null | undefined): boolean {
+    return !s.to || Boolean(agent && agent === s.to)
+  }
+
+  // agent 直接读画布时，顺便把收件箱里它能取的都交给它
+  takeInbox(agent: string | null = null): Submission[] {
     if (!this.inbox.length) return []
-    const taken = this.inbox
-    this.inbox = []
-    this.emit()
+    const taken: Submission[] = []
+    const kept: Submission[] = []
+    for (const s of this.inbox) {
+      if (this.canTakeSubmission(s, agent)) taken.push(s)
+      else kept.push(s)
+    }
+    if (taken.length) {
+      this.inbox = kept
+      this.emit()
+    }
     return taken
   }
 
@@ -210,18 +232,23 @@ export class RequestHub {
     return this.requests.get(id)
   }
 
-  submit(sub: Submission): void {
+  // 返回这份画是不是已经有着落：回应了请求，或者直接交到了正在等的 agent 手上。
+  // 返回 false 表示进了收件箱，要等 agent 自己来取。
+  submit(sub: Submission): boolean {
     const req = sub.requestId ? this.requests.get(sub.requestId) : undefined
+    let delivered = true
     if (req && req.status === 'waiting') {
       req.status = 'submitted'
-      req.submission = sub
-      this.settle((t) => 'requestId' in t && t.requestId === req.id, { status: 'submitted', submission: sub })
+      req.submission = { ...sub, to: null }
+      this.settle((t) => 'requestId' in t && t.requestId === req.id, { status: 'submitted', submission: req.submission })
     } else {
-      // 主动发送，或者请求已经失效：放进收件箱，交给等收件箱的 agent
-      const fresh = { ...sub, requestId: null }
-      if (!this.settle((t) => 'inbox' in t, { status: 'submitted', submission: fresh }, true)) this.inbox.push(fresh)
+      // 主动发送，或者请求已经失效：交给正在等收件箱的 agent（点选了席位就只交给那个席位），没人等就放进收件箱
+      const fresh = { ...sub, requestId: null, to: sub.to || null }
+      delivered = this.settle((t) => 'inbox' in t && this.canTakeSubmission(fresh, t.agent), { status: 'submitted', submission: fresh }, true)
+      if (!delivered) this.inbox.push(fresh)
     }
     this.emit()
+    return delivered
   }
 
   cancel(id: string): boolean {
@@ -259,11 +286,13 @@ export class RequestHub {
       if (!req) return Promise.resolve({ status: 'unknown_request', requestId: target.requestId })
       if (req.status === 'submitted' && req.submission) return Promise.resolve({ status: 'submitted', submission: req.submission })
       if (req.status === 'cancelled') return Promise.resolve({ status: 'cancelled', requestId: req.id })
-    } else if (this.inbox.length) {
-      const submission = this.inbox.shift()!
-      this.emit() // 让画布知道这一份被取走了
-      return Promise.resolve({ status: 'submitted', submission })
     } else {
+      const inboxIdx = this.inbox.findIndex((s) => this.canTakeSubmission(s, target.agent))
+      if (inboxIdx !== -1) {
+        const [submission] = this.inbox.splice(inboxIdx, 1)
+        this.emit() // 让画布知道这一份被取走了
+        return Promise.resolve({ status: 'submitted', submission })
+      }
       const idx = this.handoffs.findIndex((h) => this.canTakeHandoff(h, target.agent))
       if (idx !== -1) {
         const [handoff] = this.handoffs.splice(idx, 1)

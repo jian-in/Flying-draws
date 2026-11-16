@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -6,7 +6,7 @@ import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:
 import { randomBytes } from 'node:crypto'
 import { bboxOf, buildGraph, summarize, type SceneElement } from './semantic'
 import { OpsError, planOps, rebaseOps, toProposalPlan, type DrawOp, type DrawPlan, type PendingChanges } from './ops'
-import { RequestHub, type DrawRequest, type Handoff, type HubState, type Submission, type WaitResult } from './requests'
+import { pickupHint, RequestHub, type DrawRequest, type Handoff, type HubState, type Submission, type WaitResult } from './requests'
 import { SEAT_COLORS, SeatRegistry } from './seats'
 import { captureBaseline, diffProposal, type DiffElement, type ProposalBaseline } from './diff'
 import { startDaemon } from './daemon'
@@ -1069,7 +1069,7 @@ const routes = {
     }
     const hub = getSession(boardId).hub
     // 用户之前点过"发给 agent"但还没人来取的，这次读取就算取走了：把附言带上
-    const sent = hub.takeInbox().map((s) => ({ note: s.note, at: s.at }))
+    const sent = hub.takeInbox(viewer).map((s) => ({ note: s.note, at: s.at }))
     // 其他席位递过来的画笔一并交给这个席位
     const handoffs = hub.takeHandoffs(viewer).map((h) => ({ from: h.from, to: h.to, note: h.note, at: h.at }))
     return { ...res, sent, handoffs }
@@ -1238,7 +1238,10 @@ type SubmitPayload = {
   pngBase64: string | null
   decision?: 'accepted' | 'rejected' | null
   skipped?: string[]
+  to?: string | null // 主动发送时点选的目标席位
 }
+// 隔离的测试实例不碰系统剪贴板，免得跑测试时冲掉用户正在用的内容
+const TEST_INSTANCE = Boolean(process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT'])
 ipcMain.handle('hub:submit', async (_e, payload: SubmitPayload) => {
   const boardId = currentBoardId
   const hub = getSession(boardId).hub
@@ -1260,10 +1263,17 @@ ipcMain.handle('hub:submit', async (_e, payload: SubmitPayload) => {
     sceneJson: payload.sceneJson,
     pngBase64: payload.pngBase64,
     version: ver,
-    at: new Date().toISOString()
+    at: new Date().toISOString(),
+    to: !payload.requestId && typeof payload.to === 'string' && payload.to.trim() ? payload.to.trim() : null
   }
-  hub.submit(sub)
-  return { version: ver }
+  const delivered = hub.submit(sub)
+  // 没有 agent 接到：把一句取画的话放进剪贴板，用户粘贴到那个 agent 的聊天里它就会来取
+  let hint: string | null = null
+  if (!delivered) {
+    hint = pickupHint({ board: boardId, title: getSession(boardId).title, version: ver, to: sub.to })
+    if (!TEST_INSTANCE) clipboard.writeText(hint)
+  }
+  return { version: ver, delivered, hint }
 })
 ipcMain.handle('hub:cancel', (_e, requestId: string) => {
   const boardId = requestBoard.get(requestId) ?? currentBoardId

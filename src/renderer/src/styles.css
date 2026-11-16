@@ -516,6 +516,34 @@ body {
   color: var(--fd-muted);
 }
 
+/* 「发给 agent」时点选目标席位的一排小按钮 */
+.fd-send-to {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fd-banner .fd-send-to button {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 7px;
+  color: var(--fd-muted);
+  white-space: nowrap;
+}
+
+.fd-banner .fd-send-to button.fd-send-to-active {
+  background: var(--fd-primary);
+  color: var(--fd-on-primary);
+  font-weight: 600;
+}
+
+.fd-send-to-active .fd-seat-badge {
+  color: var(--fd-on-primary);
+}
+
 .fd-banner-actions {
   display: flex;
   justify-content: flex-end;

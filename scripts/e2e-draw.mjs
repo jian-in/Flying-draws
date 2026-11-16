@@ -703,6 +703,51 @@ try {
     await user3.click('全部')
     await sleep(200)
 
+    // 点选席位发送：两个席位都在线时，「发给 agent」横幅里可以选发给谁
+    const noticeText = () => user3.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)
+    const toastText = () => user3.js(`document.querySelector('.fd-toast')?.textContent ?? ''`)
+    const pickSeat = (label) =>
+      user3.js(`(() => {
+        const b = [...document.querySelectorAll('.fd-send-to button')].find((x) => x.textContent.trim().startsWith(${JSON.stringify(label)}))
+        if (!b) return false
+        b.click()
+        return true
+      })()`)
+    await user3.click('发给 agent')
+    await user3.waitForBanner()
+    const seatChoices = await user3.js(`[...document.querySelectorAll('.fd-send-to button')].map((b) => b.textContent.trim())`)
+    check(
+      seatChoices[0] === '所有 agent' && seatChoices.includes('@前端') && seatChoices.includes('@后端'),
+      '两个席位在线时，「发给 agent」横幅里出现「所有 agent / @前端 / @后端」'
+    )
+    check(await pickSeat('@后端'), '（扮演用户）点选 @后端')
+    await sleep(150)
+    check(/后端 现在没在等/.test((await user3.waitForBanner()) ?? ''), '点选的席位没在等时，横幅提示语换成这个席位的名字')
+    await user3.screenshot(join(OUT, 'send-to.png'))
+    await user3.click('发送')
+    check(await until(async () => /已复制一句话，去「后端」的聊天里粘贴/.test((await toastText()) ?? '')), '发出后提示已复制一句话，并说明去谁的聊天里粘贴')
+    check(await until(async () => /已发出，后端 还没来取/.test((await noticeText()) ?? '')), '画布上写明是「后端」还没来取')
+    const notMine = textOf(await call('canvas_read', { board: 'collab', as: '前端', image: 'never' }))
+    check(!/pressed "Send to agent"/.test(notMine) && /已发出，后端 还没来取/.test((await noticeText()) ?? ''), '另一个席位来读画布，取不走发给后端的那份')
+    const mineNow = textOf(await call2('canvas_read', { board: 'collab', as: '后端', image: 'never' }))
+    await sleep(200)
+    check(/pressed "Send to agent"/.test(mineNow) && !(await noticeText()), '后端自己来读时取走，画布上的等待提示消失')
+
+    // 点选的席位正在等：直接交到它手上
+    const seatWaiting = call2('canvas_wait', { board: 'collab', as: '后端', timeout_s: 20, image: 'never' })
+    await until(async () => /正在等你（后端）/.test((await noticeText()) ?? ''))
+    await user3.click('发给 agent')
+    await user3.waitForBanner()
+    await pickSeat('@后端')
+    await sleep(150)
+    const waitingBanner = (await user3.waitForBanner()) ?? ''
+    await user3.click('发送')
+    const seatGot = textOf(await seatWaiting)
+    check(
+      /后端 正在等你的画/.test(waitingBanner) && /The user sent the canvas/.test(seatGot) && (await until(async () => /后端 已经收到你的画/.test((await toastText()) ?? ''))),
+      '点选的席位正在等时：横幅说明它马上能看到，发出后直接送达并提示「后端 已经收到你的画」'
+    )
+
     // 递画笔场景一：后端正在等待，前端直接递过去立即唤醒
     const peerWaiting = call2('canvas_wait', { board: 'collab', as: '后端', timeout_s: 20, image: 'never' })
     await until(async () => /正在等你（后端）/.test((await user3.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)) ?? ''))

@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld('flyingdraws', {
     pngBase64: string | null
     decision?: 'accepted' | 'rejected' | null
     skipped?: string[]
+    to?: string | null
   }) => ipcRenderer.invoke('hub:submit', payload),
   cancel: (requestId: string) => ipcRenderer.invoke('hub:cancel', requestId),
 
