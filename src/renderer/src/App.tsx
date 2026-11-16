@@ -11,6 +11,12 @@ import {
 } from '@excalidraw/excalidraw'
 import { exitPoint, type ShapeBox } from '../../main/geometry'
 import type { DrawPlan, PendingChanges } from '../../main/ops'
+import {
+  chooseAdaptiveExportSize,
+  EXPORT_PADDING,
+  MAX_EXPORT_BYTES,
+  nextExportSizeForBytes
+} from './exportSize'
 import '@excalidraw/excalidraw/index.css'
 
 type ExcalidrawProps = ComponentProps<typeof Excalidraw>
@@ -19,7 +25,6 @@ type SceneArgs = Parameters<OnChange>
 type Api = Parameters<NonNullable<ExcalidrawProps['excalidrawAPI']>>[0]
 
 const SAVE_DELAY_MS = 600
-const EXPORT_MAX_SIZE = 1600
 
 // 每个元素被改动时 version 会加一（删除也算），求和就能判断画面内容有没有变。
 // 光标移动、缩放这类只改 appState 的操作不会触发保存。
@@ -108,14 +113,23 @@ async function snapshot(
   const sceneJson = serializeAsJSON(elements, appState, files, 'local')
   let pngBase64: string | null = null
   if (withImage && elements.length > 0) {
-    const blob = await exportToBlob({
-      elements,
-      appState: { ...appState, exportBackground: true, exportWithDarkMode: false },
-      files,
-      mimeType: 'image/png',
-      maxWidthOrHeight: EXPORT_MAX_SIZE,
-      exportPadding: 24
-    })
+    const exportPng = (maxWidthOrHeight: number) =>
+      exportToBlob({
+        elements,
+        appState: { ...appState, exportBackground: true, exportWithDarkMode: false },
+        files,
+        mimeType: 'image/png',
+        maxWidthOrHeight,
+        exportPadding: EXPORT_PADDING
+      })
+    let maxSize = chooseAdaptiveExportSize(elements)
+    let blob = await exportPng(maxSize)
+    for (let retry = 0; retry < 2; retry += 1) {
+      const nextSize = nextExportSizeForBytes(maxSize, blob.size, MAX_EXPORT_BYTES)
+      if (nextSize === null) break
+      maxSize = nextSize
+      blob = await exportPng(maxSize)
+    }
     pngBase64 = await blobToBase64(blob)
   }
   return { sceneJson, pngBase64, view: visibleArea(appState) }
