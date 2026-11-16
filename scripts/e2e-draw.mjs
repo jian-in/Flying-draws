@@ -428,7 +428,7 @@ try {
   check(/画板「login-flow」/.test(drawnNew) && /「输入账号」/.test(drawnNew) && !/重试三次/.test(drawnNew), '新画板 login-flow 独立绘制，不混入 default 的内容')
 
   // 扮演用户点「+ 新建画板」按钮在 UI 上创建一块新画板
-  await user2.click('+ 新建画板')
+  await user2.js(`document.querySelector('.sl-new-board').click()`)
   await sleep(200)
   await user2.js(`(() => {
     const input = document.querySelector('.sl-modal input')
@@ -487,6 +487,12 @@ try {
   // 第七次：画板重命名与删除（UI 与 MCP）
   await call('canvas_open', { board: 'ui-board' })
   await sleep(300)
+  // 重命名和删除收在「⋯」菜单里，先点开
+  const openMenu = async () => {
+    await user3.js(`void (document.querySelector('.sl-menu') || document.querySelector('.sl-more').click())`)
+    await sleep(150)
+  }
+  await openMenu()
   await user3.click('重命名')
   await sleep(200)
   await user3.js(`(() => {
@@ -513,6 +519,7 @@ try {
     'MCP canvas_rename 能重命名画板并同步更新页面下拉框'
   )
 
+  await openMenu()
   await user3.click('删除')
   await sleep(200)
   await user3.click('确认删除')
@@ -529,6 +536,7 @@ try {
   const mcpDeleted = textOf(await call('canvas_delete', { board: 'login-flow' }))
   await sleep(300)
   const listedFinal = textOf(await call('canvas_list'))
+  await openMenu()
   const deleteDisabledOnLast = await user3.js(
     `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '删除')?.disabled ?? false`
   )
@@ -538,6 +546,19 @@ try {
       deleteDisabledOnLast === true,
     'MCP canvas_delete 能删除指定画板；只剩最后一块画板时 UI 删除按钮禁用'
   )
+
+  // 界面截图：浅色和深色各一张，菜单开着
+  await user3.screenshot(join(OUT, 'ui-menu.png'))
+  await user3.js(`window.__sketchlinkApi.updateScene({ appState: { theme: 'dark' } })`)
+  await sleep(300)
+  await user3.click('发给 agent')
+  await sleep(200)
+  await openMenu()
+  await user3.screenshot(join(OUT, 'ui-dark.png'))
+  check((await user3.js(`document.documentElement.dataset.slTheme`)) === 'dark', '切到深色后，横幅和菜单跟着变深色')
+  await user3.click('取消')
+  await user3.js(`window.__sketchlinkApi.updateScene({ appState: { theme: 'light' } })`)
+  await sleep(200)
 
   user3.close()
 } finally {

@@ -62,7 +62,7 @@ src/main/diff.ts       提议的底稿和改动对比（纯函数）：用户在
 src/main/daemon.ts     本地 HTTP 服务：127.0.0.1 随机端口 + token，信息写 ~/.sketchlink/daemon.json
 src/main/requests.ts   请求队列：agent 请求作画、用户发送/取消、长轮询等待、主动发送的收件箱（含重启恢复与批量清理）
 src/preload/index.ts   页面能调用的全部接口（含画板新建/切换/重命名/删除/列表，以及可清理的监听器）
-src/renderer/src/App.tsx  画布、状态栏（含画板下拉切换、「+ 新建画板」「重命名」「删除」弹窗）、请求横幅、"发给 agent"、响应主进程 RPC（snapshot / applyPlan / loadScene / syncBoards）
+src/renderer/src/App.tsx  画布、右上角状态栏（画板下拉切换、「+」新建、「⋯」菜单里的重命名/立即保存/打开文件位置/删除、保存状态圆点）、请求横幅、"发给 agent"、响应主进程 RPC（snapshot / applyPlan / loadScene / syncBoards）
 src/bridge/index.ts    MCP 桥接（stdio）：9 个工具，转发给本地服务；应用没开时自动拉起
 test/                  单元测试（boards / diff / ops / requests / semantic）；test/fixtures/flow.excalidraw 是测试用画板
 scripts/e2e.mjs        M1 端到端测试（注意其工具列表断言仍停在 M1 的 4 个工具）
@@ -91,6 +91,8 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 - 版本没变：直接执行。
 - 版本变了：`rebaseOps()` 把指令里的旧编号换算成同一个元素现在的编号。引用的节点被删了 → 冲突；要改动或删除的元素指纹变了（被别人动过）→ 冲突；只是连线过去、旁边加字 → 照常执行。
 - 查不到那个版本，或者没带 `base_version` 却引用了已有节点 → 冲突，让 agent 重新读。
+
+界面样式（`styles.css`）：淡黄纸面 + 墨线描边的线稿风（1.5px 墨线、错开的实线代替柔和阴影、黄色主按钮），同一段里也覆盖了 Excalidraw 工具栏的颜色变量。画布默认背景是纸色 `#fffbe6`（`App.tsx` 的 `PAPER_COLOR`）：载入时只把仍是默认白底的画板换成纸色，用户自己选过背景色的不动。自己的界面统一用 `--sl-*` 颜色变量，页面把 Excalidraw 当前的深浅色写到 `<html data-sl-theme>` 上，横幅、弹窗、菜单跟着切换。「⋯」菜单用 portal 挂在 body 上，免得被横幅盖住。端到端测试会输出界面截图 `out/e2e/ui-menu.png`（浅色）和 `ui-dark.png`（深色）。
 
 外观约定：agent 画的东西一律蓝色（`#1971c2`）；还没确认的提议再加虚线和 55% 透明度；接受后变实线、不透明，仍是蓝色。用户在提议上改过的地方（拖动、改字、删掉一部分）接受时原样保留。
 

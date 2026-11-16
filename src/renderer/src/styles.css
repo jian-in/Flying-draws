@@ -5,58 +5,287 @@ body,
   margin: 0;
 }
 
-.sl-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--color-gray-70, #555);
-  white-space: nowrap;
+/* 自己的界面（右上角、横幅、弹窗、提示）共用一套颜色，跟着 Excalidraw 的深浅色切换。
+   --sl-agent 和画布上 agent 画的东西是同一个蓝色。 */
+:root {
+  --sl-ink: #2b2a26;
+  --sl-line: 1.5px;
+  --sl-surface: #fffef6;
+  --sl-surface-hover: #fff1b8;
+  --sl-border: var(--sl-ink);
+  --sl-text: var(--sl-ink);
+  --sl-muted: #7d765e;
+  --sl-primary: #ffdf70;
+  --sl-primary-hover: #ffd23f;
+  --sl-on-primary: var(--sl-ink);
+  --sl-agent: #1971c2;
+  --sl-ok: #2f9e44;
+  --sl-danger: #c92a2a;
+  --sl-danger-hover: #ffe3e0;
+  /* 线稿风：不用柔和的阴影，用一条错开的实线 */
+  --sl-shadow: 3px 3px 0 var(--sl-ink);
+  --sl-toast-bg: var(--sl-ink);
+  --sl-toast-text: #fffbe6;
+  --sl-backdrop: rgba(70, 58, 20, 0.28);
 }
+
+:root[data-sl-theme='dark'] {
+  --sl-ink: #e9e2c8;
+  --sl-surface: #26241d;
+  --sl-surface-hover: #3a3628;
+  --sl-muted: #a9a288;
+  --sl-primary: #ffdf70;
+  --sl-primary-hover: #ffe899;
+  --sl-on-primary: #26241d;
+  --sl-agent: #74b3ee;
+  --sl-ok: #69db7c;
+  --sl-danger: #ff8787;
+  --sl-danger-hover: #40292a;
+  --sl-shadow: 3px 3px 0 rgba(0, 0, 0, 0.6);
+  --sl-toast-text: #26241d;
+  --sl-backdrop: rgba(0, 0, 0, 0.5);
+}
+
+/* Excalidraw 自带的工具栏也换成同一套：淡黄纸面、墨线描边、黄色高亮 */
+:root:not([data-sl-theme='dark']) .excalidraw {
+  --island-bg-color: #fffef6;
+  --color-surface-lowest: #fffef6;
+  --color-surface-low: #fff6cf;
+  --color-surface-mid: #fbeeb4;
+  --color-surface-high: #f5e39a;
+  --color-surface-primary-container: #ffdf70;
+  --color-on-primary-container: #2b2a26;
+  --color-primary: #b07d00;
+  --color-primary-darker: #946900;
+  --color-primary-darkest: #7a5600;
+  --color-primary-light: #fff1b8;
+  --color-primary-light-darker: #ffe58a;
+  --color-brand-hover: #946900;
+  --color-brand-active: #7a5600;
+  --button-hover-bg: #fff1b8;
+  --shadow-island: 0 0 0 1.5px #2b2a26;
+}
+
+/* ---------- 按钮和输入框 ---------- */
 
 .sl-status button,
 .sl-status select,
 .sl-banner button,
 .sl-modal button {
-  font-size: 12px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--default-border-color, #ccc);
-  background: var(--island-bg-color, #fff);
-  color: inherit;
+  height: 36px;
+  box-sizing: border-box;
+  padding: 0 12px;
+  font: inherit;
+  font-size: 13px;
+  border-radius: 8px;
+  border: var(--sl-line) solid var(--sl-border);
+  background: var(--sl-surface);
+  color: var(--sl-text);
   cursor: pointer;
+  transition: background-color 0.12s, border-color 0.12s;
 }
 
-.sl-board-select {
-  max-width: 160px;
+.sl-status button:hover:not(:disabled),
+.sl-status select:hover,
+.sl-banner button:hover:not(:disabled),
+.sl-modal button:hover:not(:disabled) {
+  background: var(--sl-surface-hover);
+}
+
+.sl-status button:focus-visible,
+.sl-status select:focus-visible,
+.sl-banner button:focus-visible,
+.sl-modal button:focus-visible,
+.sl-banner-note:focus-visible,
+.sl-modal input:focus-visible {
+  outline: 2px solid var(--sl-primary);
+  outline-offset: 1px;
 }
 
 .sl-status button.sl-primary,
 .sl-banner button.sl-primary,
 .sl-modal button.sl-primary {
-  background: var(--color-primary, #6965db);
-  border-color: var(--color-primary, #6965db);
-  color: #fff;
+  background: var(--sl-primary);
+  color: var(--sl-on-primary);
+  font-weight: 600;
+}
+
+.sl-status button.sl-primary:hover:not(:disabled),
+.sl-banner button.sl-primary:hover:not(:disabled),
+.sl-modal button.sl-primary:hover:not(:disabled) {
+  background: var(--sl-primary-hover);
 }
 
 .sl-modal button.sl-danger {
-  background: #c92a2a;
-  border-color: #c92a2a;
+  background: var(--sl-danger);
   color: #fff;
+  font-weight: 600;
+}
+
+.sl-modal button.sl-danger:hover:not(:disabled) {
+  background: var(--sl-danger);
+  filter: brightness(0.92);
 }
 
 .sl-status button:disabled,
 .sl-banner button:disabled,
 .sl-modal button:disabled {
-  opacity: 0.6;
+  opacity: 0.5;
   cursor: default;
 }
+
+.sl-banner-note,
+.sl-modal input {
+  height: 36px;
+  box-sizing: border-box;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 13px;
+  border-radius: 8px;
+  border: var(--sl-line) solid var(--sl-border);
+  background: var(--sl-surface);
+  color: var(--sl-text);
+}
+
+.sl-banner-note::placeholder,
+.sl-modal input::placeholder {
+  color: var(--sl-muted);
+}
+
+.sl-error {
+  color: var(--sl-danger);
+}
+
+/* ---------- 右上角 ---------- */
+
+.sl-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--sl-text);
+  white-space: nowrap;
+}
+
+.sl-status select.sl-board-select {
+  max-width: 180px;
+  padding: 0 8px 0 10px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+}
+
+.sl-status button.sl-icon {
+  width: 36px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--sl-muted);
+}
+
+.sl-status button.sl-icon:hover:not(:disabled),
+.sl-status button.sl-icon[aria-expanded='true'] {
+  color: var(--sl-text);
+  background: var(--sl-surface-hover);
+}
+
+.sl-more-wrap {
+  position: relative;
+}
+
+/* 菜单挂在 body 上，位置由脚本按「⋯」按钮算 */
+.sl-menu {
+  position: fixed;
+  z-index: 30;
+  min-width: 156px;
+  padding: 4px;
+  border-radius: 10px;
+  border: var(--sl-line) solid var(--sl-border);
+  background: var(--sl-surface);
+  box-shadow: var(--sl-shadow);
+  display: flex;
+  flex-direction: column;
+}
+
+.sl-menu button {
+  height: 32px;
+  padding: 0 12px;
+  font: inherit;
+  font-size: 13px;
+  border: 0;
+  border-radius: 6px;
+  text-align: left;
+  background: transparent;
+  color: var(--sl-text);
+  cursor: pointer;
+}
+
+.sl-menu button:hover:not(:disabled) {
+  background: var(--sl-surface-hover);
+}
+
+.sl-menu button:focus-visible {
+  outline: 2px solid var(--sl-primary);
+  outline-offset: -2px;
+}
+
+.sl-menu button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.sl-menu button.sl-menu-danger {
+  color: var(--sl-danger);
+  margin-top: 4px;
+}
+
+.sl-menu button.sl-menu-danger:hover:not(:disabled) {
+  background: var(--sl-danger-hover);
+}
+
+/* 保存状态：小圆点 + 两三个字 */
+.sl-save {
+  display: inline-block;
+  max-width: 220px;
+  margin: 0 6px;
+  font-size: 12px;
+  color: var(--sl-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
+.sl-save::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.6;
+  vertical-align: middle;
+}
+
+.sl-save-ok::before {
+  background: var(--sl-ok);
+  opacity: 1;
+}
+
+.sl-save-error {
+  color: var(--sl-danger);
+}
+
+.sl-save-error::before {
+  opacity: 1;
+}
+
+/* ---------- 弹窗 ---------- */
 
 .sl-modal-backdrop {
   position: fixed;
   inset: 0;
   z-index: 20;
-  background: rgba(0, 0, 0, 0.25);
+  background: var(--sl-backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -65,41 +294,33 @@ body,
 .sl-modal {
   width: min(380px, calc(100vw - 32px));
   box-sizing: border-box;
-  padding: 16px;
-  border-radius: 12px;
-  background: var(--island-bg-color, #fff);
-  border: 1px solid var(--default-border-color, #ddd);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  padding: 20px;
+  border-radius: 14px;
+  background: var(--sl-surface);
+  border: var(--sl-line) solid var(--sl-border);
+  box-shadow: var(--sl-shadow);
   font-size: 13px;
-  color: #222;
+  line-height: 1.6;
+  color: var(--sl-text);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
 
 .sl-modal-title {
   font-weight: 600;
-  font-size: 14px;
-}
-
-.sl-modal input {
-  font-size: 13px;
-  padding: 7px 10px;
-  border-radius: 6px;
-  border: 1px solid #ccc;
+  font-size: 15px;
 }
 
 .sl-modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  margin-top: 4px;
 }
 
-.sl-error {
-  color: #c92a2a;
-}
+/* ---------- agent 请求横幅：放在工具栏下方居中 ---------- */
 
-/* agent 请求横幅：放在工具栏下方居中 */
 .sl-banner {
   position: fixed;
   top: 76px;
@@ -108,24 +329,94 @@ body,
   z-index: 10;
   width: min(520px, calc(100vw - 32px));
   box-sizing: border-box;
-  padding: 12px 14px;
-  border-radius: 10px;
-  background: #fff8e6;
-  border: 1px solid #f0c36d;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: var(--sl-surface);
+  border: var(--sl-line) solid var(--sl-border);
+  box-shadow: var(--sl-shadow);
   font-size: 13px;
-  color: #333;
+  line-height: 1.6;
+  color: var(--sl-text);
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
+/* 标题前的蓝点：和画布上 agent 画的东西一个颜色，一眼看出这是 agent 的事 */
 .sl-banner-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 600;
+  font-size: 14px;
+}
+
+.sl-banner-title::before,
+.sl-waiting::before {
+  content: '';
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--sl-agent);
 }
 
 .sl-banner-prompt {
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
+.sl-banner-queued {
+  font-size: 12px;
+  color: var(--sl-muted);
+}
+
+.sl-banner-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+/* ---------- 顶部的等待提示和底部的短提示 ---------- */
+
+.sl-waiting {
+  position: fixed;
+  top: 76px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  max-width: calc(100vw - 32px);
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--sl-surface);
+  border: var(--sl-line) solid var(--sl-border);
+  box-shadow: var(--sl-shadow);
+  font-size: 12px;
+  color: var(--sl-text);
+}
+
+/* agent 正等着的时候，蓝点慢慢呼吸 */
+.sl-waiting-live::before {
+  animation: sl-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes sl-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sl-waiting-live::before {
+    animation: none;
+  }
 }
 
 .sl-toast {
@@ -136,40 +427,35 @@ body,
   z-index: 10;
   padding: 8px 16px;
   border-radius: 999px;
-  background: #2f9e44;
-  color: #fff;
+  background: var(--sl-toast-bg);
+  color: var(--sl-toast-text);
   font-size: 13px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  box-shadow: var(--sl-shadow);
 }
 
-.sl-banner-queued {
-  font-size: 12px;
-  opacity: 0.7;
+/* ---------- 线稿风的小细节 ---------- */
+
+/* 主按钮带一条错开的墨线，按下去时贴回纸面 */
+.sl-status button.sl-primary,
+.sl-banner button.sl-primary,
+.sl-modal button.sl-primary,
+.sl-modal button.sl-danger {
+  box-shadow: 2px 2px 0 var(--sl-ink);
+  transition: transform 0.08s, box-shadow 0.08s, background-color 0.12s;
 }
 
-.sl-banner-note {
-  font-size: 13px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  border: 1px solid #ddd;
+.sl-status button.sl-primary:active:not(:disabled),
+.sl-banner button.sl-primary:active:not(:disabled),
+.sl-modal button.sl-primary:active:not(:disabled),
+.sl-modal button.sl-danger:active:not(:disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: none;
 }
 
-.sl-banner-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
+.sl-toast {
+  box-shadow: none;
 }
 
 .sl-waiting {
-  position: fixed;
-  top: 76px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 10;
-  padding: 6px 12px;
-  border-radius: 999px;
-  background: #fff8e6;
-  border: 1px solid #f0c36d;
-  font-size: 12px;
-  color: #333;
+  box-shadow: 2px 2px 0 var(--sl-ink);
 }

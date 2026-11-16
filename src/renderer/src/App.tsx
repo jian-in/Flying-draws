@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ComponentProps } from 'react'
+import { createPortal } from 'react-dom'
 import {
   CaptureUpdateAction,
   convertToExcalidrawElements,
@@ -55,6 +56,11 @@ async function snapshot(api: Api, withImage: boolean): Promise<{ sceneJson: stri
   }
   return { sceneJson, pngBase64 }
 }
+
+// 画布默认是淡黄的纸色。用户自己换过背景色的画板不动，只把还是默认白底的换掉。
+const PAPER_COLOR = '#fffbe6'
+const paperOr = (color: unknown): string =>
+  typeof color === 'string' && color && color.toLowerCase() !== '#ffffff' ? color : PAPER_COLOR
 
 const USER_BUSY_WAIT_MS = 8000
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -323,7 +329,8 @@ export default function App() {
       setBoardInfo({ board: res.board, title: res.title })
       setBoards(res.boards)
       setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
-      return res.json ? JSON.parse(res.json) : null
+      const scene = res.json ? (JSON.parse(res.json) as { appState?: Record<string, unknown> }) : {}
+      return { ...scene, appState: { ...scene.appState, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
     })
   )
 
@@ -358,15 +365,14 @@ export default function App() {
       if (parsed?.files && Object.keys(parsed.files).length > 0) {
         currentApi.addFiles(Object.values(parsed.files) as Parameters<Api['addFiles']>[0])
       }
-      if (parsed) {
-        const nextAppState = parsed.appState ? { ...parsed.appState } : undefined
-        if (nextAppState) delete nextAppState.collaborators
-        currentApi.updateScene({
-          elements: nextElements,
-          appState: nextAppState as unknown as Parameters<Api['updateScene']>[0]['appState'],
-          captureUpdate: CaptureUpdateAction.NEVER
-        })
-      }
+      const nextAppState: Record<string, unknown> = { ...parsed?.appState }
+      delete nextAppState.collaborators
+      nextAppState.viewBackgroundColor = paperOr(nextAppState.viewBackgroundColor)
+      currentApi.updateScene({
+        elements: nextElements,
+        appState: nextAppState as unknown as Parameters<Api['updateScene']>[0]['appState'],
+        captureUpdate: CaptureUpdateAction.NEVER
+      })
       currentApi.history.clear()
       setBoardInfo({ board: res.board, title: res.title })
       if (res.boards) setBoards(res.boards)
@@ -405,6 +411,10 @@ export default function App() {
 
   const onChange = useCallback<OnChange>(
     (elements, appState, files) => {
+      // 横幅和弹窗画在 Excalidraw 外面，要自己跟着它的深浅色走
+      if (document.documentElement.dataset.slTheme !== appState.theme) {
+        document.documentElement.dataset.slTheme = appState.theme
+      }
       latest.current = [elements, appState, files]
       const version = elementsVersion(elements)
       if (lastSavedVersion.current === null) {
@@ -630,26 +640,33 @@ export default function App() {
                 </option>
               ))}
             </select>
-            <button onClick={() => setCreating(true)} title="新建一块空白画板">
-              + 新建画板
-            </button>
-            <button onClick={() => setRenaming(true)} title="重命名当前画板">
-              重命名
-            </button>
             <button
-              onClick={() => setConfirmDelete(true)}
-              disabled={boards.length <= 1}
-              title={boards.length <= 1 ? '至少保留一块画板' : '删除当前画板'}
+              className="sl-icon sl-new-board"
+              onClick={() => setCreating(true)}
+              aria-label="新建画板"
+              title="新建一块空白画板"
             >
-              删除
+              +
             </button>
+            <MoreMenu
+              items={[
+                { label: '重命名', title: '重命名当前画板', onSelect: () => setRenaming(true) },
+                { label: '立即保存', title: '立即把当前画布写入文件', onSelect: () => void save() },
+                {
+                  label: '打开文件位置',
+                  title: '在资源管理器中显示画板文件',
+                  onSelect: () => void window.sketchlink.revealBoard()
+                },
+                {
+                  label: '删除',
+                  title: boards.length <= 1 ? '至少保留一块画板' : '删除当前画板',
+                  danger: true,
+                  disabled: boards.length <= 1,
+                  onSelect: () => setConfirmDelete(true)
+                }
+              ]}
+            />
             <StatusText status={status} />
-            <button onClick={() => void save()} title="立即把当前画布写入文件">
-              立即保存
-            </button>
-            <button onClick={() => void window.sketchlink.revealBoard()} title="在资源管理器中显示画板文件">
-              打开文件位置
-            </button>
             <button className="sl-primary" onClick={() => setComposing(true)} title="把当前画布发给 agent">
               发给 agent
             </button>
@@ -720,7 +737,7 @@ export default function App() {
           cancelLabel="取消"
         />
       ) : hub.agentWaiting ? (
-        <div className="sl-waiting">agent 正在等你：画好后点右上角「发给 agent」</div>
+        <div className="sl-waiting sl-waiting-live">agent 正在等你：画好后点右上角「发给 agent」</div>
       ) : hub.inbox > 0 ? (
         <div className="sl-waiting">
           已发出{hub.inbox > 1 ? ` ${hub.inbox} 份` : ''}，agent 还没来取。在聊天里跟它说一声「画好了」
@@ -889,19 +906,99 @@ function Banner(props: {
   )
 }
 
+type MenuItem = { label: string; title?: string; danger?: boolean; disabled?: boolean; onSelect: () => void }
+
+// 右上角的「⋯」菜单：不常用的画板操作收在这里，免得和 Excalidraw 的工具栏抢位置
+function MoreMenu({ items }: { items: MenuItem[] }) {
+  // 菜单挂到 body 上（不然会被横幅盖住），位置按按钮算：右边对齐，贴在按钮下面
+  const [pos, setPos] = useState<{ top: number; right: number } | null>(null)
+  const open = pos !== null
+  const setOpen = (next: boolean | ((v: boolean) => boolean)) =>
+    setPos((prev) => {
+      const want = typeof next === 'function' ? next(prev !== null) : next
+      const rect = wrap.current?.getBoundingClientRect()
+      return want && rect ? { top: rect.bottom + 6, right: window.innerWidth - rect.right } : null
+    })
+  const wrap = useRef<HTMLDivElement | null>(null)
+  const menu = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: PointerEvent) => {
+      const target = e.target as Node
+      if (!wrap.current?.contains(target) && !menu.current?.contains(target)) setOpen(false)
+    }
+    const onResize = () => setOpen(false)
+    window.addEventListener('resize', onResize)
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    window.addEventListener('pointerdown', onDown, true)
+    window.addEventListener('keydown', onKey, true)
+    return () => {
+      window.removeEventListener('resize', onResize)
+      window.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('keydown', onKey, true)
+    }
+  }, [open])
+  return (
+    <div className="sl-more-wrap" ref={wrap}>
+      <button
+        className="sl-icon sl-more"
+        aria-label="更多画板操作"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="更多"
+        onClick={() => setOpen((v) => !v)}
+      >
+        ⋯
+      </button>
+      {pos
+        ? createPortal(
+            <div className="sl-menu" role="menu" ref={menu} style={{ top: pos.top, right: pos.right }}>
+              {items.map((item) => (
+                <button
+                  key={item.label}
+                  role="menuitem"
+                  className={item.danger ? 'sl-menu-danger' : undefined}
+                  title={item.title}
+                  disabled={item.disabled}
+                  onClick={() => {
+                    setOpen(false)
+                    item.onSelect()
+                  }}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>,
+            document.body
+          )
+        : null}
+    </div>
+  )
+}
+
+// 保存状态：一个小圆点加两三个字，细节（版本号、时间、路径）放在悬停提示里
 function StatusText({ status }: { status: Status }) {
   switch (status.kind) {
     case 'loading':
-      return <span>载入中…</span>
+      return <span className="sl-save">载入中…</span>
     case 'idle':
-      return <span>未修改</span>
+      return <span className="sl-save">未修改</span>
     case 'saved':
       return (
-        <span title={status.path}>
-          已保存 v{status.version} · {new Date(status.savedAt).toLocaleTimeString()}
+        <span
+          className="sl-save sl-save-ok"
+          title={`v${status.version} · ${new Date(status.savedAt).toLocaleTimeString()}\n${status.path}`}
+        >
+          已保存
         </span>
       )
     case 'error':
-      return <span className="sl-error">保存失败：{status.message}</span>
+      return (
+        <span className="sl-save sl-save-error" title={status.message}>
+          出错了：{status.message}
+        </span>
+      )
   }
 }
