@@ -10,6 +10,7 @@ import { pickupHint, RequestHub, type DrawRequest, type Handoff, type HubState, 
 import { SEAT_COLORS, SeatRegistry } from './seats'
 import { captureBaseline, diffProposal, type DiffElement, type ProposalBaseline } from './diff'
 import { startDaemon } from './daemon'
+import { WindowDock, type DockState } from './dock'
 import {
   BOARD_EXT,
   DEFAULT_BOARD_ID,
@@ -544,6 +545,7 @@ function bringToFront(): void {
 }
 
 let windowReady: Promise<void> = Promise.resolve()
+let dock: WindowDock | null = null
 
 function createWindow(): void {
   win = new BrowserWindow({
@@ -562,6 +564,10 @@ function createWindow(): void {
     }
   })
   const overlayTarget = win
+  // 窗口吸附：拖到别的窗口旁边松手就贴上去，状态变了告诉页面
+  dock = new WindowDock(win, (state) => {
+    if (!overlayTarget.isDestroyed()) overlayTarget.webContents.send('dock:state', state)
+  })
   ipcMain.removeAllListeners('window:theme')
   ipcMain.on('window:theme', (_e, theme: unknown) => {
     if (overlayTarget.isDestroyed()) return
@@ -1232,6 +1238,8 @@ ipcMain.handle('board:reveal', () => {
   return shell.openPath(BOARDS_DIR)
 })
 ipcMain.handle('hub:state', () => buildHubState(currentBoardId))
+ipcMain.handle('dock:state', (): DockState => dock?.state() ?? { docked: false, side: null, title: null })
+ipcMain.on('dock:release', () => dock?.release())
 type SubmitPayload = {
   requestId: string | null
   note: string

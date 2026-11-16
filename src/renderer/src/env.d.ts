@@ -19,6 +19,12 @@ declare global {
     onlineSeats?: OnlineSeat[]
   }
 
+  interface DockState {
+    docked: boolean
+    side: 'left' | 'right' | null
+    title: string | null
+  }
+
   interface BoardSummary {
     board: string
     title: string | null
@@ -70,6 +76,9 @@ declare global {
         to?: string | null
       }) => Promise<{ version: number; delivered: boolean; hint: string | null }>
       cancel: (requestId: string) => Promise<boolean>
+      getDockState: () => Promise<DockState>
+      onDockState: (fn: (state: DockState) => void) => () => void
+      releaseDock: () => void
       copyHint: () => Promise<string | null>
       onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => () => void
       rpcReply: (id: number, result: unknown, error?: string) => void

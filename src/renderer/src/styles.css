@@ -68,6 +68,15 @@ body {
   font-size: 15px;
 }
 
+/* 画布窗口吸附在别的窗口旁边时的小标记，点一下解除 */
+.fd-titlebar-tools.fd-status button.fd-dock-pill {
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  border-radius: 999px;
+  color: var(--fd-muted);
+}
+
 /* 顶部挂着我们自己的横幅或提示条时，Excalidraw 的操作提示先让一让，免得两行字叠在一起 */
 .fd-has-notice .excalidraw .HintViewer {
   visibility: hidden;

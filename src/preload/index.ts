@@ -34,6 +34,15 @@ contextBridge.exposeInMainWorld('flyingdraws', {
     to?: string | null
   }) => ipcRenderer.invoke('hub:submit', payload),
   cancel: (requestId: string) => ipcRenderer.invoke('hub:cancel', requestId),
+
+  // 窗口吸附：画布贴在哪个窗口旁边
+  getDockState: () => ipcRenderer.invoke('dock:state'),
+  onDockState: (fn: (state: unknown) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, state: unknown) => fn(state)
+    ipcRenderer.on('dock:state', listener)
+    return () => ipcRenderer.removeListener('dock:state', listener)
+  },
+  releaseDock: () => ipcRenderer.send('dock:release'),
   copyHint: () => ipcRenderer.invoke('hub:hint'),
 
   // 主进程发起的调用：页面处理完用 rpcReply 回复

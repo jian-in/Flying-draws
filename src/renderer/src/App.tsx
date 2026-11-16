@@ -652,6 +652,11 @@ export default function App() {
     }
   }, [seatInfo, filter])
   const [composing, setComposing] = useState(false)
+  const [dock, setDock] = useState<DockState>({ docked: false, side: null, title: null }) // 画布窗口贴在哪个窗口旁边
+  useEffect(() => {
+    void window.flyingdraws.getDockState().then(setDock)
+    return window.flyingdraws.onDockState(setDock)
+  }, [])
   const [sendTo, setSendTo] = useState<string | null>(null) // 「发给 agent」时点选的席位，null 是所有 agent
   const [initialData] = useState(() =>
     window.flyingdraws.loadBoard().then((res) => {
@@ -1081,6 +1086,16 @@ export default function App() {
             ]}
           />
           <StatusText status={status} />
+          {dock.docked ? (
+            <button
+              type="button"
+              className="fd-dock-pill"
+              title={`画布贴在「${dock.title ?? '另一个窗口'}」${dock.side === 'left' ? '左' : '右'}边，会跟着它移动和缩放。点一下解除，或者直接把画布拖开`}
+              onClick={() => window.flyingdraws.releaseDock()}
+            >
+              已吸附 ×
+            </button>
+          ) : null}
         </div>
         <div className="fd-seats" aria-label="在线 agent 席位">
           {onlineSeats.length ? (
