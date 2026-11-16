@@ -5,7 +5,7 @@
 //
 // 用 SKETCHLINK_HOME 把画板和连接信息都指到 out/e2e-home，
 // 不会碰用户的 ~/.sketchlink，也不用先关掉用户开着的画布。
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -404,8 +404,142 @@ try {
   // 提议乙画上去之后，用户才加了那个框，所以对乙来说它也是"后来加的"；乙本身没被改
   check(/自己加了：节点一个没有文字的图形/.test(rB) && !/把节点|删掉了/.test(rB), '重启后底稿还在：改动对比照常工作')
   const pendingFile = JSON.parse(readFileSync(join(HOME, 'pending.json'), 'utf8'))
-  check(pendingFile.requests.length === 0, '处理完后，存盘的待处理请求清空了')
+  check(Object.keys(pendingFile.boards ?? {}).length === 0, '处理完后，存盘的待处理请求清空了')
+
+  // 第五次：多画板新建、切换与隔离
+  const listed1 = textOf(await call('canvas_list'))
+  check(/Current board: default/.test(listed1), 'canvas_list 能看到当前画板 default')
+
+  const openedNew = textOf(await call('canvas_open', { board: 'login-flow', title: '登录流程' }))
+  check(/Created and opened canvas "login-flow"/.test(openedNew), 'canvas_open 支持传入新 board 和 title 创建并切换')
+  await sleep(300)
+  const selectValAfterMcp = await user2.js(`document.querySelector('.sl-board-select')?.value`)
+  check(selectValAfterMcp === 'login-flow', 'MCP 切画板后，页面右上角下拉框同步切到 login-flow')
+
+  const drawnNew = textOf(
+    await call('canvas_draw', {
+      ops: [
+        { op: 'add_node', id: 'u', label: '输入账号' },
+        { op: 'add_node', id: 'ok', label: '进入首页' },
+        { op: 'add_edge', from: 'u', to: 'ok', label: '验证通过' }
+      ]
+    })
+  )
+  check(/画板「login-flow」/.test(drawnNew) && /「输入账号」/.test(drawnNew) && !/重试三次/.test(drawnNew), '新画板 login-flow 独立绘制，不混入 default 的内容')
+
+  // 扮演用户点「+ 新建画板」按钮在 UI 上创建一块新画板
+  await user2.click('+ 新建画板')
+  await sleep(200)
+  await user2.js(`(() => {
+    const input = document.querySelector('.sl-modal input')
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+    setter.call(input, 'ui-board')
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  })()`)
+  await user2.click('创建')
+  await sleep(400)
+  const uiSelect = await user2.js(`document.querySelector('.sl-board-select')?.value`)
+  check(uiSelect === 'ui-board', '页面点「+ 新建画板」能创建并切到 ui-board')
+
+  const uiRead = textOf(await call('canvas_read'))
+  check(/画板「ui-board」/.test(uiRead) && /（画板是空的）/.test(uiRead), '新建的 ui-board 是空白画板')
+
+  // 用 canvas_read 指定 board 切回 default，确认原先的画还在
+  const readDefault = textOf(await call('canvas_read', { board: 'default', image: 'never' }))
+  check(/画板「default」/.test(readDefault) && /「重试三次」/.test(readDefault), '切回 default 后原来的内容完整保留')
+
+  const listed2 = textOf(await call('canvas_list'))
+  check(/login-flow "登录流程"/.test(listed2) && /ui-board/.test(listed2) && /default \[active\]/.test(listed2), 'canvas_list 列出全部三块画板并标明当前激活画板')
+
+  // 第六次：收件箱持久化（用户主动发画后重启，收件箱和等待条都在）
+  await user2.click('发给 agent')
+  await sleep(200)
+  await user2.typeNote('重启前发出的画')
+  await user2.click('发送')
+  const waitingBeforeRestart = await until(
+    async () => /已发出，agent 还没来取/.test((await user2.js(`document.querySelector('.sl-waiting')?.textContent ?? ''`)) ?? '')
+  )
+  check(waitingBeforeRestart, '没有 agent 等待时发画会显示等待查看横幅')
+  const pendingWithInbox = JSON.parse(readFileSync(join(HOME, 'pending.json'), 'utf8'))
+  check(
+    Array.isArray(pendingWithInbox.inbox?.default) && pendingWithInbox.inbox.default[0]?.note === '重启前发出的画',
+    '未取走的收件箱消息已经写入 pending.json'
+  )
+
+  const pidBeforeInboxRestart = JSON.parse(readFileSync(join(HOME, 'daemon.json'), 'utf8')).pid
   user2.close()
+  process.kill(pidBeforeInboxRestart)
+  await sleep(1500)
+  await call('canvas_open')
+  const user3 = await connectPage()
+  const waitingAfterRestart = await until(
+    async () => /已发出，agent 还没来取/.test((await user3.js(`document.querySelector('.sl-waiting')?.textContent ?? ''`)) ?? '')
+  )
+  check(waitingAfterRestart, '应用重启后收件箱等待横幅自动恢复')
+
+  const readInboxAfterRestart = textOf(await call('canvas_read', { image: 'never' }))
+  check(/重启前发出的画/.test(readInboxAfterRestart), '重启后调用 canvas_read 能收到用户之前发来的画与附言')
+  await sleep(300)
+  const waitingAfterRead = await user3.js(`document.querySelector('.sl-waiting')?.textContent ?? ''`)
+  const pendingClearedInbox = JSON.parse(readFileSync(join(HOME, 'pending.json'), 'utf8'))
+  check(!waitingAfterRead && !pendingClearedInbox.inbox, '收件箱取走后等待横幅消失且 pending.json 已清空')
+
+  // 第七次：画板重命名与删除（UI 与 MCP）
+  await call('canvas_open', { board: 'ui-board' })
+  await sleep(300)
+  await user3.click('重命名')
+  await sleep(200)
+  await user3.js(`(() => {
+    const input = document.querySelector('.sl-modal input')
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+    setter.call(input, 'renamed-ui')
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  })()`)
+  await user3.click('保存')
+  await sleep(400)
+  const selectAfterUiRename = await user3.js(`document.querySelector('.sl-board-select')?.value`)
+  check(
+    selectAfterUiRename === 'renamed-ui' &&
+      !existsSync(join(HOME, 'boards', 'ui-board.excalidraw')) &&
+      existsSync(join(HOME, 'boards', 'renamed-ui.excalidraw')),
+    'UI 重命名画板后切换编号并迁移磁盘文件'
+  )
+
+  const mcpRenamed = textOf(await call('canvas_rename', { board: 'renamed-ui', new_board: 'renamed-by-mcp', title: 'MCP 重命名' }))
+  await sleep(300)
+  const selectAfterMcpRename = await user3.js(`document.querySelector('.sl-board-select')?.value`)
+  check(
+    /Renamed board "renamed-ui" to "renamed-by-mcp"/.test(mcpRenamed) && selectAfterMcpRename === 'renamed-by-mcp',
+    'MCP canvas_rename 能重命名画板并同步更新页面下拉框'
+  )
+
+  await user3.click('删除')
+  await sleep(200)
+  await user3.click('确认删除')
+  await sleep(400)
+  const selectAfterUiDelete = await user3.js(`document.querySelector('.sl-board-select')?.value`)
+  const listedAfterUiDelete = textOf(await call('canvas_list'))
+  check(
+    selectAfterUiDelete === 'default' &&
+      !existsSync(join(HOME, 'boards', 'renamed-by-mcp.excalidraw')) &&
+      !/renamed-by-mcp/.test(listedAfterUiDelete),
+    'UI 删除当前画板后自动切回 default 并移除磁盘文件'
+  )
+
+  const mcpDeleted = textOf(await call('canvas_delete', { board: 'login-flow' }))
+  await sleep(300)
+  const listedFinal = textOf(await call('canvas_list'))
+  const deleteDisabledOnLast = await user3.js(
+    `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '删除')?.disabled ?? false`
+  )
+  check(
+    /Deleted board "login-flow"/.test(mcpDeleted) &&
+      !/login-flow/.test(listedFinal) &&
+      deleteDisabledOnLast === true,
+    'MCP canvas_delete 能删除指定画板；只剩最后一块画板时 UI 删除按钮禁用'
+  )
+
+  user3.close()
 } finally {
   await client.close()
   // 关掉测试开的那个画布实例

@@ -81,11 +81,24 @@ export class RequestHub {
     return [...this.requests.values()].filter((r) => r.status === 'waiting')
   }
 
-  // 应用重启后把存盘的请求放回来，编号不变，agent 手里的 request_id 还能用
-  restore(saved: readonly DrawRequest[]): void {
+  // 用户主动发出、还没被 agent 取走的画，同样用来存盘防重启丢失
+  queuedInbox(): Submission[] {
+    return [...this.inbox]
+  }
+
+  // 应用重启后把存盘的请求和收件箱放回来，编号不变，agent 手里的 request_id 还能用
+  restore(saved: readonly DrawRequest[], savedInbox: readonly Submission[] = []): void {
     for (const r of saved) {
       if (!r?.id || this.requests.has(r.id)) continue
       this.requests.set(r.id, { ...r, status: 'waiting', submission: null })
+    }
+    const seenInbox = new Set(this.inbox.map((s) => `${s.at}:${s.version}:${s.note}`))
+    for (const s of savedInbox) {
+      if (!s || typeof s.sceneJson !== 'string' || typeof s.at !== 'string') continue
+      const key = `${s.at}:${s.version}:${s.note ?? ''}`
+      if (seenInbox.has(key)) continue
+      seenInbox.add(key)
+      this.inbox.push({ ...s, requestId: null })
     }
     this.emit()
   }
@@ -132,6 +145,22 @@ export class RequestHub {
     this.settle((t) => 'requestId' in t && t.requestId === id, { status: 'cancelled', requestId: id })
     this.emit()
     return true
+  }
+
+  // 删除画板时统一清理该画板下未完成的等待请求和收件箱
+  cancelAll(): void {
+    let changed = false
+    for (const req of this.requests.values()) {
+      if (req.status !== 'waiting') continue
+      req.status = 'cancelled'
+      this.settle((t) => 'requestId' in t && t.requestId === req.id, { status: 'cancelled', requestId: req.id })
+      changed = true
+    }
+    if (this.inbox.length) {
+      this.inbox = []
+      changed = true
+    }
+    if (changed) this.emit()
   }
 
   wait(target: WaitTarget, timeoutMs: number): Promise<WaitResult> {

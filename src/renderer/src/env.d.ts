@@ -7,13 +7,44 @@ declare global {
     inbox: number
   }
 
+  interface BoardSummary {
+    board: string
+    title: string | null
+    version: number
+    elements: number
+    updatedAt: string
+    active: boolean
+  }
+
+  interface BoardLoadResult {
+    board: string
+    title: string | null
+    version: number
+    json: string | null
+    path: string
+    boards: BoardSummary[]
+    hubState?: HubState
+    oldBoard?: string
+    deleted?: string
+  }
+
   interface Window {
     sketchlink: {
-      loadBoard: () => Promise<{ json: string | null; path: string }>
-      saveBoard: (json: string) => Promise<{ path: string; saveCount: number; version: number; savedAt: string }>
+      loadBoard: () => Promise<BoardLoadResult>
+      listBoards: () => Promise<{ current: string; boards: BoardSummary[] }>
+      saveBoard: (json: string) => Promise<{ board: string; path: string; saveCount: number; version: number; savedAt: string }>
+      createBoard: (payload: { name: string; title?: string; currentSceneJson?: string }) => Promise<BoardLoadResult>
+      switchBoard: (payload: { board: string; currentSceneJson?: string }) => Promise<BoardLoadResult>
+      renameBoard: (payload: {
+        board?: string
+        name: string
+        title?: string | null
+        currentSceneJson?: string
+      }) => Promise<BoardLoadResult>
+      deleteBoard: (payload: { board: string; currentSceneJson?: string }) => Promise<BoardLoadResult>
       revealBoard: () => Promise<void>
       getHubState: () => Promise<HubState>
-      onHubState: (fn: (state: HubState) => void) => void
+      onHubState: (fn: (state: HubState) => void) => () => void
       submit: (payload: {
         requestId: string | null
         note: string
@@ -22,7 +53,7 @@ declare global {
         decision?: 'accepted' | 'rejected' | null
       }) => Promise<{ version: number }>
       cancel: (requestId: string) => Promise<boolean>
-      onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => void
+      onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => () => void
       rpcReply: (id: number, result: unknown, error?: string) => void
       ready: () => void
       testMode: boolean

@@ -150,21 +150,93 @@ const imageSchema = z
   .enum(['auto', 'always', 'never'])
   .optional()
   .describe('Attach a PNG of the canvas. "auto" (default) attaches it only when the drawing has things the text description cannot capture (scribbles, images, plain lines).')
+const boardSchema = z
+  .string()
+  .min(1)
+  .optional()
+  .describe('Optional board id/name (e.g. "default", "login-flow"). Omit to use the currently active board.')
 
 const server = new McpServer({ name: 'sketchlink', version: '0.1.0' })
 
 server.registerTool(
   'canvas_open',
   {
-    title: 'Open the Sketchlink canvas',
+    title: 'Open or create a Sketchlink canvas board',
     description:
       'Open the local Sketchlink drawing canvas window (starting the app if needed) and bring it to the front. ' +
-      'Use it when the user wants to sketch something, or before asking them to draw.',
+      'Optionally pass "board" to switch to another board or create a new blank board if it does not exist yet.',
+    inputSchema: {
+      board: z.string().min(1).optional().describe('Optional board id/name to open or create. Omit to open the current active board.'),
+      title: z.string().min(1).optional().describe('Optional human-readable title when creating or naming a board.')
+    }
+  },
+  ({ board, title }) => guarded(async () => {
+    const res = await daemon('/open', { board, title })
+    const action = res.created ? 'Created and opened canvas' : 'Canvas'
+    const label = res.title ? `${res.board}" ("${res.title}")` : `${res.board}"`
+    return text(`${action} "${label} is open (version ${res.version}). The user can draw on it now.`)
+  })
+)
+
+server.registerTool(
+  'canvas_list',
+  {
+    title: 'List Sketchlink canvas boards',
+    description: 'List all available boards in Sketchlink, showing which one is currently active, its title, version, and element count.',
     inputSchema: {}
   },
   () => guarded(async () => {
-    const res = await daemon('/open', {})
-    return text(`Canvas "${res.board}" is open (version ${res.version}). The user can draw on it now.`)
+    const res = await daemon('/list', {})
+    const boards = (Array.isArray(res.boards) ? res.boards : []) as {
+      board: string
+      title: string | null
+      version: number
+      elements: number
+      active: boolean
+    }[]
+    if (!boards.length) return text('No boards yet.')
+    const lines = boards.map((b) => {
+      const mark = b.active ? ' [active]' : ''
+      const title = b.title ? ` "${b.title}"` : ''
+      return `- ${b.board}${title}${mark}: v${b.version}, ${b.elements} element(s)`
+    })
+    return text(`Current board: ${res.current}\n${lines.join('\n')}`)
+  })
+)
+
+server.registerTool(
+  'canvas_rename',
+  {
+    title: 'Rename a Sketchlink canvas board',
+    description: 'Rename an existing board and/or update its display title. Preserves the active session and undo history.',
+    inputSchema: {
+      board: z.string().min(1).optional().describe('Board id to rename. Omit to rename the current active board.'),
+      new_board: z.string().min(1).describe('New board id/name.'),
+      title: z.string().nullable().optional().describe('Optional display title. Pass null to clear the existing title.')
+    }
+  },
+  ({ board, new_board, title }) => guarded(async () => {
+    const res = await daemon('/rename', { board, new_board, title })
+    const label = res.title ? `${res.board}" ("${res.title}")` : `${res.board}"`
+    return text(`Renamed board "${res.old_board}" to "${label} (v${res.version}).`)
+  })
+)
+
+server.registerTool(
+  'canvas_delete',
+  {
+    title: 'Delete a Sketchlink canvas board',
+    description:
+      'Delete a board from Sketchlink and remove its .excalidraw file. Cannot delete the last remaining board. ' +
+      'If deleting the active board, Sketchlink automatically switches to another board.',
+    inputSchema: {
+      board: z.string().min(1).optional().describe('Board id to delete. Omit to delete the current active board.')
+    }
+  },
+  ({ board }) => guarded(async () => {
+    const res = await daemon('/delete', { board })
+    const currentLabel = res.title ? `${res.current}" ("${res.title}")` : `${res.current}"`
+    return text(`Deleted board "${res.deleted}". Current active board is now "${currentLabel} (v${res.version}).`)
   })
 )
 
@@ -177,10 +249,10 @@ server.registerTool(
       'arrows between them, free text notes and where they sit, and hand-drawn strokes. ' +
       'The first line shows the canvas version (e.g. v12). Node ids like N1 are valid only for that version. Use this right away when the user says they drew something, sent you the canvas, or refers to "the canvas" / "my sketch": ' +
       'the canvas cannot notify you by itself, so a drawing the user sent just waits until you read it.',
-    inputSchema: { format: formatSchema, image: imageSchema }
+    inputSchema: { board: boardSchema, format: formatSchema, image: imageSchema }
   },
-  ({ format, image }) => guarded(async () => {
-    const res = await daemon('/read', { format: format ?? 'summary', image: image ?? 'auto' }, 20_000)
+  ({ board, format, image }) => guarded(async () => {
+    const res = await daemon('/read', { board, format: format ?? 'summary', image: image ?? 'auto' }, 20_000)
     // 用户之前主动点过"发给 agent"的，这次读取一并交给 agent
     const sent = (Array.isArray(res.sent) ? res.sent : []) as { note: string }[]
     const notes = sent.map((s) => s.note).filter(Boolean)
@@ -200,13 +272,14 @@ server.registerTool(
       '(a layout, a flow, a rough shape, positions, a curve). Shows your prompt on the canvas and returns a request_id immediately. ' +
       'Then call canvas_wait with that request_id to get the drawing.',
     inputSchema: {
-      prompt: z.string().min(1).describe('What you want the user to draw, in the user\'s language. Shown on the canvas.')
+      prompt: z.string().min(1).describe('What you want the user to draw, in the user\'s language. Shown on the canvas.'),
+      board: boardSchema
     }
   },
-  ({ prompt }) => guarded(async () => {
-    const res = await daemon('/request', { prompt })
+  ({ prompt, board }) => guarded(async () => {
+    const res = await daemon('/request', { prompt, board })
     return text(
-      `Request ${res.request_id} is shown on the canvas. Now call canvas_wait with request_id "${res.request_id}" to receive the drawing.`
+      `Request ${res.request_id} is shown on the canvas "${res.board}". Now call canvas_wait with request_id "${res.request_id}" to receive the drawing.`
     )
   })
 )
@@ -221,14 +294,15 @@ server.registerTool(
       'If the result says the user is still drawing, call canvas_wait again. After about 3 empty waits, stop and tell the user in the chat that you are waiting for their drawing instead of retrying silently.',
     inputSchema: {
       request_id: z.string().optional().describe('The id returned by canvas_request or canvas_propose.'),
+      board: boardSchema,
       timeout_s: z.number().int().min(1).max(45).optional().describe('How long to wait, in seconds. Default 40.'),
       format: formatSchema,
       image: imageSchema
     }
   },
-  ({ request_id, timeout_s, format, image }) => guarded(async () => {
+  ({ request_id, board, timeout_s, format, image }) => guarded(async () => {
     const wait = timeout_s ?? 40
-    const res = await daemon('/wait', { request_id, timeout_s: wait, format: format ?? 'summary', image: image ?? 'auto' }, (wait + 10) * 1000)
+    const res = await daemon('/wait', { request_id, board, timeout_s: wait, format: format ?? 'summary', image: image ?? 'auto' }, (wait + 10) * 1000)
     switch (res.status) {
       case 'submitted': {
         const note = res.note ? `The user's note: "${res.note}"` : 'The user added no note.'
@@ -347,14 +421,15 @@ server.registerTool(
       'If accepted, the proposal becomes part of the canvas and you are told exactly what the user changed in it first. If rejected, it is removed. ' +
       'The request survives a restart of the canvas app, so keep using the same request_id.',
     inputSchema: {
+      board: boardSchema,
       ops: z.array(opSchema).min(1).describe('What to draw as the proposal, applied together as one batch.'),
       question: z.string().min(1).describe('What you want the user to confirm, in the user\'s language, e.g. "Is this the flow you meant?". Shown on the canvas.'),
       direction: directionSchema,
       base_version: baseVersionSchema
     }
   },
-  ({ ops, question, direction, base_version }) => guarded(async () => {
-    const res = await daemon('/propose', { ops, question, direction, base_version }, 30_000)
+  ({ board, ops, question, direction, base_version }) => guarded(async () => {
+    const res = await daemon('/propose', { board, ops, question, direction, base_version }, 30_000)
     const failure = drawFailure(res, base_version)
     if (failure) return failure
     if (res.status !== 'proposed') return text(JSON.stringify(res))
@@ -383,13 +458,14 @@ server.registerTool(
       'it still works if the canvas changed since, unless a node you refer to was deleted or something you want to change was edited by the user. ' +
       'Returns the updated canvas description. Things you drew are marked as drawn by the agent in later reads.',
     inputSchema: {
+      board: boardSchema,
       ops: z.array(drawOpSchema).min(1).describe('What to add or change, applied together as one batch: either all of it happens or none.'),
       direction: directionSchema,
       base_version: baseVersionSchema
     }
   },
-  ({ ops, base_version, direction }) => guarded(async () => {
-    const res = await daemon('/draw', { ops, base_version, direction }, 30_000)
+  ({ board, ops, base_version, direction }) => guarded(async () => {
+    const res = await daemon('/draw', { board, ops, base_version, direction }, 30_000)
     const failure = drawFailure(res, base_version)
     if (failure) return failure
     if (res.status !== 'drawn') return text(JSON.stringify(res))

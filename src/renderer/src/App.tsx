@@ -294,6 +294,11 @@ type Status =
 export default function App() {
   const [api, setApi] = useState<Api | null>(null)
   const [status, setStatus] = useState<Status>({ kind: 'loading' })
+  const [boardInfo, setBoardInfo] = useState<{ board: string; title: string | null }>({ board: 'default', title: null })
+  const [boards, setBoards] = useState<BoardSummary[]>([])
+  const [creating, setCreating] = useState(false)
+  const [renaming, setRenaming] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
   const [hub, setHub] = useState<HubState>({ pending: [], agentWaiting: false, inbox: 0 })
   const [toast, setToast] = useState<string | null>(null)
   const hubRef = useRef(hub)
@@ -315,7 +320,9 @@ export default function App() {
   const [composing, setComposing] = useState(false)
   const [initialData] = useState(() =>
     window.sketchlink.loadBoard().then((res) => {
-      setStatus({ kind: 'idle' })
+      setBoardInfo({ board: res.board, title: res.title })
+      setBoards(res.boards)
+      setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
       return res.json ? JSON.parse(res.json) : null
     })
   )
@@ -325,6 +332,58 @@ export default function App() {
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const apiRef = useRef<Api | null>(null)
   apiRef.current = api
+
+  const applyLoadedScene = useCallback(
+    (
+      currentApi: Api,
+      res: {
+        board: string
+        title: string | null
+        version: number
+        json: string | null
+        path?: string
+        boards?: BoardSummary[]
+        hubState?: HubState
+      }
+    ) => {
+      if (timer.current) {
+        clearTimeout(timer.current)
+        timer.current = null
+      }
+      const parsed = res.json ? (JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; files?: Record<string, unknown> }) : null
+      const nextElements = parsed?.elements ?? []
+      lastSavedVersion.current = elementsVersion(nextElements)
+      latest.current = null
+      currentApi.resetScene()
+      if (parsed?.files && Object.keys(parsed.files).length > 0) {
+        currentApi.addFiles(Object.values(parsed.files) as Parameters<Api['addFiles']>[0])
+      }
+      if (parsed) {
+        const nextAppState = parsed.appState ? { ...parsed.appState } : undefined
+        if (nextAppState) delete nextAppState.collaborators
+        currentApi.updateScene({
+          elements: nextElements,
+          appState: nextAppState as unknown as Parameters<Api['updateScene']>[0]['appState'],
+          captureUpdate: CaptureUpdateAction.NEVER
+        })
+      }
+      currentApi.history.clear()
+      setBoardInfo({ board: res.board, title: res.title })
+      if (res.boards) setBoards(res.boards)
+      else void window.sketchlink.listBoards().then((list) => setBoards(list.boards))
+      if (res.hubState) {
+        lastInbox.current = res.hubState.inbox
+        setHub(res.hubState)
+      }
+      setComposing(false)
+      setStatus(
+        res.json && res.path
+          ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() }
+          : { kind: 'idle' }
+      )
+    },
+    []
+  )
 
   const save = useCallback(async () => {
     if (timer.current) {
@@ -371,14 +430,15 @@ export default function App() {
 
   // 订阅 agent 请求的状态
   useEffect(() => {
-    window.sketchlink.onHubState(setHub)
+    const off = window.sketchlink.onHubState(setHub)
     void window.sketchlink.getHubState().then(setHub)
+    return off
   }, [])
 
   // 处理主进程发来的调用。画布 API 准备好以后才通知主进程"页面就绪"
   useEffect(() => {
     if (!api) return
-    window.sketchlink.onRpc(async ({ id, method, params }) => {
+    const off = window.sketchlink.onRpc(async ({ id, method, params }) => {
       const current = apiRef.current
       try {
         if (!current) throw new Error('canvas is not ready')
@@ -388,6 +448,26 @@ export default function App() {
         } else if (method === 'applyPlan') {
           const { plan, proposalId } = params as { plan: DrawPlan; proposalId: string | null }
           window.sketchlink.rpcReply(id, await applyPlan(current, plan, proposalId))
+        } else if (method === 'loadScene') {
+          const next = params as { board: string; title: string | null; version: number; json: string | null }
+          applyLoadedScene(current, next)
+          window.sketchlink.rpcReply(id, { ok: true })
+        } else if (method === 'syncBoards') {
+          const next = params as {
+            board: string
+            title: string | null
+            version: number
+            boards: BoardSummary[]
+            hubState: HubState
+          }
+          setBoardInfo({ board: next.board, title: next.title })
+          setBoards(next.boards)
+          lastInbox.current = next.hubState.inbox
+          setHub(next.hubState)
+          setStatus((prev) =>
+            prev.kind === 'saved' ? { ...prev, version: next.version, savedAt: new Date().toISOString() } : prev
+          )
+          window.sketchlink.rpcReply(id, { ok: true })
         } else {
           throw new Error(`unknown method ${method}`)
         }
@@ -396,7 +476,77 @@ export default function App() {
       }
     })
     window.sketchlink.ready()
-  }, [api])
+    return off
+  }, [api, applyLoadedScene])
+
+  const handleSwitchBoard = useCallback(
+    async (targetBoard: string) => {
+      const current = apiRef.current
+      if (!current || targetBoard === boardInfo.board) return
+      try {
+        const snap = await snapshot(current, false)
+        const res = await window.sketchlink.switchBoard({ board: targetBoard, currentSceneJson: snap.sceneJson })
+        applyLoadedScene(current, res)
+      } catch (err) {
+        setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
+      }
+    },
+    [applyLoadedScene, boardInfo.board]
+  )
+
+  const handleCreateBoard = useCallback(
+    async (rawName: string) => {
+      const current = apiRef.current
+      if (!current) return
+      const trimmed = rawName.trim()
+      const snap = await snapshot(current, false)
+      const res = await window.sketchlink.createBoard({
+        name: trimmed,
+        title: /\s/.test(trimmed) ? trimmed : undefined,
+        currentSceneJson: snap.sceneJson
+      })
+      applyLoadedScene(current, res)
+      setCreating(false)
+      setToast(`已新建画板「${res.board}」`)
+    },
+    [applyLoadedScene]
+  )
+
+  const handleRenameBoard = useCallback(async (rawName: string) => {
+    const current = apiRef.current
+    if (!current) return
+    const trimmed = rawName.trim()
+    const snap = await snapshot(current, false)
+    const res = await window.sketchlink.renameBoard({
+      board: boardInfo.board,
+      name: trimmed,
+      title: /\s/.test(trimmed) ? trimmed : null,
+      currentSceneJson: snap.sceneJson
+    })
+    setBoardInfo({ board: res.board, title: res.title })
+    setBoards(res.boards)
+    if (res.hubState) {
+      lastInbox.current = res.hubState.inbox
+      setHub(res.hubState)
+    }
+    setStatus({ kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() })
+    setRenaming(false)
+    setToast(`已重命名画板为「${res.board}」`)
+  }, [boardInfo.board])
+
+  const handleDeleteBoard = useCallback(async () => {
+    const current = apiRef.current
+    if (!current) return
+    const snap = await snapshot(current, false)
+    const target = boardInfo.board
+    const res = await window.sketchlink.deleteBoard({
+      board: target,
+      currentSceneJson: snap.sceneJson
+    })
+    applyLoadedScene(current, res)
+    setConfirmDelete(false)
+    setToast(`已删除画板「${res.deleted ?? target}」`)
+  }, [applyLoadedScene, boardInfo.board])
 
   const submit = useCallback(
     async (requestId: string | null, note: string) => {
@@ -447,6 +597,14 @@ export default function App() {
     if (api && window.sketchlink.testMode) (window as unknown as { __sketchlinkApi?: Api }).__sketchlinkApi = api
   }, [api])
 
+  const nextBoardName = () => {
+    const used = new Set(boards.map((b) => b.board))
+    for (let i = 1; ; i++) {
+      const candidate = `board-${i}`
+      if (!used.has(candidate)) return candidate
+    }
+  }
+
   return (
     <>
       <Excalidraw
@@ -456,6 +614,35 @@ export default function App() {
         langCode="zh-CN"
         renderTopRightUI={() => (
           <div className="sl-status">
+            <select
+              className="sl-board-select"
+              aria-label="切换画板"
+              title="切换当前画板"
+              value={boardInfo.board}
+              onChange={(e) => void handleSwitchBoard(e.target.value)}
+            >
+              {boards.some((b) => b.board === boardInfo.board) ? null : (
+                <option value={boardInfo.board}>{boardInfo.title || boardInfo.board}</option>
+              )}
+              {boards.map((b) => (
+                <option key={b.board} value={b.board}>
+                  {b.title ? `${b.title} (${b.board})` : b.board}
+                </option>
+              ))}
+            </select>
+            <button onClick={() => setCreating(true)} title="新建一块空白画板">
+              + 新建画板
+            </button>
+            <button onClick={() => setRenaming(true)} title="重命名当前画板">
+              重命名
+            </button>
+            <button
+              onClick={() => setConfirmDelete(true)}
+              disabled={boards.length <= 1}
+              title={boards.length <= 1 ? '至少保留一块画板' : '删除当前画板'}
+            >
+              删除
+            </button>
             <StatusText status={status} />
             <button onClick={() => void save()} title="立即把当前画布写入文件">
               立即保存
@@ -469,6 +656,36 @@ export default function App() {
           </div>
         )}
       />
+      {creating ? (
+        <BoardNameModal
+          modeTitle="新建画板"
+          submitLabel="创建"
+          busyLabel="创建中…"
+          defaultName={nextBoardName()}
+          onSubmit={handleCreateBoard}
+          onClose={() => setCreating(false)}
+        />
+      ) : null}
+      {renaming ? (
+        <BoardNameModal
+          modeTitle="重命名画板"
+          submitLabel="保存"
+          busyLabel="保存中…"
+          defaultName={boardInfo.title ?? boardInfo.board}
+          onSubmit={handleRenameBoard}
+          onClose={() => setRenaming(false)}
+        />
+      ) : null}
+      {confirmDelete ? (
+        <ConfirmModal
+          title="删除画板"
+          message={`确定要删除画板「${boardInfo.title ? `${boardInfo.title} (${boardInfo.board})` : boardInfo.board}」吗？文件会从磁盘移除，无法恢复。`}
+          confirmLabel="确认删除"
+          busyLabel="删除中…"
+          onConfirm={handleDeleteBoard}
+          onClose={() => setConfirmDelete(false)}
+        />
+      ) : null}
       {request && request.kind === 'proposal' && request.proposalId ? (
         <Banner
           key={request.id}
@@ -515,6 +732,109 @@ export default function App() {
         </div>
       ) : null}
     </>
+  )
+}
+
+function BoardNameModal(props: {
+  modeTitle: string
+  submitLabel: string
+  busyLabel: string
+  defaultName: string
+  onSubmit: (name: string) => Promise<void>
+  onClose: () => void
+}) {
+  const [name, setName] = useState(props.defaultName)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submit = async () => {
+    if (!name.trim()) {
+      setError('画板名称不能为空')
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      await props.onSubmit(name)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setBusy(false)
+    }
+  }
+  return (
+    <div className="sl-modal-backdrop" onClick={() => !busy && props.onClose()}>
+      <div className="sl-modal" role="dialog" aria-label={props.modeTitle} onClick={(e) => e.stopPropagation()}>
+        <div className="sl-modal-title">{props.modeTitle}</div>
+        <input
+          autoFocus
+          value={name}
+          placeholder="例如：login-flow 或 登录流程"
+          onFocus={(e) => e.target.select()}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => {
+            e.stopPropagation()
+            if (e.key === 'Enter' && !busy) void submit()
+            if (e.key === 'Escape' && !busy) props.onClose()
+          }}
+        />
+        {error ? <div className="sl-error">{error}</div> : null}
+        <div className="sl-modal-actions">
+          <button onClick={props.onClose} disabled={busy}>
+            取消
+          </button>
+          <button className="sl-primary" onClick={() => void submit()} disabled={busy}>
+            {busy ? props.busyLabel : props.submitLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ConfirmModal(props: {
+  title: string
+  message: string
+  confirmLabel: string
+  busyLabel: string
+  onConfirm: () => Promise<void>
+  onClose: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const confirm = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      await props.onConfirm()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setBusy(false)
+    }
+  }
+  return (
+    <div className="sl-modal-backdrop" onClick={() => !busy && props.onClose()}>
+      <div
+        className="sl-modal"
+        role="dialog"
+        aria-label={props.title}
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          e.stopPropagation()
+          if (e.key === 'Escape' && !busy) props.onClose()
+        }}
+      >
+        <div className="sl-modal-title">{props.title}</div>
+        <div>{props.message}</div>
+        {error ? <div className="sl-error">{error}</div> : null}
+        <div className="sl-modal-actions">
+          <button autoFocus onClick={props.onClose} disabled={busy}>
+            取消
+          </button>
+          <button className="sl-danger" onClick={() => void confirm()} disabled={busy}>
+            {busy ? props.busyLabel : props.confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 

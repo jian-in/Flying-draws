@@ -1,7 +1,7 @@
 # 接手文档
 
 > 新会话动手前先读这份，再按需看 [design.md](design.md)。
-> 最后更新：2026-11-15，M1 完成后。
+> 最后更新：2026-11-15，画板重命名/删除与收件箱持久化迭代后。
 
 ## 一句话
 
@@ -13,10 +13,12 @@ Sketchlink（暂定名）：本地桌面画布（Electron + Excalidraw），通�
 |---|---|---|
 | M0 技术验证 | ✅ | `94a9fe9` |
 | M1「画给 agent 看」 | ✅ 代码完成，单元测试和端到端测试通过；用户已在真实画布上手写字、经 MCP 读到并靠截图认出 | `6ee92fc` |
-| M2-a 写入通路 | ✅ `canvas_draw` 纯新增（节点、连线、文字），单元测试和隔离画板上的端到端测试通过；还没在真实 agent 会话里用过 | 见 git log |
-| M2-b 自动排版 | ✅ 新节点用 dagre 排版，可选从左到右或从上到下；箭头按图形轮廓起止，跨层连线会绕开节点。测试情况同上 | 见 git log |
-| M2-c 提议层 | ✅ `canvas_propose`：agent 画的提议是蓝色虚线半透明，用户点接受或拒绝，结果经 `canvas_wait` 回到 agent。测试情况同上，端到端测试里用 DevTools 扮演用户点了按钮 | 见 git log |
-| M2-d diff 和并发 | ✅ 用户改了提议的 diff、待处理请求重启后恢复、按元素判断冲突、agent 改字和删除自己画的东西。测试情况同上。到这里 M2 的代码做完了，**还没在真实 agent 会话里验收过** | 见 git log |
+| M2-a 写入通路 | ✅ `canvas_draw` 纯新增（节点、连线、文字），单元测试和隔离画板上的端到端测试通过；已在真实 Antigravity 会话中演示手写识别 | 见 git log |
+| M2-b 自动排版 | ✅ 新节点用 dagre 排版，可选从左到右或从上到下；箭头按图形轮廓起止，跨层连线会绕开节点 | 见 git log |
+| M2-c 提议层 | ✅ `canvas_propose`：agent 画的提议是蓝色虚线半透明，用户点接受或拒绝，结果经 `canvas_wait` 回到 agent；已在真实 Antigravity 会话中走通接受流程 | 见 git log |
+| M2-d diff 和并发 | ✅ 用户改了提议的 diff、待处理请求重启后恢复、按元素判断冲突、agent 改字和删除自己画的东西 | 见 git log |
+| 多画板新建与切换（M4 提前引入） | ✅ 页面右上角支持切换画板和「+ 新建画板」，MCP 新增 `canvas_list`、`canvas_open(board?, title?)` 及各读写工具可选 `board` 参数 | 见 git log / 待提交 |
+| 画板重命名/删除与收件箱持久化 | ✅ 页面支持「重命名」「删除」（至少保留一块，非切换操作走 `syncBoards` 保留撤销栈）；MCP 新增 `canvas_rename`、`canvas_delete`；未取走的「发给 agent」收件箱随 `pending.json` 持久化并在重启后恢复 | 待提交 |
 
 - 远程：GitHub 仓库 `jian-in/Freedom-draw`，本地 `master` 跟踪 `origin/master`。
 - 项目名还是暂定，发布前要查 GitHub / npm 重名。
@@ -52,17 +54,19 @@ npm run e2e:draw     # 自己拉起一个隔离实例，画板在 out/e2e-home�
 ## 代码地图
 
 ```
-src/main/index.ts      主进程入口：窗口、画板读写和版本号、给页面的 RPC、本地服务的路由
+src/main/index.ts      主进程入口：窗口、多画板会话切换/重命名/删除/版本号、给页面的 RPC、本地服务的路由
+src/main/boards.ts     画板标识校验、文件名映射、标题归一化/更新、回退画板选择、空画板模板与元数据解析（纯函数）
 src/main/semantic.ts   语义层（纯函数，不依赖 Electron）：buildGraph() 出结构，summarize() 出中文描述
 src/main/ops.ts        绘图指令 → 绘图计划（纯函数）：校验 ops、解析节点引用、定好每个新元素的 id、位置和大小
 src/main/diff.ts       提议的底稿和改动对比（纯函数）：用户在提议上改了什么
 src/main/daemon.ts     本地 HTTP 服务：127.0.0.1 随机端口 + token，信息写 ~/.sketchlink/daemon.json
-src/main/requests.ts   请求队列：agent 请求作画、用户发送/取消、长轮询等待、主动发送的收件箱
-src/preload/index.ts   页面能调用的全部接口
-src/renderer/src/App.tsx  画布、状态栏、请求横幅、"发给 agent"、响应主进程 RPC（snapshot 取场景和 PNG）
-src/bridge/index.ts    MCP 桥接（stdio）：4 个工具，转发给本地服务；应用没开时自动拉起
-test/semantic.test.ts  语义层测试；test/fixtures/flow.excalidraw 是测试用画板
-scripts/e2e.mjs        端到端测试
+src/main/requests.ts   请求队列：agent 请求作画、用户发送/取消、长轮询等待、主动发送的收件箱（含重启恢复与批量清理）
+src/preload/index.ts   页面能调用的全部接口（含画板新建/切换/重命名/删除/列表，以及可清理的监听器）
+src/renderer/src/App.tsx  画布、状态栏（含画板下拉切换、「+ 新建画板」「重命名」「删除」弹窗）、请求横幅、"发给 agent"、响应主进程 RPC（snapshot / applyPlan / loadScene / syncBoards）
+src/bridge/index.ts    MCP 桥接（stdio）：9 个工具，转发给本地服务；应用没开时自动拉起
+test/                  单元测试（boards / diff / ops / requests / semantic）；test/fixtures/flow.excalidraw 是测试用画板
+scripts/e2e.mjs        M1 端到端测试（注意其工具列表断言仍停在 M1 的 4 个工具）
+scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 ```
 
 读的数据流：agent → 桥接（stdio MCP）→ 本地服务（HTTP）→ 主进程 →（RPC）→ 页面取快照 → 主进程算语义 → 原路返回。
@@ -73,11 +77,17 @@ scripts/e2e.mjs        端到端测试
 
 用户改了什么（`src/main/diff.ts`，纯函数）：提议画上去时 `captureBaseline()` 记一份底稿，存在请求上；用户接受时 `diffProposal()` 拿当时的画布和底稿比，输出几句中文（改了文字、挪了位置、删了什么、自己加了什么），放在 `canvas_wait` 结果的 `changes` 里。挪动不到 24px、大小变化不到 25% 的不报。
 
-待处理的请求会存盘：每次请求有增减就同步写 `~/.sketchlink/pending.json`（连同提议的底稿），应用启动时读回来，编号不变，所以 agent 手里的 `request_id` 重启后还能用，确认横幅也会重新出现。提议对应的元素要是已经不在画板上了，这个提议就不恢复。
+待处理的请求和未取走的收件箱会存盘：每次请求或收件箱有增减就原子写 `~/.sketchlink/pending.json`（v2 格式 `{ version: 2, boards: { [boardId]: waiting[] }, inbox?: { [boardId]: Submission[] } }`，兼容旧版 `{ board, requests }`），应用启动时按画板读回来——等待中请求的编号不变（`request_id` 重启后还能用、确认横幅会重新出现），用户之前"发给 agent"但尚未被取走的收件箱内容与等待条也会一并恢复，直到被 `canvas_read` 或不带 `request_id` 的 `canvas_wait` 取走后清空。提议对应的元素要是已经不在对应画板上了（比如用户手动删光了），这个提议就不恢复。
+
+多画板状态管理（`src/main/boards.ts` + `src/main/index.ts`）：
+- 每块画板对应 `~/.sketchlink/boards/<id>.excalidraw`，标题（可选）保存在 `scene.sketchlink.title`。当前激活的画板 ID 记在 `~/.sketchlink/state.json`，重启后自动恢复；没有 `state.json` 时默认 `default`。
+- 每个画板在主进程有独立的 `BoardSession`（`version`、`history`、`RequestHub`），`requestBoard` 映射记录 `request_id → boardId`，切画板不会把别的画板的待处理横幅串过来。
+- 页面右上角提供画板下拉框切换、「+ 新建画板」、「重命名」和「删除」（仅剩最后一块画板时禁用删除）；切换或删除当前画板前会自动把当前场景落盘，页面通过 `resetScene()` + `addFiles()` + `updateScene()` + `history.clear()` 载入目标画板，避免跨画板撤销串台。
+- 重命名会迁移 `.excalidraw` 文件、更新 `scene.sketchlink.title`、迁移内存 `BoardSession` 与 `requestBoard` 映射，并通过 `syncBoards` RPC 同步页面标题/列表而不重置画布和撤销栈；删除会取消并清空该画板的请求和收件箱、删除磁盘文件，若删的是当前激活画板则优先回退到 `default`（否则选剩余第一块）。
 
 多个请求同时等着时按先来后到一个一个问，横幅上写着后面还有几个；轮到一个提议时视野会移到它上面，并让开顶部的横幅。
 
-冲突怎么判断（design.md 12.3）：主进程每给 agent 一份画板描述，就在内存里记下那个版本的"编号 → 元素"对照表和每个元素的指纹（`history`）。agent 带着 `base_version` 来画时：
+冲突怎么判断（design.md 12.3）：主进程每给 agent 一份画板描述，就在对应画板的内存记录里记下那个版本的"编号 → 元素"对照表和每个元素的指纹（`history`）。agent 带着 `base_version` 来画时：
 - 版本没变：直接执行。
 - 版本变了：`rebaseOps()` 把指令里的旧编号换算成同一个元素现在的编号。引用的节点被删了 → 冲突；要改动或删除的元素指纹变了（被别人动过）→ 冲突；只是连线过去、旁边加字 → 照常执行。
 - 查不到那个版本，或者没带 `base_version` 却引用了已有节点 → 冲突，让 agent 重新读。
@@ -90,12 +100,15 @@ scripts/e2e.mjs        端到端测试
 
 | 工具 | 说明 |
 |---|---|
-| `canvas_open` | 打开并前置窗口 |
-| `canvas_read` | `format: summary/graph`，`image: auto/always/never`；auto 只在有涂鸦、图片、线条时附图 |
-| `canvas_request` | 弹出请求横幅，立即返回 `request_id` |
-| `canvas_wait` | 最多等 45 秒；带 `request_id` 等那个请求，不带就等用户主动"发给 agent" |
-| `canvas_propose` | 参数同 `canvas_draw`，另加 `question`。画在提议层上并弹出确认横幅，立即返回 `request_id`；用 `canvas_wait` 等结果，`decision` 是 `accepted` 或 `rejected` |
-| `canvas_draw` | `ops`（`add_node` / `add_edge` / `add_text`）整批生效或整批不生效。另有 `update_node` / `delete_node` / `update_edge` / `delete_edge`，只能用在 agent 自己画的、已在正式层上的元素上。`direction: right/down` 定排版方向。引用已有节点（N1 这类编号）时必须带 `base_version`；冲突时返回原因和当前画板 |
+| `canvas_open` | 打开并前置窗口；可选 `board` 和 `title`，`board` 不存在时自动创建空白画板并切换过去 |
+| `canvas_list` | 列出 `~/.sketchlink/boards/` 下的所有画板（含当前激活标记、标题、版本号、元素数） |
+| `canvas_rename` | 重命名指定（或当前）画板，并可选设置/清空显示标题（`title: null` 清空），保留当前会话和撤销历史 |
+| `canvas_delete` | 删除指定（或当前）画板及其 `.excalidraw` 文件（不能删最后一块）；若删除当前画板会自动切换到剩余画板 |
+| `canvas_read` | 可选 `board`；`format: summary/graph`，`image: auto/always/never`；auto 只在有涂鸦、图片、线条时附图 |
+| `canvas_request` | 可选 `board`；弹出请求横幅，立即返回 `request_id` |
+| `canvas_wait` | 最多等 45 秒；带 `request_id` 等那个请求（自动路由到对应画板），不带就等当前或指定 `board` 上用户主动"发给 agent" |
+| `canvas_propose` | 可选 `board`；参数同 `canvas_draw`，另加 `question`。画在提议层上并弹出确认横幅，立即返回 `request_id`；用 `canvas_wait` 等结果，`decision` 是 `accepted` 或 `rejected` |
+| `canvas_draw` | 可选 `board`；`ops`（`add_node` / `add_edge` / `add_text`）整批生效或整批不生效。另有 `update_node` / `delete_node` / `update_edge` / `delete_edge`，只能用在 agent 自己画的、已在正式层上的元素上。`direction: right/down` 定排版方向。引用已有节点（N1 这类编号）时必须带 `base_version`；冲突时返回原因和当前画板 |
 
 工具描述是英文（给各种 agent 用），返回的画板描述是中文。国际化还没做。
 
@@ -144,8 +157,8 @@ scripts/e2e.mjs        端到端测试
 - M2 的代码到这里做完了。下一步是在真实 agent 会话里走一遍主演示（画草图 → agent 读 → agent 提议 → 用户改一笔接受 → agent 知道改了哪里），再决定 M3 做什么
 
 **其他待定**
-- 用户主动"发给 agent"但还没被 agent 取走的画（收件箱）只在内存里，应用重启后会丢。等待中的请求已经会存盘了
-- **画布没法主动叫醒 agent**（MCP 是 agent 来问工具）。用户点了"发给 agent"而 agent 没在等时，画只能放在收件箱里，要用户在聊天里说一声。画布上现在会明说这一点：发送前提示"要在聊天里说一声"，发出后显示"已发出，agent 还没来取"，被取走时提示"agent 已经取走你的画"。`canvas_read` 和不带 `request_id` 的 `canvas_wait` 都会取走收件箱里的画和附言。想真正做到"发了就到"，得用 MCP 的资源订阅通知（design.md 第 7 节末尾），而且客户端要支持
+- **画布没法主动叫醒 agent**（MCP 是 agent 来问工具）。用户点了"发给 agent"而 agent 没在等时，画只能放在收件箱里（现已持久化到 `pending.json`，重启不丢失），要用户在聊天里说一声。画布上现在会明说这一点：发送前提示"要在聊天里说一声"，发出后显示"已发出，agent 还没来取"，被取走时提示"agent 已经取走你的画"。`canvas_read` 和不带 `request_id` 的 `canvas_wait` 都会取走收件箱里的画和附言。想真正做到"发了就到"，得用 MCP 的资源订阅通知（design.md 第 7 节末尾），而且客户端要支持
 - 桥接靠 `require('electron')` 找可执行文件，Electron 现在是 devDependency；做成可分发的 npm 包时要重新设计启动方式
-- 只有一块画板 `default`，多画板还没做
+- **多画板当前限制**：目前仍是单窗口渲染，agent 在 `canvas_read`/`draw`/`propose`/`request` 传入非当前 `board` 时会把窗口切换到该画板（且要求该画板已存在，新画板需先通过 `canvas_open` 或界面创建）；支持重命名与删除，但重命名非当前激活画板后窗口不会切过去
+- **升级提示**：如果本机之前已经开着旧版 Sketchlink 窗口，重新 `npm run build` 后需要重启一次画布应用窗口（或在宿主里重连 MCP），新加的工具和接口才会生效
 - 摘要只有中文

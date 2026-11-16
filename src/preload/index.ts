@@ -3,12 +3,21 @@ import { contextBridge, ipcRenderer } from 'electron'
 // 渲染进程只能通过这几个函数和主进程打交道，拿不到完整的 Node 能力
 contextBridge.exposeInMainWorld('sketchlink', {
   loadBoard: () => ipcRenderer.invoke('board:load'),
+  listBoards: () => ipcRenderer.invoke('board:list'),
   saveBoard: (json: string) => ipcRenderer.invoke('board:save', json),
+  createBoard: (payload: { name: string; title?: string; currentSceneJson?: string }) =>
+    ipcRenderer.invoke('board:create', payload),
+  switchBoard: (payload: { board: string; currentSceneJson?: string }) => ipcRenderer.invoke('board:switch', payload),
+  renameBoard: (payload: { board?: string; name: string; title?: string | null; currentSceneJson?: string }) =>
+    ipcRenderer.invoke('board:rename', payload),
+  deleteBoard: (payload: { board: string; currentSceneJson?: string }) => ipcRenderer.invoke('board:delete', payload),
   revealBoard: () => ipcRenderer.invoke('board:reveal'),
 
   getHubState: () => ipcRenderer.invoke('hub:state'),
   onHubState: (fn: (state: unknown) => void) => {
-    ipcRenderer.on('hub:state', (_e, state) => fn(state))
+    const listener = (_e: Electron.IpcRendererEvent, state: unknown) => fn(state)
+    ipcRenderer.on('hub:state', listener)
+    return () => ipcRenderer.removeListener('hub:state', listener)
   },
   submit: (payload: {
     requestId: string | null
@@ -16,13 +25,14 @@ contextBridge.exposeInMainWorld('sketchlink', {
     sceneJson: string
     pngBase64: string | null
     decision?: 'accepted' | 'rejected' | null
-  }) =>
-    ipcRenderer.invoke('hub:submit', payload),
+  }) => ipcRenderer.invoke('hub:submit', payload),
   cancel: (requestId: string) => ipcRenderer.invoke('hub:cancel', requestId),
 
   // 主进程发起的调用：页面处理完用 rpcReply 回复
   onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => {
-    ipcRenderer.on('rpc', (_e, msg) => fn(msg))
+    const listener = (_e: Electron.IpcRendererEvent, msg: { id: number; method: string; params: unknown }) => fn(msg)
+    ipcRenderer.on('rpc', listener)
+    return () => ipcRenderer.removeListener('rpc', listener)
   },
   rpcReply: (id: number, result: unknown, error?: string) => ipcRenderer.send('rpc:reply', { id, result, error }),
   ready: () => ipcRenderer.send('renderer:ready'),

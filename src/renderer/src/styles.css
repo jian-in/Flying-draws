@@ -15,7 +15,9 @@ body,
 }
 
 .sl-status button,
-.sl-banner button {
+.sl-status select,
+.sl-banner button,
+.sl-modal button {
   font-size: 12px;
   padding: 4px 8px;
   border-radius: 6px;
@@ -25,16 +27,72 @@ body,
   cursor: pointer;
 }
 
+.sl-board-select {
+  max-width: 160px;
+}
+
 .sl-status button.sl-primary,
-.sl-banner button.sl-primary {
+.sl-banner button.sl-primary,
+.sl-modal button.sl-primary {
   background: var(--color-primary, #6965db);
   border-color: var(--color-primary, #6965db);
   color: #fff;
 }
 
-.sl-banner button:disabled {
+.sl-modal button.sl-danger {
+  background: #c92a2a;
+  border-color: #c92a2a;
+  color: #fff;
+}
+
+.sl-status button:disabled,
+.sl-banner button:disabled,
+.sl-modal button:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+.sl-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: rgba(0, 0, 0, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sl-modal {
+  width: min(380px, calc(100vw - 32px));
+  box-sizing: border-box;
+  padding: 16px;
+  border-radius: 12px;
+  background: var(--island-bg-color, #fff);
+  border: 1px solid var(--default-border-color, #ddd);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  font-size: 13px;
+  color: #222;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sl-modal-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.sl-modal input {
+  font-size: 13px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid #ccc;
+}
+
+.sl-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .sl-error {
