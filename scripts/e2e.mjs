@@ -82,7 +82,9 @@ const call = (name, args = {}) => client.callTool({ name, arguments: args }, und
 const textOf = (res) => res.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n')
 
 const tools = (await client.listTools()).tools.map((t) => t.name).sort()
-check(JSON.stringify(tools) === JSON.stringify(['canvas_open', 'canvas_read', 'canvas_request', 'canvas_wait']), `工具列表：${tools.join(', ')}`)
+// 只断言 M1 的这四个工具在（后续里程碑还会加），和 e2e-draw.mjs 一样用子集判断
+const expectedTools = ['canvas_open', 'canvas_read', 'canvas_request', 'canvas_wait']
+check(expectedTools.every((n) => tools.includes(n)), `工具列表（${tools.length} 个）：${tools.join(', ')}`)
 
 const open = await call('canvas_open')
 check(!open.isError && /is open/.test(textOf(open)), 'canvas_open')
