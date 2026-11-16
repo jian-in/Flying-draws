@@ -525,6 +525,7 @@ ipcMain.on('rpc:reply', (_e, msg: { id: number; result?: unknown; error?: string
 interface Snapshot {
   sceneJson: string
   pngBase64: string | null
+  view?: { x: number; y: number; w: number; h: number } | null // 用户当前看得见的那块画布
 }
 
 // ---------- 窗口 ----------
@@ -871,7 +872,7 @@ async function drawOps(
 
   let plan: DrawPlan
   try {
-    plan = planOps(ops, graph, newElementId, { direction: body.direction === 'down' ? 'down' : 'right' })
+    plan = planOps(ops, graph, newElementId, { direction: body.direction === 'down' ? 'down' : 'right', view: snap.view ?? null })
   } catch (err) {
     if (err instanceof OpsError) return fail('invalid', err.message)
     throw err
@@ -1274,6 +1275,17 @@ ipcMain.handle('hub:submit', async (_e, payload: SubmitPayload) => {
     if (!TEST_INSTANCE) clipboard.writeText(hint)
   }
   return { version: ver, delivered, hint }
+})
+// 收件箱里还有没被取走的画时，用户可以再要一次那句取画的话（比如剪贴板已经被别的内容盖掉了）
+ipcMain.handle('hub:hint', () => {
+  const boardId = currentBoardId
+  const session = getSession(boardId)
+  const queued = session.hub.queuedInbox()
+  const last = queued[queued.length - 1]
+  if (!last) return null
+  const hint = pickupHint({ board: boardId, title: session.title, version: last.version, to: last.to })
+  if (!TEST_INSTANCE) clipboard.writeText(hint)
+  return hint
 })
 ipcMain.handle('hub:cancel', (_e, requestId: string) => {
   const boardId = requestBoard.get(requestId) ?? currentBoardId

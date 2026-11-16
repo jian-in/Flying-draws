@@ -84,7 +84,23 @@ function unmaskElements(elements: readonly SceneEl[], hidden: HiddenMap): SceneE
 }
 
 // 从画布当前状态取一份快照：场景 JSON，以及可选的 PNG 截图
-async function snapshot(api: Api, withImage: boolean, hidden?: HiddenMap): Promise<{ sceneJson: string; pngBase64: string | null }> {
+// 用户当前看得见、又没被我们的界面挡住的那块画布（画布坐标）。agent 画新内容时优先往这里放。
+// 四边按屏幕像素让出工具栏、横幅和底部筛选栏的位置。
+const VIEW_INSET = { top: 130, right: 24, bottom: 80, left: 24 }
+function visibleArea(appState: { scrollX: number; scrollY: number; width: number; height: number; zoom: { value: number } }): ViewBox | null {
+  const z = appState.zoom?.value || 1
+  const w = (appState.width - VIEW_INSET.left - VIEW_INSET.right) / z
+  const h = (appState.height - VIEW_INSET.top - VIEW_INSET.bottom) / z
+  if (!(w > 0 && h > 0)) return null
+  return { x: -appState.scrollX + VIEW_INSET.left / z, y: -appState.scrollY + VIEW_INSET.top / z, w, h }
+}
+type ViewBox = { x: number; y: number; w: number; h: number }
+
+async function snapshot(
+  api: Api,
+  withImage: boolean,
+  hidden?: HiddenMap
+): Promise<{ sceneJson: string; pngBase64: string | null; view: ViewBox | null }> {
   const raw = api.getSceneElements()
   const elements = hidden ? unmaskElements(raw, hidden) : raw
   const appState = api.getAppState()
@@ -102,7 +118,7 @@ async function snapshot(api: Api, withImage: boolean, hidden?: HiddenMap): Promi
     })
     pngBase64 = await blobToBase64(blob)
   }
-  return { sceneJson, pngBase64 }
+  return { sceneJson, pngBase64, view: visibleArea(appState) }
 }
 
 // 画布默认是淡黄的纸色。用户自己换过背景色的画板不动，只把还是默认白底的换掉。
@@ -137,17 +153,23 @@ const BANNER_HEIGHT = 190 // 确认横幅大约占画布顶部这么高（屏幕
 // 把视野移到一批元素上，不改缩放。belowBanner 为 true 时把内容往下让一让，别被顶部的横幅挡住。
 function showElements(api: Api, elements: readonly SceneEl[], belowBanner: boolean): void {
   if (!elements.length) return
-  if (!belowBanner) {
-    api.scrollToContent(elements, { fitToContent: false, animate: true })
-    return
-  }
-  // 自己算滚动位置：把内容放在横幅下面那块区域的正中间；内容比那块区域还高时，顶部对齐到横幅下沿
   const minX = Math.min(...elements.map((el) => Math.min(el.x, el.x + el.width)))
   const maxX = Math.max(...elements.map((el) => Math.max(el.x, el.x + el.width)))
   const minY = Math.min(...elements.map((el) => Math.min(el.y, el.y + el.height)))
   const maxY = Math.max(...elements.map((el) => Math.max(el.y, el.y + el.height)))
   const s = api.getAppState()
   const zoom = s.zoom.value
+  // 新内容本来就全在用户眼前（而且没被横幅挡住）就别动视野：画面突然一跳比不动更打扰人
+  const seen = visibleArea(s)
+  if (seen) {
+    const top = belowBanner ? -s.scrollY + (BANNER_HEIGHT + 20) / zoom : seen.y
+    if (minX >= seen.x && maxX <= seen.x + seen.w && minY >= top && maxY <= seen.y + seen.h) return
+  }
+  if (!belowBanner) {
+    api.scrollToContent(elements, { fitToContent: false, animate: true })
+    return
+  }
+  // 自己算滚动位置：把内容放在横幅下面那块区域的正中间；内容比那块区域还高时，顶部对齐到横幅下沿
   const room = s.height - BANNER_HEIGHT
   const top = (maxY - minY) * zoom > room - 40 ? BANNER_HEIGHT + 20 : BANNER_HEIGHT + (room - (maxY - minY) * zoom) / 2
   api.updateScene({
@@ -604,7 +626,8 @@ export default function App() {
   // 几秒后自动消失的提示
   useEffect(() => {
     if (!toast) return
-    const t = setTimeout(() => setToast(null), 4000)
+    // 字多的提示（比如告诉用户去哪里粘贴）多留一会儿，够读完
+    const t = setTimeout(() => setToast(null), Math.min(8000, Math.max(3000, 1500 + toast.length * 150)))
     return () => clearTimeout(t)
   }, [toast])
 
@@ -940,6 +963,27 @@ export default function App() {
     }
   }, [])
 
+  // Ctrl+Shift+Enter：打开「发给 agent」；已经打开就直接发出去。
+  // agent 的请求或提议正挂着时不替用户表态，只把光标放进那个横幅的附言框。
+  const composingRef = useRef(composing)
+  composingRef.current = composing
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Enter' || !e.shiftKey || !(e.ctrlKey || e.metaKey)) return
+      e.preventDefault()
+      e.stopPropagation()
+      if (hubRef.current.pending.length) {
+        document.querySelector<HTMLInputElement>('.fd-banner-note')?.focus()
+      } else if (composingRef.current) {
+        document.querySelector<HTMLButtonElement>('.fd-banner .fd-banner-actions .fd-primary')?.click()
+      } else {
+        setComposing(true)
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
+
   // 请求按先来后到一个一个处理，横幅上写明后面还排着几个
   const request = hub.pending[0] ?? null
   const queued = Math.max(0, hub.pending.length - 1)
@@ -984,7 +1028,60 @@ export default function App() {
       {/* 自己画的标题栏：和画布一个颜色，整条可以拖动窗口 */}
       <div className="fd-titlebar">
         <span className="fd-titlebar-app">Flying draws</span>
-        <span className="fd-titlebar-board">{boardInfo.title ? `${boardInfo.title} (${boardInfo.board})` : boardInfo.board}</span>
+        {/* 画板切换、新建、「⋯」菜单和保存状态都在标题栏里，画布右上角只留「发给 agent」 */}
+        <div className="fd-status fd-titlebar-tools">
+          <select
+            className="fd-board-select"
+            aria-label="切换画板"
+            title="切换当前画板"
+            value={boardInfo.board}
+            onChange={(e) => void handleSwitchBoard(e.target.value)}
+          >
+            {boards.some((b) => b.board === boardInfo.board) ? null : (
+              <option value={boardInfo.board}>{boardInfo.title || boardInfo.board}</option>
+            )}
+            {boards.map((b) => (
+              <option key={b.board} value={b.board}>
+                {b.title ? `${b.title} (${b.board})` : b.board}
+              </option>
+            ))}
+          </select>
+          <button
+            className="fd-icon fd-new-board"
+            onClick={() => setCreating(true)}
+            aria-label="新建画板"
+            title="新建一块空白画板"
+          >
+            +
+          </button>
+          <MoreMenu
+            items={[
+              { label: '重命名', title: '重命名当前画板', onSelect: () => setRenaming(true) },
+              { label: '立即保存', title: '立即把当前画布写入文件', onSelect: () => void save() },
+              {
+                label: '打开文件位置',
+                title: '在资源管理器中显示画板文件',
+                onSelect: () => void window.flyingdraws.revealBoard()
+              },
+              {
+                label: '重新加载',
+                title: '重新载入页面（没存盘的修改会先保存）',
+                sepBefore: true,
+                onSelect: () => void save().then(() => window.flyingdraws.reloadWindow())
+              },
+              { label: '开发者工具', title: '打开或关闭开发者工具', onSelect: () => window.flyingdraws.toggleDevTools() },
+              {
+                sepBefore: true,
+                label: '删除',
+                title: boards.length <= 1 ? '至少保留一块画板' : '删除当前画板',
+                danger: true,
+                disabled: boards.length <= 1,
+                onSelect: () => setConfirmDelete(true)
+              }
+            ]}
+          />
+          <StatusText status={status} />
+        </div>
         <div className="fd-seats" aria-label="在线 agent 席位">
           {onlineSeats.length ? (
             <>
@@ -1018,7 +1115,7 @@ export default function App() {
           )}
         </div>
       </div>
-      <div className="fd-canvas">
+      <div className={`fd-canvas${request || composing || hub.agentWaiting || hub.handoff || hub.inbox > 0 ? ' fd-has-notice' : ''}`}>
       <Excalidraw
         excalidrawAPI={setApi}
         initialData={initialData}
@@ -1026,58 +1123,7 @@ export default function App() {
         langCode="zh-CN"
         renderTopRightUI={() => (
           <div className="fd-status">
-            <select
-              className="fd-board-select"
-              aria-label="切换画板"
-              title="切换当前画板"
-              value={boardInfo.board}
-              onChange={(e) => void handleSwitchBoard(e.target.value)}
-            >
-              {boards.some((b) => b.board === boardInfo.board) ? null : (
-                <option value={boardInfo.board}>{boardInfo.title || boardInfo.board}</option>
-              )}
-              {boards.map((b) => (
-                <option key={b.board} value={b.board}>
-                  {b.title ? `${b.title} (${b.board})` : b.board}
-                </option>
-              ))}
-            </select>
-            <button
-              className="fd-icon fd-new-board"
-              onClick={() => setCreating(true)}
-              aria-label="新建画板"
-              title="新建一块空白画板"
-            >
-              +
-            </button>
-            <MoreMenu
-              items={[
-                { label: '重命名', title: '重命名当前画板', onSelect: () => setRenaming(true) },
-                { label: '立即保存', title: '立即把当前画布写入文件', onSelect: () => void save() },
-                {
-                  label: '打开文件位置',
-                  title: '在资源管理器中显示画板文件',
-                  onSelect: () => void window.flyingdraws.revealBoard()
-                },
-                {
-                  label: '重新加载',
-                  title: '重新载入页面（没存盘的修改会先保存）',
-                  sepBefore: true,
-                  onSelect: () => void save().then(() => window.flyingdraws.reloadWindow())
-                },
-                { label: '开发者工具', title: '打开或关闭开发者工具', onSelect: () => window.flyingdraws.toggleDevTools() },
-                {
-                  sepBefore: true,
-                  label: '删除',
-                  title: boards.length <= 1 ? '至少保留一块画板' : '删除当前画板',
-                  danger: true,
-                  disabled: boards.length <= 1,
-                  onSelect: () => setConfirmDelete(true)
-                }
-              ]}
-            />
-            <StatusText status={status} />
-            <button className="fd-primary" onClick={() => setComposing(true)} title="把当前画布发给 agent">
+            <button className="fd-primary" onClick={() => setComposing(true)} title="把当前画布发给 agent（Ctrl+Shift+Enter）">
               发给 agent
             </button>
           </div>
@@ -1159,6 +1205,7 @@ export default function App() {
           onSend={(note) => submit(null, note, sendTarget)}
           onCancel={() => setComposing(false)}
           cancelLabel="取消"
+          keyboard
         >
           {/* 只有一个 agent 时不用选；两个以上才问发给谁 */}
           {onlineSeats.length > 1 ? (
@@ -1195,12 +1242,20 @@ export default function App() {
       ) : hub.inbox > 0 ? (
         <div className="fd-waiting">
           已发出{hub.inbox > 1 ? ` ${hub.inbox} 份` : ''}，{hub.inboxTargets?.length ? hub.inboxTargets.join('、') : 'agent'} 还没来取。在聊天里跟它说一声「画好了」
+          <button
+            type="button"
+            className="fd-waiting-action"
+            title="把那句取画的话再复制一次，粘贴到 agent 的聊天里"
+            onClick={() => void window.flyingdraws.copyHint().then((hint) => hint && setToast('已复制，去聊天里粘贴'))}
+          >
+            复制这句话
+          </button>
         </div>
       ) : null}
       {toast ? (
-        <div className="fd-toast" role="status">
+        <button type="button" className="fd-toast" role="status" title="点一下收起" onClick={() => setToast(null)}>
           {toast}
-        </div>
+        </button>
       ) : null}
       <div className="fd-filter" role="tablist" aria-label="按作者筛选显示">
         {isDynamicSeats(seatInfo) ? (
@@ -1374,6 +1429,7 @@ function Banner(props: {
   onCancel: (note: string) => void | Promise<void>
   cancelLabel: string
   children?: ReactNode // 提示语和附言之间的额外内容，比如点选发给哪个席位
+  keyboard?: boolean // 用户自己打开的横幅：一出来就把光标放进附言框，Enter 发送、Esc 取消
 }) {
   const [note, setNote] = useState('')
   const [sending, setSending] = useState(false)
@@ -1390,19 +1446,32 @@ function Banner(props: {
   }
   const send = () => run(props.onSend)
   return (
-    <div className="fd-banner" role="dialog" aria-label={props.title}>
+    <div
+      className="fd-banner"
+      role="dialog"
+      aria-label={props.title}
+      onKeyDown={(e) => {
+        if (props.keyboard && e.key === 'Escape' && !sending) {
+          e.stopPropagation()
+          void run(props.onCancel)
+        }
+      }}
+    >
       <div className="fd-banner-title">{props.title}</div>
       <div className="fd-banner-prompt">{props.prompt}</div>
       {props.queued ? <div className="fd-banner-queued">处理完这个，后面还有 {props.queued} 个请求</div> : null}
       {props.children}
       <input
         className="fd-banner-note"
-        placeholder="想补充一句话吗？（可不填）"
+        placeholder={props.keyboard ? '想补充一句话吗？（可不填，Enter 发送，Esc 取消）' : '想补充一句话吗？（可不填）'}
+        autoFocus={props.keyboard}
         value={note}
         onChange={(e) => setNote(e.target.value)}
         onKeyDown={(e) => {
           e.stopPropagation() // 别让 Excalidraw 把输入当成快捷键
           if (e.key === 'Enter' && !sending) void send()
+          // 上面拦住了冒泡，横幅外层收不到这次按键，Esc 要在这里自己处理
+          else if (e.key === 'Escape' && props.keyboard && !sending) void run(props.onCancel)
         }}
       />
       {error ? <div className="fd-error">{error}</div> : null}

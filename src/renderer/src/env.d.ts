@@ -70,6 +70,7 @@ declare global {
         to?: string | null
       }) => Promise<{ version: number; delivered: boolean; hint: string | null }>
       cancel: (requestId: string) => Promise<boolean>
+      copyHint: () => Promise<string | null>
       onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => () => void
       rpcReply: (id: number, result: unknown, error?: string) => void
       ready: () => void

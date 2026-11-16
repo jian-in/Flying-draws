@@ -782,6 +782,33 @@ try {
   await call('canvas_delete', { board: 'collab' })
   await sleep(300)
 
+  // 手感：画板工具在标题栏里，画布右上角只留「发给 agent」；键盘就能发送
+  const layout = await user3.js(`({
+    inTitlebar: Boolean(document.querySelector('.fd-titlebar .fd-board-select') && document.querySelector('.fd-titlebar .fd-more') && document.querySelector('.fd-titlebar .fd-save')),
+    onCanvas: [...document.querySelectorAll('.fd-canvas .fd-status button')].map((b) => b.textContent.trim())
+  })`)
+  check(layout.inTitlebar && layout.onCanvas.length === 1 && layout.onCanvas[0] === '发给 agent', '画板切换、「⋯」菜单和保存状态在标题栏里，画布右上角只剩「发给 agent」')
+  const pressSend = () => user3.js(`void window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }))`)
+  const bannerOpen = () => user3.js(`Boolean(document.querySelector('.fd-banner'))`)
+  await pressSend()
+  check(
+    (await until(bannerOpen)) && (await user3.js(`document.activeElement?.classList.contains('fd-banner-note')`)) === true,
+    'Ctrl+Shift+Enter 打开「发给 agent」横幅，光标直接在附言框里'
+  )
+  await user3.js(`void document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))`)
+  check(await until(async () => !(await bannerOpen())), '横幅里按 Esc 取消')
+  await pressSend()
+  await until(bannerOpen)
+  await pressSend()
+  check(
+    await until(async () => /已发出，agent 还没来取/.test((await user3.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)) ?? '')),
+    '横幅开着时再按一次 Ctrl+Shift+Enter 直接发出'
+  )
+  await user3.click('复制这句话')
+  check(await until(async () => /已复制，去聊天里粘贴/.test((await user3.js(`document.querySelector('.fd-toast')?.textContent ?? ''`)) ?? '')), '等待条上的「复制这句话」可以再要一次取画指令')
+  await call('canvas_read', { as: '前端', image: 'never' })
+  await sleep(300)
+
   // 界面截图：浅色和深色各一张，菜单开着
   await user3.screenshot(join(OUT, 'ui-menu.png'))
   await user3.js(`window.__flyingdrawsApi.updateScene({ appState: { theme: 'dark' } })`)

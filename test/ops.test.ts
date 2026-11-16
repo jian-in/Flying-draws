@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGraph, summarize, type SceneElement } from '../src/main/semantic.ts'
-import { estimateTextWidth, exitPoint, OpsError, planOps, rebaseOps, toProposalPlan, type DrawOp } from '../src/main/ops.ts'
+import { detourPoint, estimateTextWidth, exitPoint, OpsError, placeBlock, planOps, rebaseOps, toProposalPlan, type DrawOp } from '../src/main/ops.ts'
 
 const ids = () => {
   let n = 0
@@ -493,4 +493,101 @@ test('toProposalPlan 把改动和删除转为标记框与 pending，新增保持
 
   const pureAdd = planOps([{ op: 'add_node', id: 'only', label: '纯新增' }], g, ids())
   assert.equal(toProposalPlan(pureAdd, { box: () => null, name: () => '' }, ids()).pending, null)
+})
+
+// ---------- 找空位落笔 ----------
+
+const box = (x: number, y: number, w: number, h: number) => ({ x, y, w, h })
+
+test('placeBlock：连着已有节点时紧挨着放，横排先试右边、竖排先试下面', () => {
+  const anchor = box(0, 0, 100, 60)
+  const far = box(0, 2000, 100, 60) // 画布很远的地方还有内容，不该把新的一块甩到它下面去
+  const size = { w: 200, h: 80 }
+  const right = placeBlock(size, [anchor, far], { anchors: [anchor], direction: 'right', fallback: [0, 9999] })
+  assert.deepEqual(right, [200, -10], '右边：隔开一段，上下居中对齐')
+  const below = placeBlock(size, [anchor, far], { anchors: [anchor], direction: 'down', fallback: [0, 9999] })
+  assert.deepEqual(below, [-50, 160], '下面：隔开一段，左右居中对齐')
+})
+
+test('placeBlock：顺着方向的那一侧被占了就换另一侧；两侧都被占就从正下方往下找第一处空位', () => {
+  const anchor = box(0, 0, 100, 60)
+  const onRight = box(300, 0, 100, 60)
+  const size = { w: 200, h: 80 }
+  const turned = placeBlock(size, [anchor, onRight], { anchors: [anchor], direction: 'right', fallback: [0, 9999] })
+  assert.deepEqual(turned, [-50, 160], '右边有东西，改放下面')
+
+  const under = box(-50, 150, 200, 100)
+  const [x, y] = placeBlock(size, [anchor, onRight, under], { anchors: [anchor], direction: 'right', fallback: [0, 9999] })
+  assert.equal(x, -50)
+  assert.ok(y >= under.y + under.h + 30 && y < 600, '挨着挡路的东西往下放，不是甩到画布最底下')
+  for (const o of [anchor, onRight, under]) assert.equal(overlap({ x, y, ...size }, o), false)
+})
+
+test('placeBlock：不连已有节点时放进用户视野里的空位；视野里放不下就放在这一竖条内容的下面', () => {
+  const view = box(1000, 1000, 800, 500)
+  const size = { w: 300, h: 100 }
+  assert.deepEqual(placeBlock(size, [], { view, fallback: [0, 9999] }), [1000, 1000], '视野是空的：放在左上角')
+
+  const inView = box(1000, 1000, 400, 200)
+  const [x, y] = placeBlock(size, [inView], { view, fallback: [0, 9999] })
+  assert.equal(overlap({ x, y, ...size }, inView), false)
+  assert.ok(x >= view.x && x + size.w <= view.x + view.w && y >= view.y && y + size.h <= view.y + view.h, '还在视野里')
+
+  const full = box(900, 900, 1000, 700) // 整个视野都被占满
+  assert.deepEqual(placeBlock(size, [full], { view, fallback: [0, 9999] }), [1000, 1700])
+  assert.deepEqual(placeBlock(size, [full], { fallback: [7, 9999] }), [7, 9999], '不知道视野时用调用方给的老位置')
+})
+
+test('planOps：连到已有节点的新节点落在它旁边的空位，而不是所有内容的最下方', () => {
+  // N1、N2 在上面一行；很远的下方还有一个用户画的框
+  const scene: SceneElement[] = [...existing, { id: 'rc', type: 'rectangle', x: 0, y: 3000, width: 100, height: 60 }]
+  const graph = buildGraph(scene)
+  const n2 = graph.nodes.find((n) => n.ref === 'rb')!
+  const plan = planOps(
+    [
+      { op: 'add_node', id: 'next', label: '下一步' },
+      { op: 'add_edge', from: n2.id, to: 'next' }
+    ],
+    graph,
+    ids()
+  )
+  const next = plan.nodes[0]
+  assert.ok(next.x >= 400 + 60 && next.x < 800, '在 N2 右边不远处')
+  assert.ok(next.y < 300, '没有被甩到 y=3000 那个框的下面')
+  for (const n of graph.nodes) assert.equal(overlap(next, n.bbox), false)
+})
+
+// ---------- 连线绕开障碍 ----------
+
+test('detourPoint：直线不压东西时不加拐点；压到时在旁边加一个拐点，两段线都绕开', () => {
+  const a: [number, number] = [0, 0]
+  const b: [number, number] = [600, 0]
+  assert.equal(detourPoint(a, b, [box(250, 200, 100, 60)]), null)
+
+  const wall = box(250, -30, 100, 60)
+  const via = detourPoint(a, b, [wall])
+  assert.ok(via, '加了拐点')
+  assert.ok(Math.abs(via![0] - 300) < 1, '拐点在两端的中线上')
+  assert.ok(via![1] > wall.y + wall.h || via![1] < wall.y, '拐点在障碍的上面或下面')
+
+  // 圈着端点的大框、端点自己的框不算障碍
+  assert.equal(detourPoint(a, b, [box(-50, -50, 100, 100), box(550, -50, 100, 100), box(-100, -100, 800, 200)]), null)
+})
+
+test('planOps：两个已有节点之间隔着别的节点时，新连线带一个拐点绕过去', () => {
+  const scene: SceneElement[] = [
+    { id: 'ra', type: 'rectangle', x: 0, y: 0, width: 100, height: 60 },
+    { id: 'rm', type: 'rectangle', x: 300, y: 0, width: 100, height: 60 },
+    { id: 'rb', type: 'rectangle', x: 600, y: 0, width: 100, height: 60 }
+  ]
+  const graph = buildGraph(scene)
+  const id = (ref: string) => graph.nodes.find((n) => n.ref === ref)!.id
+  const plan = planOps([{ op: 'add_edge', from: id('ra'), to: id('rb') }], graph, ids())
+  const e = plan.edges[0]
+  assert.equal(e.points.length, 3, '起点、拐点、终点')
+  const midY = e.y + e.points[1][1]
+  assert.ok(midY > 60 + 10 || midY < -10, '拐点在中间那个节点的上方或下方')
+
+  const direct = planOps([{ op: 'add_edge', from: id('ra'), to: id('rm') }], graph, ids())
+  assert.equal(direct.edges[0].points.length, 2, '相邻的两个节点之间还是直线')
 })

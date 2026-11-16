@@ -206,6 +206,121 @@ function nodeSize(shape: NodeShape, label: string | null): { w: number; h: numbe
 type Box = ShapeBox
 export { exitPoint }
 
+// ---------- 给新画的一块找落笔的位置 ----------
+
+const PLACE_MARGIN = 30 // 新的一块和已有内容之间至少留这么宽
+const PLACE_STEP = 40
+
+const overlaps = (a: Bbox, b: Bbox, margin = 0): boolean =>
+  a.x < b.x + b.w + margin && a.x + a.w + margin > b.x && a.y < b.y + b.h + margin && a.y + a.h + margin > b.y
+
+// 新的一块放哪儿，返回它的左上角。
+// - 连着已有节点：紧挨着那些节点放。先试顺着排版方向的那一侧（横排试右边，竖排试下面），被占了试另一侧，
+//   两侧都被占就从正下方一路往下找到第一处空位——不再一律甩到整张画布的最底下。
+// - 不连已有节点：知道用户当前的视野时，放进视野里第一处放得下的空位；
+//   视野里放不下，就放在视野这一竖条里已有内容的下面。不知道视野时退回老办法：所有内容的最下方。
+export function placeBlock(
+  size: { w: number; h: number },
+  obstacles: readonly Bbox[],
+  opts: { anchors?: readonly Bbox[]; direction?: Direction; view?: Bbox | null; fallback: [number, number] }
+): [number, number] {
+  const free = (r: Bbox): boolean => !obstacles.some((o) => overlaps(r, o, PLACE_MARGIN))
+  const anchors = opts.anchors ?? []
+  if (anchors.length) {
+    const x0 = Math.min(...anchors.map((a) => a.x))
+    const y0 = Math.min(...anchors.map((a) => a.y))
+    const x1 = Math.max(...anchors.map((a) => a.x + a.w))
+    const y1 = Math.max(...anchors.map((a) => a.y + a.h))
+    // 中线按各个节点中心的平均算，和原来「对齐到这些节点正下方」的算法一致
+    const cx = anchors.reduce((sum, a) => sum + a.x + a.w / 2, 0) / anchors.length
+    const cy = anchors.reduce((sum, a) => sum + a.y + a.h / 2, 0) / anchors.length
+    const reach = BLOCK_GAP - PLACE_MARGIN - 1 // 检查空位时把到节点之间的那段过道也算上，免得连线从别的东西上压过去
+    const below = { x: cx - size.w / 2, y: y1 + BLOCK_GAP, w: size.w, h: size.h }
+    const right = { x: x1 + BLOCK_GAP, y: cy - size.h / 2, w: size.w, h: size.h }
+    const belowFree = free({ ...below, y: below.y - reach, h: below.h + reach })
+    const rightFree = free({ ...right, x: right.x - reach, w: right.w + reach })
+    const order = opts.direction === 'down' ? (['below', 'right'] as const) : (['right', 'below'] as const)
+    for (const side of order) {
+      if (side === 'below' && belowFree) return [below.x, below.y]
+      if (side === 'right' && rightFree) return [right.x, right.y]
+    }
+    for (let i = 1; i <= 400; i++) {
+      const y = below.y + i * PLACE_STEP
+      if (free({ ...below, y })) return [below.x, y]
+    }
+    return opts.fallback
+  }
+
+  const view = opts.view
+  if (view && view.w > 0 && view.h > 0) {
+    if (size.w <= view.w && size.h <= view.h) {
+      for (let y = view.y; y + size.h <= view.y + view.h; y += PLACE_STEP) {
+        for (let x = view.x; x + size.w <= view.x + view.w; x += PLACE_STEP) {
+          if (free({ x, y, w: size.w, h: size.h })) return [x, y]
+        }
+      }
+    }
+    const column = obstacles.filter((o) => o.x < view.x + view.w && o.x + o.w > view.x)
+    return [view.x, column.length ? Math.max(...column.map((o) => o.y + o.h)) + BLOCK_GAP : view.y]
+  }
+  return opts.fallback
+}
+
+// 线段有没有穿过一个框（Liang–Barsky）
+function segmentHits(a: [number, number], b: [number, number], box: Bbox, pad = 0): boolean {
+  const dx = b[0] - a[0]
+  const dy = b[1] - a[1]
+  let t0 = 0
+  let t1 = 1
+  const edges: [number, number][] = [
+    [-dx, a[0] - (box.x - pad)],
+    [dx, box.x + box.w + pad - a[0]],
+    [-dy, a[1] - (box.y - pad)],
+    [dy, box.y + box.h + pad - a[1]]
+  ]
+  for (const [p, q] of edges) {
+    if (p === 0) {
+      if (q < 0) return false
+      continue
+    }
+    const t = q / p
+    if (p < 0) {
+      if (t > t1) return false
+      if (t > t0) t0 = t
+    } else {
+      if (t < t0) return false
+      if (t < t1) t1 = t
+    }
+  }
+  return true
+}
+
+const DETOUR_PAD = 12
+const DETOUR_STEP = 20
+
+// 两个节点之间的直线如果会压到别的东西，给它加一个拐点绕开：在线段中点的垂直方向上，
+// 往两边由近到远地试，取第一处让两段线都不压东西的位置。绕不开就返回 null，照旧画直线。
+export function detourPoint(a: [number, number], b: [number, number], obstacles: readonly Bbox[]): [number, number] | null {
+  const inside = (p: [number, number], o: Bbox) => p[0] >= o.x && p[0] <= o.x + o.w && p[1] >= o.y && p[1] <= o.y + o.h
+  // 起点或终点落在里面的框不算障碍：那是这两个节点自己，或者圈着它们的大框
+  const others = obstacles.filter((o) => !inside(a, o) && !inside(b, o))
+  const blocked = (p: [number, number], q: [number, number]) => others.some((o) => segmentHits(p, q, o, DETOUR_PAD))
+  if (!blocked(a, b)) return null
+  const len = Math.hypot(b[0] - a[0], b[1] - a[1])
+  if (len < 1) return null
+  const nx = -(b[1] - a[1]) / len
+  const ny = (b[0] - a[0]) / len
+  const mx = (a[0] + b[0]) / 2
+  const my = (a[1] + b[1]) / 2
+  for (let d = DETOUR_STEP * 2; d <= 800; d += DETOUR_STEP) {
+    for (const sign of [1, -1]) {
+      const p: [number, number] = [mx + nx * d * sign, my + ny * d * sign]
+      if (!blocked(a, p) && !blocked(p, b)) return p
+    }
+  }
+  return null
+}
+
 function centerOf(b: Bbox): [number, number] {
   return [b.x + b.w / 2, b.y + b.h / 2]
 }
@@ -256,7 +371,7 @@ export function planOps(
   ops: readonly DrawOp[],
   graph: SemanticGraph,
   newId: () => string,
-  opts: { direction?: Direction } = {}
+  opts: { direction?: Direction; view?: Bbox | null } = {} // view：用户当前看得见的那块画布（画布坐标），没有就不管视野
 ): DrawPlan {
   if (!Array.isArray(ops) || ops.length === 0) throw new OpsError('ops must be a non-empty array')
   const direction: Direction = opts.direction === 'down' ? 'down' : 'right'
@@ -511,16 +626,26 @@ export function planOps(
     }
     for (const e of g.edges()) for (const p of g.edge(e).points ?? []) grow(p.x, p.y)
 
-    // 这一块连着已有节点时，横向对齐到那些节点的正下方；否则贴着已有内容的左边
-    const anchors = edgeOps
-      .flatMap((e) => (auto.has(e.from) !== auto.has(e.to) ? [existing.get(auto.has(e.from) ? e.to : e.from)] : []))
-      .filter((n) => n !== undefined)
-    let originX = blockLeft
-    if (anchors.length) {
-      const cx = anchors.reduce((sum, n) => sum + n.bbox.x + n.bbox.w / 2, 0) / anchors.length
-      originX = cx - (maxX - minX) / 2
-    }
-    const originY = allBoxes.length ? Math.max(...allBoxes.map((b) => b.y + b.h)) + BLOCK_GAP : START[1]
+    // 这一块连着已有节点时紧挨着那些节点放，否则在用户的视野里找空位；规则见 placeBlock
+    const anchors = [
+      ...new Set(
+        edgeOps
+          .flatMap((e) => (auto.has(e.from) !== auto.has(e.to) ? [existing.get(auto.has(e.from) ? e.to : e.from)] : []))
+          .filter((n) => n !== undefined)
+      )
+    ]
+    const bottomOfAll = allBoxes.length ? Math.max(...allBoxes.map((b) => b.y + b.h)) + BLOCK_GAP : START[1]
+    // 给手工指定了坐标的新节点也留出位置
+    const pinned = nodes.filter((n) => !auto.has(n.key)).map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h }))
+    const [originX, originY] = placeBlock({ w: maxX - minX, h: maxY - minY }, [...allBoxes, ...pinned], {
+      anchors: anchors.map((n) => n.bbox),
+      direction,
+      view: opts.view ?? null,
+      fallback: [
+        anchors.length ? anchors.reduce((sum, n) => sum + n.bbox.x + n.bbox.w / 2, 0) / anchors.length - (maxX - minX) / 2 : blockLeft,
+        bottomOfAll
+      ]
+    })
     const shiftX = originX - minX
     const shiftY = originY - minY
     blockLeft = originX
@@ -552,10 +677,17 @@ export function planOps(
     const old = existing.get(key)!
     return { elementId: old.ref, box: { ...old.bbox, shape: old.kind } }
   }
+  // 连线要绕开的东西：画布上已有的，加上这一批新画的节点
+  const edgeObstacles: Bbox[] = [...allBoxes, ...nodes.map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h }))]
   const edges: PlannedEdge[] = edgeOps.map((e, i) => {
     const from = boxOf(e.from)
     const to = boxOf(e.to)
-    const mid = bends.get(i) ?? []
+    let mid = bends.get(i) ?? []
+    if (!mid.length) {
+      // 直线会压到别的东西时加一个拐点绕过去
+      const via = detourPoint(centerOf(from.box), centerOf(to.box), edgeObstacles)
+      if (via) mid = [via]
+    }
     const [sx, sy] = exitPoint(from.box, ...(mid[0] ?? centerOf(to.box)), EDGE_GAP)
     const [ex, ey] = exitPoint(to.box, ...(mid[mid.length - 1] ?? centerOf(from.box)), EDGE_GAP)
     return {

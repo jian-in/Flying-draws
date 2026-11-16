@@ -34,6 +34,7 @@ contextBridge.exposeInMainWorld('flyingdraws', {
     to?: string | null
   }) => ipcRenderer.invoke('hub:submit', payload),
   cancel: (requestId: string) => ipcRenderer.invoke('hub:cancel', requestId),
+  copyHint: () => ipcRenderer.invoke('hub:hint'),
 
   // 主进程发起的调用：页面处理完用 rpcReply 回复
   onRpc: (fn: (msg: { id: number; method: string; params: unknown }) => void) => {

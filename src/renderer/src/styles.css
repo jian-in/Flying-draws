@@ -43,6 +43,36 @@ body {
   text-overflow: ellipsis;
 }
 
+/* 标题栏里的画板工具：切换、新建、「⋯」菜单、保存状态。比画布上的按钮矮一号，而且不能拖动窗口 */
+.fd-titlebar-tools {
+  flex: none;
+  gap: 4px;
+  font-size: 12px;
+  -webkit-app-region: no-drag;
+}
+
+.fd-titlebar-tools.fd-status button,
+.fd-titlebar-tools.fd-status select {
+  height: 26px;
+  font-size: 12px;
+  border-radius: 7px;
+  box-shadow: none;
+}
+
+.fd-titlebar-tools.fd-status select.fd-board-select {
+  max-width: 220px;
+}
+
+.fd-titlebar-tools.fd-status button.fd-icon {
+  width: 26px;
+  font-size: 15px;
+}
+
+/* 顶部挂着我们自己的横幅或提示条时，Excalidraw 的操作提示先让一让，免得两行字叠在一起 */
+.fd-has-notice .excalidraw .HintViewer {
+  visibility: hidden;
+}
+
 .fd-seats {
   margin-left: auto;
   display: flex;
@@ -574,6 +604,28 @@ body {
 }
 
 /* agent 正等着的时候，蓝点慢慢呼吸 */
+.fd-waiting-action {
+  flex: none;
+  height: 24px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 12px;
+  border-radius: 999px;
+  border: 1px solid var(--fd-border);
+  background: var(--fd-surface);
+  color: var(--fd-text);
+  cursor: pointer;
+}
+
+.fd-waiting-action:hover {
+  background: var(--fd-surface-hover);
+}
+
+.fd-waiting-action:focus-visible {
+  outline: 2px solid var(--fd-primary);
+  outline-offset: 1px;
+}
+
 .fd-waiting-live::before {
   animation: fd-pulse 1.6s ease-in-out infinite;
 }
@@ -601,7 +653,11 @@ body {
   border-radius: 999px;
   background: var(--fd-toast-bg);
   color: var(--fd-toast-text);
+  font: inherit;
   font-size: 13px;
+  border: 0;
+  cursor: pointer;
+  max-width: calc(100vw - 32px);
   box-shadow: var(--fd-shadow);
 }
 

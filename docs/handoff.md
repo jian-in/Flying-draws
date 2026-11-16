@@ -1,7 +1,7 @@
 # 接手文档
 
 > 新会话动手前先读这份，再按需看 [design.md](design.md)。
-> 最后更新：2026-11-16，「发给 agent」支持点选目标席位、没人在等时复制取画指令到剪贴板之后。
+> 最后更新：2026-11-16，手感优化（发送快捷键、画板工具挪进标题栏、agent 新内容找空位落笔、连线绕开障碍）之后。
 
 ## 一句话
 
@@ -21,6 +21,7 @@ Flying draws：本地桌面画布（Electron + Excalidraw），通过 MCP 接任
 | 画板重命名/删除与收件箱持久化 | ✅ 页面支持「重命名」「删除」（至少保留一块，非切换操作走 `syncBoards` 保留撤销栈）；MCP 新增 `canvas_rename`、`canvas_delete`；未取走的「发给 agent」收件箱随 `pending.json` 持久化并在重启后恢复 | `2f341c6` |
 | agent 干预用户内容、改样式与作者筛选 | ✅ 独立文字（`T1`）和手绘（`S1`）纳入编号与改删；新增 `update_text` / `delete_text` / `delete_strokes` / `set_style`；`canvas_draw` 与 `canvas_propose` 均可改删任意已确认元素（提议中以虚线标记框预览，支持单处删除拒绝）；记录 `agent` 署名并在页面底部提供作者筛选标签 | 见 git log |
 | 多席位联手作画与「递画笔」接力 | ✅ 工具支持 `as` 声明席位并自动分配 6 色固定色板；底部筛选栏按实际席位动态生成带色点标签；新增 `canvas_pass` 工具，支持与 `canvas_wait` / `canvas_read` 席位间直接或挂起交接画笔 | 见 git log |
+| 手感优化 | ✅ `Ctrl+Shift+Enter` 打开「发给 agent」、再按一次发出，横幅里 Enter 发送、Esc 取消；画板切换、新建、「⋯」菜单和保存状态挪进标题栏，画布右上角只留「发给 agent」；agent 的新内容紧挨着它连接的节点或落在用户视野里的空位（`placeBlock()`），直线会压到东西时加拐点绕开（`detourPoint()`）；新内容已在眼前时不再移动视野 | 见 git log |
 | 点选席位发送与剪贴板兜底（「叫醒 agent」第 1 步） | ✅ 两个以上席位在线时，「发给 agent」横幅可点选「所有 agent / @某席位」；点选了席位的画只有那个席位能取（`canvas_read` / `canvas_wait`）。对方正在等就直接送达，否则进收件箱，并把一句带画板、版本、席位的取画指令放进剪贴板 | 见 git log |
 
 - 远程：GitHub 仓库 `jian-in/Flying-draws`，本地 `master` 跟踪 `origin/master`。
@@ -67,7 +68,7 @@ src/main/daemon.ts     本地 HTTP 服务：127.0.0.1 随机端口 + token，信
 src/main/requests.ts   请求队列：agent 请求作画、提议（含 pending 改动）、用户发送/取消、长轮询等待、主动发送的收件箱（可指定目标席位 `to`）与席位间递画笔交接（含重启恢复与批量清理）、剪贴板取画指令 `pickupHint()`
 src/main/seats.ts      在线席位登记表 SeatRegistry（纯逻辑，不依赖 Electron）：跟踪连着画布的桥接或调用方、分配 6 色色板、离场或超时后清理
 src/preload/index.ts   页面能调用的全部接口（含画板新建/切换/重命名/删除/列表，以及可清理的监听器）
-src/renderer/src/App.tsx  画布、右上角状态栏、底部动态席位/作者筛选标签、请求横幅、交接提示、"发给 agent"、响应主进程 RPC（snapshot / applyPlan / loadScene / syncBoards）
+src/renderer/src/App.tsx  画布、标题栏里的画板工具、右上角「发给 agent」、底部动态席位/作者筛选标签、请求横幅、交接提示、"发给 agent"、响应主进程 RPC（snapshot / applyPlan / loadScene / syncBoards）
 src/bridge/index.ts    MCP 桥接（stdio）：10 个工具，支持 as 席位声明并自动上报客户端名字，转发给本地服务；应用没开时自动拉起
 test/                  单元测试（boards / diff / ops / requests / seats / semantic）；test/fixtures/flow.excalidraw 是测试用画板
 scripts/e2e.mjs        M1 端到端测试（注意其工具列表断言仍停在 M1 的 4 个工具）
@@ -87,7 +88,7 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 多画板状态管理（`src/main/boards.ts` + `src/main/index.ts`）：
 - 每块画板对应 `~/.flyingdraws/boards/<id>.excalidraw`，标题（可选）保存在 `scene.flyingdraws.title`。当前激活的画板 ID 记在 `~/.flyingdraws/state.json`，重启后自动恢复；没有 `state.json` 时默认 `default`。
 - 每个画板在主进程有独立的 `BoardSession`（`version`、`history`、`RequestHub`），`requestBoard` 映射记录 `request_id → boardId`，切画板不会把别的画板的待处理横幅串过来。
-- 页面右上角提供画板下拉框切换、「+ 新建画板」、「重命名」和「删除」（仅剩最后一块画板时禁用删除）；切换或删除当前画板前会自动把当前场景落盘，页面通过 `resetScene()` + `addFiles()` + `updateScene()` + `history.clear()` 载入目标画板，避免跨画板撤销串台。
+- 窗口标题栏里提供画板下拉框切换、「+ 新建画板」和「⋯」菜单（「重命名」「删除」等）（仅剩最后一块画板时禁用删除）；切换或删除当前画板前会自动把当前场景落盘，页面通过 `resetScene()` + `addFiles()` + `updateScene()` + `history.clear()` 载入目标画板，避免跨画板撤销串台。
 - 重命名会迁移 `.excalidraw` 文件、更新 `scene.flyingdraws.title`、迁移内存 `BoardSession` 与 `requestBoard` 映射，并通过 `syncBoards` RPC 同步页面标题/列表而不重置画布和撤销栈；删除会取消并清空该画板的请求和收件箱、删除磁盘文件，若删的是当前激活画板则优先回退到 `default`（否则选剩余第一块）。
 
 多个请求同时等着时按先来后到一个一个问，横幅上写着后面还有几个；轮到一个提议时视野会移到它上面，并让开顶部的横幅。
@@ -142,14 +143,19 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 - 还没做：一个圈圈住一组手写时，不会说"圈住了那组手写"；多笔画成的箭头也会被当成一组涂鸦。
 
 **排版现在怎么做的（M2-b）**
-- 一批指令里没指定坐标的新节点交给 dagre（`@dagrejs/dagre` 3.1.3）排成一块，`direction` 是 `right`（默认）或 `down`。整块放在已有内容的下方；这一块连着已有节点时，横向对齐到那些节点的正下方。**已有元素一律不动。**
+- 一批指令里没指定坐标的新节点交给 dagre（`@dagrejs/dagre` 3.1.3）排成一块，`direction` 是 `right`（默认）或 `down`。**已有元素一律不动。**
+- 整块放哪儿由 `ops.ts` 的 `placeBlock()` 决定：
+  - 连着已有节点：紧挨着那些节点放。横排先试右边、竖排先试下面，被占了换另一侧，两侧都被占就从正下方往下找第一处空位。
+  - 不连已有节点：放进用户当前视野里第一处放得下的空位（页面的 `snapshot` 会带回 `view`，已让出工具栏、横幅和底部筛选栏）；视野里放不下就放在视野这一竖条内容的下面。拿不到视野时退回老办法：所有内容的最下方。
+- 没有 dagre 拐点的连线，如果两端中心的直线会压到别的元素，`detourPoint()` 在中点的垂直方向上加一个拐点绕开；绕不开就照旧画直线。端点落在里面的框（节点自己、圈着它的大框）不算障碍。
+- 画完后，新内容已经全在用户眼前（且没被横幅挡住）时视野不动，否则才移过去。
 - 挂在新节点旁边的文字（`add_text` 带 `near`）会在排版时留出位置，不会压到别的节点。
 - 相邻两层之间的连线画直线，跨层的连线用 dagre 给的拐点画成曲线。箭头起止点按矩形、椭圆、菱形各自的轮廓算。
 - 节点编号（N1、N2……）按阅读顺序排，排版一变编号就可能变。测试和 agent 都要用 `canvas_draw` 返回的对照表（`open = N1`），不要假设顺序。
 
 **M2-a、M2-b 留下的缺口**
-- 连到已有节点的线走直线，不绕路，可能压到用户已有的文字或图形（端到端测试的截图里就有一条压到了文字）。
-- 新的一块永远放在所有内容的最下方，不会找旁边的空位。画板内容多了以后新内容会离得很远，靠视野自动移过去。
+- 连线绕行只加一个拐点，障碍很多、很密时可能绕不开，会退回直线。连线上的文字、连线本身不算障碍。
+- 找空位只看元素的外接框：用户画的一个大圈、一条长斜线会把它框住的整块区域都算成被占。
 - 没有"移动"指令。改字后（`update_node` / `update_edge`）不会对整块重新排版：连线上的字太长时可能盖住箭头，节点只会长高不会变宽（但 `set_style` 支持直接指定宽高和改形状）。
 - 冲突判断靠主进程内存里的版本记录（最近 60 个版本）。应用重启后查不到旧版本，agent 引用已有元素会被要求重新读一次。
 - "被动过"的判断偏严：元素的 `version` 或它上面文字的 `version` 变了就算。用户拖动一个节点时，连着它的箭头也会变，所以 agent 这时去改那条箭头上的字也会冲突。
