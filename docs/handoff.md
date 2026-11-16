@@ -5,7 +5,7 @@
 
 ## 一句话
 
-Sketchlink（暂定名）：本地桌面画布（Electron + Excalidraw），通过 MCP 接任意 agent。用户用画表达想法，agent 读到的是结构化的文字描述，认不出来的内容附截图。
+Flying draws：本地桌面画布（Electron + Excalidraw），通过 MCP 接任意 agent。用户用画表达想法，agent 读到的是结构化的文字描述，认不出来的内容附截图。
 
 ## 现在在哪
 
@@ -21,7 +21,7 @@ Sketchlink（暂定名）：本地桌面画布（Electron + Excalidraw），通�
 | 画板重命名/删除与收件箱持久化 | ✅ 页面支持「重命名」「删除」（至少保留一块，非切换操作走 `syncBoards` 保留撤销栈）；MCP 新增 `canvas_rename`、`canvas_delete`；未取走的「发给 agent」收件箱随 `pending.json` 持久化并在重启后恢复 | 待提交 |
 
 - 远程：GitHub 仓库 `jian-in/Freedom-draw`，本地 `master` 跟踪 `origin/master`。
-- 项目名还是暂定，发布前要查 GitHub / npm 重名。
+- 项目名定为 **Flying draws**（原暂定名 Sketchlink），显示的名字和内部标识符都改了：数据目录 `~/.flyingdraws`、页面接口 `window.flyingdraws`、元素标记 `customData.flyingdraws`、画板元数据 `scene.flyingdraws`、环境变量 `FLYINGDRAWS_HOME` / `FLYINGDRAWS_DEBUG_PORT`、npm 包名和 MCP 服务名 `flying-draws`、样式前缀 `fd-` / `--fd-`。兼容旧数据靠两处：主进程启动时把 `~/.sketchlink` 整个改名成 `~/.flyingdraws`（`index.ts` 的 `migrateLegacyDirs()`，新目录已存在就不动）；读画板文件时 `boards.ts` 的 `upgradeLegacyScene()` 把旧名字下的元数据和作者标记挪到新名字下。代码里还出现 `sketchlink` 的只有这两处。发布前仍要查 GitHub / npm 重名。
 
 ## 怎么跑
 
@@ -31,7 +31,7 @@ npm run build        # 应用打包到 out/，桥接编译到 out/bridge/
 npm run dev          # 开发模式启动画布
 npm test             # 语义层单元测试（node --test，直接跑 .ts）
 npm run typecheck
-npm run inspect      # 打印 ~/.sketchlink/boards/default.excalidraw 的结构
+npm run inspect      # 打印 ~/.flyingdraws/boards/default.excalidraw 的结构
 ```
 
 端到端测试（扮演 agent 调 MCP，用 CDP 扮演用户点按钮）：
@@ -47,9 +47,9 @@ npm run e2e                                    # 截图输出到 out/e2e/
 npm run e2e:draw     # 自己拉起一个隔离实例，画板在 out/e2e-home，截图在 out/e2e/draw.png
 ```
 
-它还会用 DevTools 端口 9334 在页面里点按钮，扮演用户接受和拒绝提议（隔离实例上设了 `SKETCHLINK_DEBUG_PORT` 才会开这个端口）。提议的截图在 `out/e2e/propose.png` 和 `propose-accepted.png`。
+它还会用 DevTools 端口 9334 在页面里点按钮，扮演用户接受和拒绝提议（隔离实例上设了 `FLYINGDRAWS_DEBUG_PORT` 才会开这个端口）。提议的截图在 `out/e2e/propose.png` 和 `propose-accepted.png`。
 
-隔离靠环境变量 `SKETCHLINK_HOME`：设了它，画板、`daemon.json` 和 Electron 的 userData 都放到那个目录下，可以和用户开着的画布同时运行。**凡是会往画布上写东西的测试都要用它。**
+隔离靠环境变量 `FLYINGDRAWS_HOME`：设了它，画板、`daemon.json` 和 Electron 的 userData 都放到那个目录下，可以和用户开着的画布同时运行。**凡是会往画布上写东西的测试都要用它。**
 
 ## 代码地图
 
@@ -59,7 +59,7 @@ src/main/boards.ts     画板标识校验、文件名映射、标题归一化/�
 src/main/semantic.ts   语义层（纯函数，不依赖 Electron）：buildGraph() 出结构，summarize() 出中文描述
 src/main/ops.ts        绘图指令 → 绘图计划（纯函数）：校验 ops、解析节点引用、定好每个新元素的 id、位置和大小
 src/main/diff.ts       提议的底稿和改动对比（纯函数）：用户在提议上改了什么
-src/main/daemon.ts     本地 HTTP 服务：127.0.0.1 随机端口 + token，信息写 ~/.sketchlink/daemon.json
+src/main/daemon.ts     本地 HTTP 服务：127.0.0.1 随机端口 + token，信息写 ~/.flyingdraws/daemon.json
 src/main/requests.ts   请求队列：agent 请求作画、用户发送/取消、长轮询等待、主动发送的收件箱（含重启恢复与批量清理）
 src/preload/index.ts   页面能调用的全部接口（含画板新建/切换/重命名/删除/列表，以及可清理的监听器）
 src/renderer/src/App.tsx  画布、右上角状态栏（画板下拉切换、「+」新建、「⋯」菜单里的重命名/立即保存/打开文件位置/删除、保存状态圆点）、请求横幅、"发给 agent"、响应主进程 RPC（snapshot / applyPlan / loadScene / syncBoards）
@@ -77,13 +77,13 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 
 用户改了什么（`src/main/diff.ts`，纯函数）：提议画上去时 `captureBaseline()` 记一份底稿，存在请求上；用户接受时 `diffProposal()` 拿当时的画布和底稿比，输出几句中文（改了文字、挪了位置、删了什么、自己加了什么），放在 `canvas_wait` 结果的 `changes` 里。挪动不到 24px、大小变化不到 25% 的不报。
 
-待处理的请求和未取走的收件箱会存盘：每次请求或收件箱有增减就原子写 `~/.sketchlink/pending.json`（v2 格式 `{ version: 2, boards: { [boardId]: waiting[] }, inbox?: { [boardId]: Submission[] } }`，兼容旧版 `{ board, requests }`），应用启动时按画板读回来——等待中请求的编号不变（`request_id` 重启后还能用、确认横幅会重新出现），用户之前"发给 agent"但尚未被取走的收件箱内容与等待条也会一并恢复，直到被 `canvas_read` 或不带 `request_id` 的 `canvas_wait` 取走后清空。提议对应的元素要是已经不在对应画板上了（比如用户手动删光了），这个提议就不恢复。
+待处理的请求和未取走的收件箱会存盘：每次请求或收件箱有增减就原子写 `~/.flyingdraws/pending.json`（v2 格式 `{ version: 2, boards: { [boardId]: waiting[] }, inbox?: { [boardId]: Submission[] } }`，兼容旧版 `{ board, requests }`），应用启动时按画板读回来——等待中请求的编号不变（`request_id` 重启后还能用、确认横幅会重新出现），用户之前"发给 agent"但尚未被取走的收件箱内容与等待条也会一并恢复，直到被 `canvas_read` 或不带 `request_id` 的 `canvas_wait` 取走后清空。提议对应的元素要是已经不在对应画板上了（比如用户手动删光了），这个提议就不恢复。
 
 多画板状态管理（`src/main/boards.ts` + `src/main/index.ts`）：
-- 每块画板对应 `~/.sketchlink/boards/<id>.excalidraw`，标题（可选）保存在 `scene.sketchlink.title`。当前激活的画板 ID 记在 `~/.sketchlink/state.json`，重启后自动恢复；没有 `state.json` 时默认 `default`。
+- 每块画板对应 `~/.flyingdraws/boards/<id>.excalidraw`，标题（可选）保存在 `scene.flyingdraws.title`。当前激活的画板 ID 记在 `~/.flyingdraws/state.json`，重启后自动恢复；没有 `state.json` 时默认 `default`。
 - 每个画板在主进程有独立的 `BoardSession`（`version`、`history`、`RequestHub`），`requestBoard` 映射记录 `request_id → boardId`，切画板不会把别的画板的待处理横幅串过来。
 - 页面右上角提供画板下拉框切换、「+ 新建画板」、「重命名」和「删除」（仅剩最后一块画板时禁用删除）；切换或删除当前画板前会自动把当前场景落盘，页面通过 `resetScene()` + `addFiles()` + `updateScene()` + `history.clear()` 载入目标画板，避免跨画板撤销串台。
-- 重命名会迁移 `.excalidraw` 文件、更新 `scene.sketchlink.title`、迁移内存 `BoardSession` 与 `requestBoard` 映射，并通过 `syncBoards` RPC 同步页面标题/列表而不重置画布和撤销栈；删除会取消并清空该画板的请求和收件箱、删除磁盘文件，若删的是当前激活画板则优先回退到 `default`（否则选剩余第一块）。
+- 重命名会迁移 `.excalidraw` 文件、更新 `scene.flyingdraws.title`、迁移内存 `BoardSession` 与 `requestBoard` 映射，并通过 `syncBoards` RPC 同步页面标题/列表而不重置画布和撤销栈；删除会取消并清空该画板的请求和收件箱、删除磁盘文件，若删的是当前激活画板则优先回退到 `default`（否则选剩余第一块）。
 
 多个请求同时等着时按先来后到一个一个问，横幅上写着后面还有几个；轮到一个提议时视野会移到它上面，并让开顶部的横幅。
 
@@ -92,18 +92,18 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 - 版本变了：`rebaseOps()` 把指令里的旧编号换算成同一个元素现在的编号。引用的节点被删了 → 冲突；要改动或删除的元素指纹变了（被别人动过）→ 冲突；只是连线过去、旁边加字 → 照常执行。
 - 查不到那个版本，或者没带 `base_version` 却引用了已有节点 → 冲突，让 agent 重新读。
 
-界面样式（`styles.css`）：淡黄纸面 + 墨线描边的线稿风（1.5px 墨线、错开的实线代替柔和阴影、黄色主按钮），同一段里也覆盖了 Excalidraw 工具栏的颜色变量。画布默认背景是纸色 `#fffbe6`（`App.tsx` 的 `PAPER_COLOR`）：载入时只把仍是默认白底的画板换成纸色，用户自己选过背景色的不动。自己的界面统一用 `--sl-*` 颜色变量，页面把 Excalidraw 当前的深浅色写到 `<html data-sl-theme>` 上，横幅、弹窗、菜单跟着切换。「⋯」菜单用 portal 挂在 body 上，免得被横幅盖住。端到端测试会输出界面截图 `out/e2e/ui-menu.png`（浅色）和 `ui-dark.png`（深色）。
+界面样式（`styles.css`）：淡黄纸面 + 墨线描边的线稿风（1.5px 墨线、错开的实线代替柔和阴影、黄色主按钮），同一段里也覆盖了 Excalidraw 工具栏的颜色变量。画布默认背景是纸色 `#fffbe6`（`App.tsx` 的 `PAPER_COLOR`）：载入时只把仍是默认白底的画板换成纸色，用户自己选过背景色的不动。窗口没有系统标题栏和菜单栏（`titleBarStyle: 'hidden'` + `titleBarOverlay`）：顶上 36px 那条是页面自己画的 `.fd-titlebar`，和画布同色、可拖动窗口，右边留给系统的最小化/关闭按钮；按钮颜色由页面经 `window:theme` 通知主进程跟着深浅色换。高度和颜色在 `index.ts` 的 `TITLEBAR_*` 和 `styles.css` 的 `--fd-titlebar-h`、`--fd-paper` 两处，要一起改。自己的界面统一用 `--fd-*` 颜色变量，页面把 Excalidraw 当前的深浅色写到 `<html data-fd-theme>` 上，横幅、弹窗、菜单跟着切换。「⋯」菜单用 portal 挂在 body 上，免得被横幅盖住。端到端测试会输出界面截图 `out/e2e/ui-menu.png`（浅色）和 `ui-dark.png`（深色）。
 
 外观约定：agent 画的东西一律蓝色（`#1971c2`）；还没确认的提议再加虚线和 55% 透明度；接受后变实线、不透明，仍是蓝色。用户在提议上改过的地方（拖动、改字、删掉一部分）接受时原样保留。
 
-作者标记写在元素的 `customData.sketchlink = { author: 'agent', layer: 'final' }`（提议是 `layer: 'proposal'`，另带 `proposal: 提议编号`）。已在 Excalidraw 0.18.1 里确认：`customData` 是所有元素都有的可选字段，新建、载入、导出时都原样保留。没有这个标记的元素都算用户画的。
+作者标记写在元素的 `customData.flyingdraws = { author: 'agent', layer: 'final' }`（提议是 `layer: 'proposal'`，另带 `proposal: 提议编号`）。已在 Excalidraw 0.18.1 里确认：`customData` 是所有元素都有的可选字段，新建、载入、导出时都原样保留。没有这个标记的元素都算用户画的。
 
 ## MCP 工具
 
 | 工具 | 说明 |
 |---|---|
 | `canvas_open` | 打开并前置窗口；可选 `board` 和 `title`，`board` 不存在时自动创建空白画板并切换过去 |
-| `canvas_list` | 列出 `~/.sketchlink/boards/` 下的所有画板（含当前激活标记、标题、版本号、元素数） |
+| `canvas_list` | 列出 `~/.flyingdraws/boards/` 下的所有画板（含当前激活标记、标题、版本号、元素数） |
 | `canvas_rename` | 重命名指定（或当前）画板，并可选设置/清空显示标题（`title: null` 清空），保留当前会话和撤销历史 |
 | `canvas_delete` | 删除指定（或当前）画板及其 `.excalidraw` 文件（不能删最后一块）；若删除当前画板会自动切换到剩余画板 |
 | `canvas_read` | 可选 `board`；`format: summary/graph`，`image: auto/always/never`；auto 只在有涂鸦、图片、线条时附图 |
@@ -116,8 +116,8 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 
 ## 开发与本地调试提示
 
-- `sketchlink` 已用 `claude mcp add` 注册在 **/path/to/flying-draws 项目的 local scope**，命令 `node /path/to/flying-draws/out/bridge/index.js`。只有在这个文件夹里新开的会话才有这几个工具。
-- 用户的画板 `~/.sketchlink/boards/default.excalidraw` 里有**用户自己画的东西**（手写字、涂鸦），测试时只读，不要清空或覆盖。
+- MCP 服务 `flying-draws` 已用 `claude mcp add` 注册在 **/path/to/flying-draws 项目的 local scope**，命令 `node /path/to/flying-draws/out/bridge/index.js`（旧的 `sketchlink` 注册已删除）。只有在这个文件夹里新开的会话才有这几个工具，工具全名是 `mcp__flying-draws__canvas_*`。旧的 Electron 缓存目录 `%APPDATA%/sketchlink` 还留着，里面没有用户数据，可以手动删。
+- 用户的画板 `~/.flyingdraws/boards/default.excalidraw` 里有**用户自己画的东西**（手写字、涂鸦），测试时只读，不要清空或覆盖。
 - npm 用的是 npmmirror 镜像，Electron 也从镜像下载。
 
 ## 踩过的坑
@@ -162,5 +162,5 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 - **画布没法主动叫醒 agent**（MCP 是 agent 来问工具）。用户点了"发给 agent"而 agent 没在等时，画只能放在收件箱里（现已持久化到 `pending.json`，重启不丢失），要用户在聊天里说一声。画布上现在会明说这一点：发送前提示"要在聊天里说一声"，发出后显示"已发出，agent 还没来取"，被取走时提示"agent 已经取走你的画"。`canvas_read` 和不带 `request_id` 的 `canvas_wait` 都会取走收件箱里的画和附言。想真正做到"发了就到"，得用 MCP 的资源订阅通知（design.md 第 7 节末尾），而且客户端要支持
 - 桥接靠 `require('electron')` 找可执行文件，Electron 现在是 devDependency；做成可分发的 npm 包时要重新设计启动方式
 - **多画板当前限制**：目前仍是单窗口渲染，agent 在 `canvas_read`/`draw`/`propose`/`request` 传入非当前 `board` 时会把窗口切换到该画板（且要求该画板已存在，新画板需先通过 `canvas_open` 或界面创建）；支持重命名与删除，但重命名非当前激活画板后窗口不会切过去
-- **升级提示**：如果本机之前已经开着旧版 Sketchlink 窗口，重新 `npm run build` 后需要重启一次画布应用窗口（或在宿主里重连 MCP），新加的工具和接口才会生效
+- **升级提示**：如果本机之前已经开着旧版 Flying draws 窗口，重新 `npm run build` 后需要重启一次画布应用窗口（或在宿主里重连 MCP），新加的工具和接口才会生效
 - 摘要只有中文

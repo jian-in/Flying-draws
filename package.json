@@ -1,12 +1,12 @@
 {
-  "name": "sketchlink",
+  "name": "flying-draws",
   "version": "0.0.1",
   "private": true,
   "description": "A local canvas that lets any agent read what you draw",
   "license": "MIT",
   "main": "./out/main/index.js",
   "bin": {
-    "sketchlink-mcp": "out/bridge/index.js"
+    "flying-draws-mcp": "out/bridge/index.js"
   },
   "scripts": {
     "postinstall": "node node_modules/electron/install.js && node scripts/copy-fonts.mjs",

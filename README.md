@@ -1,4 +1,4 @@
-# Sketchlink（暂定名）
+# Flying draws
 
 一块本地桌面画布，通过 MCP 接到任意 agent 上：你用画来表达想法，agent 能读懂画里的结构，也能把它的理解画回来让你确认。
 
@@ -6,9 +6,9 @@
 
 ## 当前进度：M1「画给 agent 看」
 
-- Electron 窗口里嵌入 Excalidraw 画布（中文界面，字体从本地加载，断网可用），自动保存到 `~/.sketchlink/boards/default.excalidraw`
+- Electron 窗口里嵌入 Excalidraw 画布（中文界面，字体从本地加载，断网可用），自动保存到 `~/.flyingdraws/boards/default.excalidraw`
 - **语义层**：把画翻译成节点、连线（含方向和标签）、旁注文字（挂到最近的节点或连线上）、包含关系、手绘笔画（圈 / 直线 / 涂鸦）；有文字描述不了的内容时附画布截图
-- **MCP 桥接**：`sketchlink-mcp` 通过 stdio 接入任意 agent，画布应用没开时自动拉起
+- **MCP 桥接**：`flying-draws-mcp` 通过 stdio 接入任意 agent，画布应用没开时自动拉起
 - **四个工具**：
 
 | 工具 | 作用 |
@@ -31,7 +31,7 @@ npm run build
 Claude Code：
 
 ```bash
-claude mcp add sketchlink -- node /你的路径/out/bridge/index.js
+claude mcp add flyingdraws -- node /你的路径/out/bridge/index.js
 ```
 
 其他支持 stdio MCP 的 agent（Codex、Cursor、Gemini CLI 等）同理：命令是 `node`，参数是 `out/bridge/index.js` 的绝对路径。
@@ -69,7 +69,7 @@ ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
 src/main/       主进程：窗口、画板读写、本地服务（daemon）、请求队列、语义层
 src/preload/    暴露给页面的最小接口
 src/renderer/   页面：Excalidraw 画布、状态栏、请求横幅
-src/bridge/     MCP 桥接进程（sketchlink-mcp）
+src/bridge/     MCP 桥接进程（flying-draws-mcp）
 test/           语义层测试和测试用画板
 scripts/        字体拷贝、画板检查脚本
 docs/           设计文档
@@ -77,7 +77,7 @@ docs/           设计文档
 
 ## 安全
 
-本地服务只监听 `127.0.0.1`，端口和随机 token 写在 `~/.sketchlink/daemon.json`；拒绝带 `Origin` 头的浏览器请求和 Host 不是 `127.0.0.1` 的请求。应用里不内置任何模型，也不联网。
+本地服务只监听 `127.0.0.1`，端口和随机 token 写在 `~/.flyingdraws/daemon.json`；拒绝带 `Origin` 头的浏览器请求和 Host 不是 `127.0.0.1` 的请求。应用里不内置任何模型，也不联网。
 
 ## 许可证
 

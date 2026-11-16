@@ -5,49 +5,96 @@ body,
   margin: 0;
 }
 
-/* 自己的界面（右上角、横幅、弹窗、提示）共用一套颜色，跟着 Excalidraw 的深浅色切换。
-   --sl-agent 和画布上 agent 画的东西是同一个蓝色。 */
-:root {
-  --sl-ink: #2b2a26;
-  --sl-line: 1.5px;
-  --sl-surface: #fffef6;
-  --sl-surface-hover: #fff1b8;
-  --sl-border: var(--sl-ink);
-  --sl-text: var(--sl-ink);
-  --sl-muted: #7d765e;
-  --sl-primary: #ffdf70;
-  --sl-primary-hover: #ffd23f;
-  --sl-on-primary: var(--sl-ink);
-  --sl-agent: #1971c2;
-  --sl-ok: #2f9e44;
-  --sl-danger: #c92a2a;
-  --sl-danger-hover: #ffe3e0;
-  /* 线稿风：不用柔和的阴影，用一条错开的实线 */
-  --sl-shadow: 3px 3px 0 var(--sl-ink);
-  --sl-toast-bg: var(--sl-ink);
-  --sl-toast-text: #fffbe6;
-  --sl-backdrop: rgba(70, 58, 20, 0.28);
+body {
+  background: var(--fd-paper);
 }
 
-:root[data-sl-theme='dark'] {
-  --sl-ink: #e9e2c8;
-  --sl-surface: #26241d;
-  --sl-surface-hover: #3a3628;
-  --sl-muted: #a9a288;
-  --sl-primary: #ffdf70;
-  --sl-primary-hover: #ffe899;
-  --sl-on-primary: #26241d;
-  --sl-agent: #74b3ee;
-  --sl-ok: #69db7c;
-  --sl-danger: #ff8787;
-  --sl-danger-hover: #40292a;
-  --sl-shadow: 3px 3px 0 rgba(0, 0, 0, 0.6);
-  --sl-toast-text: #26241d;
-  --sl-backdrop: rgba(0, 0, 0, 0.5);
+#root {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 窗口顶上那一条：和画布同一个纸色，中间没有分界线。右边留给系统的最小化/关闭按钮 */
+.fd-titlebar {
+  flex: none;
+  height: var(--fd-titlebar-h);
+  box-sizing: border-box;
+  padding: 0 150px 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--fd-paper);
+  color: var(--fd-text);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  user-select: none;
+  -webkit-app-region: drag;
+}
+
+.fd-titlebar-app {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.fd-titlebar-board {
+  color: var(--fd-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fd-canvas {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+/* 自己的界面（右上角、横幅、弹窗、提示）共用一套颜色，跟着 Excalidraw 的深浅色切换。
+   --fd-agent 和画布上 agent 画的东西是同一个蓝色。 */
+:root {
+  --fd-ink: #2b2a26;
+  --fd-line: 1.5px;
+  --fd-paper: #fffbe6;
+  --fd-titlebar-h: 36px;
+  --fd-surface: #fffef6;
+  --fd-surface-hover: #fff1b8;
+  --fd-border: var(--fd-ink);
+  --fd-text: var(--fd-ink);
+  --fd-muted: #7d765e;
+  --fd-primary: #ffdf70;
+  --fd-primary-hover: #ffd23f;
+  --fd-on-primary: var(--fd-ink);
+  --fd-agent: #1971c2;
+  --fd-ok: #2f9e44;
+  --fd-danger: #c92a2a;
+  --fd-danger-hover: #ffe3e0;
+  /* 线稿风：不用柔和的阴影，用一条错开的实线 */
+  --fd-shadow: 3px 3px 0 var(--fd-ink);
+  --fd-toast-bg: var(--fd-ink);
+  --fd-toast-text: #fffbe6;
+  --fd-backdrop: rgba(70, 58, 20, 0.28);
+}
+
+:root[data-fd-theme='dark'] {
+  --fd-ink: #e9e2c8;
+  --fd-paper: #181508;
+  --fd-surface: #26241d;
+  --fd-surface-hover: #3a3628;
+  --fd-muted: #a9a288;
+  --fd-primary: #ffdf70;
+  --fd-primary-hover: #ffe899;
+  --fd-on-primary: #26241d;
+  --fd-agent: #74b3ee;
+  --fd-ok: #69db7c;
+  --fd-danger: #ff8787;
+  --fd-danger-hover: #40292a;
+  --fd-shadow: 3px 3px 0 rgba(0, 0, 0, 0.6);
+  --fd-toast-text: #26241d;
+  --fd-backdrop: rgba(0, 0, 0, 0.5);
 }
 
 /* Excalidraw 自带的工具栏也换成同一套：淡黄纸面、墨线描边、黄色高亮 */
-:root:not([data-sl-theme='dark']) .excalidraw {
+:root:not([data-fd-theme='dark']) .excalidraw {
   --island-bg-color: #fffef6;
   --color-surface-lowest: #fffef6;
   --color-surface-low: #fff6cf;
@@ -66,147 +113,164 @@ body,
   --shadow-island: 0 0 0 1.5px #2b2a26;
 }
 
+/* 深色下工具栏也换成暖色，不留 Excalidraw 默认的紫灰色 */
+:root[data-fd-theme='dark'] .excalidraw.theme--dark {
+  --island-bg-color: #26241d;
+  --color-surface-lowest: #26241d;
+  --color-surface-low: #2f2c22;
+  --color-surface-mid: #3a3628;
+  --color-surface-high: #463f2c;
+  --color-surface-primary-container: #6b5a1e;
+  --color-on-primary-container: #fff1b8;
+  --color-primary: #ffdf70;
+  --color-primary-darker: #ffe58a;
+  --color-primary-darkest: #fff1b8;
+  --color-primary-light: #4a401c;
+  --color-primary-light-darker: #5a4d20;
+  --button-hover-bg: #3a3628;
+}
+
 /* ---------- 按钮和输入框 ---------- */
 
-.sl-status button,
-.sl-status select,
-.sl-banner button,
-.sl-modal button {
+.fd-status button,
+.fd-status select,
+.fd-banner button,
+.fd-modal button {
   height: 36px;
   box-sizing: border-box;
   padding: 0 12px;
   font: inherit;
   font-size: 13px;
   border-radius: 8px;
-  border: var(--sl-line) solid var(--sl-border);
-  background: var(--sl-surface);
-  color: var(--sl-text);
+  border: var(--fd-line) solid var(--fd-border);
+  background: var(--fd-surface);
+  color: var(--fd-text);
   cursor: pointer;
   transition: background-color 0.12s, border-color 0.12s;
 }
 
-.sl-status button:hover:not(:disabled),
-.sl-status select:hover,
-.sl-banner button:hover:not(:disabled),
-.sl-modal button:hover:not(:disabled) {
-  background: var(--sl-surface-hover);
+.fd-status button:hover:not(:disabled),
+.fd-status select:hover,
+.fd-banner button:hover:not(:disabled),
+.fd-modal button:hover:not(:disabled) {
+  background: var(--fd-surface-hover);
 }
 
-.sl-status button:focus-visible,
-.sl-status select:focus-visible,
-.sl-banner button:focus-visible,
-.sl-modal button:focus-visible,
-.sl-banner-note:focus-visible,
-.sl-modal input:focus-visible {
-  outline: 2px solid var(--sl-primary);
+.fd-status button:focus-visible,
+.fd-status select:focus-visible,
+.fd-banner button:focus-visible,
+.fd-modal button:focus-visible,
+.fd-banner-note:focus-visible,
+.fd-modal input:focus-visible {
+  outline: 2px solid var(--fd-primary);
   outline-offset: 1px;
 }
 
-.sl-status button.sl-primary,
-.sl-banner button.sl-primary,
-.sl-modal button.sl-primary {
-  background: var(--sl-primary);
-  color: var(--sl-on-primary);
+.fd-status button.fd-primary,
+.fd-banner button.fd-primary,
+.fd-modal button.fd-primary {
+  background: var(--fd-primary);
+  color: var(--fd-on-primary);
   font-weight: 600;
 }
 
-.sl-status button.sl-primary:hover:not(:disabled),
-.sl-banner button.sl-primary:hover:not(:disabled),
-.sl-modal button.sl-primary:hover:not(:disabled) {
-  background: var(--sl-primary-hover);
+.fd-status button.fd-primary:hover:not(:disabled),
+.fd-banner button.fd-primary:hover:not(:disabled),
+.fd-modal button.fd-primary:hover:not(:disabled) {
+  background: var(--fd-primary-hover);
 }
 
-.sl-modal button.sl-danger {
-  background: var(--sl-danger);
+.fd-modal button.fd-danger {
+  background: var(--fd-danger);
   color: #fff;
   font-weight: 600;
 }
 
-.sl-modal button.sl-danger:hover:not(:disabled) {
-  background: var(--sl-danger);
+.fd-modal button.fd-danger:hover:not(:disabled) {
+  background: var(--fd-danger);
   filter: brightness(0.92);
 }
 
-.sl-status button:disabled,
-.sl-banner button:disabled,
-.sl-modal button:disabled {
+.fd-status button:disabled,
+.fd-banner button:disabled,
+.fd-modal button:disabled {
   opacity: 0.5;
   cursor: default;
 }
 
-.sl-banner-note,
-.sl-modal input {
+.fd-banner-note,
+.fd-modal input {
   height: 36px;
   box-sizing: border-box;
   padding: 0 10px;
   font: inherit;
   font-size: 13px;
   border-radius: 8px;
-  border: var(--sl-line) solid var(--sl-border);
-  background: var(--sl-surface);
-  color: var(--sl-text);
+  border: var(--fd-line) solid var(--fd-border);
+  background: var(--fd-surface);
+  color: var(--fd-text);
 }
 
-.sl-banner-note::placeholder,
-.sl-modal input::placeholder {
-  color: var(--sl-muted);
+.fd-banner-note::placeholder,
+.fd-modal input::placeholder {
+  color: var(--fd-muted);
 }
 
-.sl-error {
-  color: var(--sl-danger);
+.fd-error {
+  color: var(--fd-danger);
 }
 
 /* ---------- 右上角 ---------- */
 
-.sl-status {
+.fd-status {
   display: flex;
   align-items: center;
   gap: 6px;
   font-size: 13px;
-  color: var(--sl-text);
+  color: var(--fd-text);
   white-space: nowrap;
 }
 
-.sl-status select.sl-board-select {
+.fd-status select.fd-board-select {
   max-width: 180px;
   padding: 0 8px 0 10px;
   font-weight: 600;
   text-overflow: ellipsis;
 }
 
-.sl-status button.sl-icon {
+.fd-status button.fd-icon {
   width: 36px;
   padding: 0;
   font-size: 18px;
   line-height: 1;
-  color: var(--sl-muted);
+  color: var(--fd-muted);
 }
 
-.sl-status button.sl-icon:hover:not(:disabled),
-.sl-status button.sl-icon[aria-expanded='true'] {
-  color: var(--sl-text);
-  background: var(--sl-surface-hover);
+.fd-status button.fd-icon:hover:not(:disabled),
+.fd-status button.fd-icon[aria-expanded='true'] {
+  color: var(--fd-text);
+  background: var(--fd-surface-hover);
 }
 
-.sl-more-wrap {
+.fd-more-wrap {
   position: relative;
 }
 
 /* 菜单挂在 body 上，位置由脚本按「⋯」按钮算 */
-.sl-menu {
+.fd-menu {
   position: fixed;
   z-index: 30;
   min-width: 156px;
   padding: 4px;
   border-radius: 10px;
-  border: var(--sl-line) solid var(--sl-border);
-  background: var(--sl-surface);
-  box-shadow: var(--sl-shadow);
+  border: var(--fd-line) solid var(--fd-border);
+  background: var(--fd-surface);
+  box-shadow: var(--fd-shadow);
   display: flex;
   flex-direction: column;
 }
 
-.sl-menu button {
+.fd-menu button {
   height: 32px;
   padding: 0 12px;
   font: inherit;
@@ -215,46 +279,52 @@ body,
   border-radius: 6px;
   text-align: left;
   background: transparent;
-  color: var(--sl-text);
+  color: var(--fd-text);
   cursor: pointer;
 }
 
-.sl-menu button:hover:not(:disabled) {
-  background: var(--sl-surface-hover);
+.fd-menu button:hover:not(:disabled) {
+  background: var(--fd-surface-hover);
 }
 
-.sl-menu button:focus-visible {
-  outline: 2px solid var(--sl-primary);
+.fd-menu button:focus-visible {
+  outline: 2px solid var(--fd-primary);
   outline-offset: -2px;
 }
 
-.sl-menu button:disabled {
+.fd-menu button:disabled {
   opacity: 0.5;
   cursor: default;
 }
 
-.sl-menu button.sl-menu-danger {
-  color: var(--sl-danger);
-  margin-top: 4px;
+.fd-menu button.fd-menu-danger {
+  color: var(--fd-danger);
 }
 
-.sl-menu button.sl-menu-danger:hover:not(:disabled) {
-  background: var(--sl-danger-hover);
+.fd-menu-sep {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--fd-muted);
+  opacity: 0.35;
+}
+
+.fd-menu button.fd-menu-danger:hover:not(:disabled) {
+  background: var(--fd-danger-hover);
 }
 
 /* 保存状态：小圆点 + 两三个字 */
-.sl-save {
+.fd-save {
   display: inline-block;
   max-width: 220px;
   margin: 0 6px;
   font-size: 12px;
-  color: var(--sl-muted);
+  color: var(--fd-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   vertical-align: middle;
 }
 
-.sl-save::before {
+.fd-save::before {
   content: '';
   display: inline-block;
   width: 6px;
@@ -266,53 +336,53 @@ body,
   vertical-align: middle;
 }
 
-.sl-save-ok::before {
-  background: var(--sl-ok);
+.fd-save-ok::before {
+  background: var(--fd-ok);
   opacity: 1;
 }
 
-.sl-save-error {
-  color: var(--sl-danger);
+.fd-save-error {
+  color: var(--fd-danger);
 }
 
-.sl-save-error::before {
+.fd-save-error::before {
   opacity: 1;
 }
 
 /* ---------- 弹窗 ---------- */
 
-.sl-modal-backdrop {
+.fd-modal-backdrop {
   position: fixed;
   inset: 0;
   z-index: 20;
-  background: var(--sl-backdrop);
+  background: var(--fd-backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.sl-modal {
+.fd-modal {
   width: min(380px, calc(100vw - 32px));
   box-sizing: border-box;
   padding: 20px;
   border-radius: 14px;
-  background: var(--sl-surface);
-  border: var(--sl-line) solid var(--sl-border);
-  box-shadow: var(--sl-shadow);
+  background: var(--fd-surface);
+  border: var(--fd-line) solid var(--fd-border);
+  box-shadow: var(--fd-shadow);
   font-size: 13px;
   line-height: 1.6;
-  color: var(--sl-text);
+  color: var(--fd-text);
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
 
-.sl-modal-title {
+.fd-modal-title {
   font-weight: 600;
   font-size: 15px;
 }
 
-.sl-modal-actions {
+.fd-modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
@@ -321,9 +391,9 @@ body,
 
 /* ---------- agent 请求横幅：放在工具栏下方居中 ---------- */
 
-.sl-banner {
+.fd-banner {
   position: fixed;
-  top: 76px;
+  top: calc(76px + var(--fd-titlebar-h));
   left: 50%;
   transform: translateX(-50%);
   z-index: 10;
@@ -331,19 +401,19 @@ body,
   box-sizing: border-box;
   padding: 14px 16px;
   border-radius: 14px;
-  background: var(--sl-surface);
-  border: var(--sl-line) solid var(--sl-border);
-  box-shadow: var(--sl-shadow);
+  background: var(--fd-surface);
+  border: var(--fd-line) solid var(--fd-border);
+  box-shadow: var(--fd-shadow);
   font-size: 13px;
   line-height: 1.6;
-  color: var(--sl-text);
+  color: var(--fd-text);
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
 /* 标题前的蓝点：和画布上 agent 画的东西一个颜色，一眼看出这是 agent 的事 */
-.sl-banner-title {
+.fd-banner-title {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -351,29 +421,29 @@ body,
   font-size: 14px;
 }
 
-.sl-banner-title::before,
-.sl-waiting::before {
+.fd-banner-title::before,
+.fd-waiting::before {
   content: '';
   flex: none;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--sl-agent);
+  background: var(--fd-agent);
 }
 
-.sl-banner-prompt {
+.fd-banner-prompt {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   max-height: 30vh;
   overflow-y: auto;
 }
 
-.sl-banner-queued {
+.fd-banner-queued {
   font-size: 12px;
-  color: var(--sl-muted);
+  color: var(--fd-muted);
 }
 
-.sl-banner-actions {
+.fd-banner-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
@@ -382,9 +452,9 @@ body,
 
 /* ---------- 顶部的等待提示和底部的短提示 ---------- */
 
-.sl-waiting {
+.fd-waiting {
   position: fixed;
-  top: 76px;
+  top: calc(76px + var(--fd-titlebar-h));
   left: 50%;
   transform: translateX(-50%);
   z-index: 10;
@@ -395,31 +465,31 @@ body,
   gap: 8px;
   padding: 8px 14px;
   border-radius: 999px;
-  background: var(--sl-surface);
-  border: var(--sl-line) solid var(--sl-border);
-  box-shadow: var(--sl-shadow);
+  background: var(--fd-surface);
+  border: var(--fd-line) solid var(--fd-border);
+  box-shadow: var(--fd-shadow);
   font-size: 12px;
-  color: var(--sl-text);
+  color: var(--fd-text);
 }
 
 /* agent 正等着的时候，蓝点慢慢呼吸 */
-.sl-waiting-live::before {
-  animation: sl-pulse 1.6s ease-in-out infinite;
+.fd-waiting-live::before {
+  animation: fd-pulse 1.6s ease-in-out infinite;
 }
 
-@keyframes sl-pulse {
+@keyframes fd-pulse {
   50% {
     opacity: 0.3;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .sl-waiting-live::before {
+  .fd-waiting-live::before {
     animation: none;
   }
 }
 
-.sl-toast {
+.fd-toast {
   position: fixed;
   bottom: 72px;
   left: 50%;
@@ -427,35 +497,35 @@ body,
   z-index: 10;
   padding: 8px 16px;
   border-radius: 999px;
-  background: var(--sl-toast-bg);
-  color: var(--sl-toast-text);
+  background: var(--fd-toast-bg);
+  color: var(--fd-toast-text);
   font-size: 13px;
-  box-shadow: var(--sl-shadow);
+  box-shadow: var(--fd-shadow);
 }
 
 /* ---------- 线稿风的小细节 ---------- */
 
 /* 主按钮带一条错开的墨线，按下去时贴回纸面 */
-.sl-status button.sl-primary,
-.sl-banner button.sl-primary,
-.sl-modal button.sl-primary,
-.sl-modal button.sl-danger {
-  box-shadow: 2px 2px 0 var(--sl-ink);
+.fd-status button.fd-primary,
+.fd-banner button.fd-primary,
+.fd-modal button.fd-primary,
+.fd-modal button.fd-danger {
+  box-shadow: 2px 2px 0 var(--fd-ink);
   transition: transform 0.08s, box-shadow 0.08s, background-color 0.12s;
 }
 
-.sl-status button.sl-primary:active:not(:disabled),
-.sl-banner button.sl-primary:active:not(:disabled),
-.sl-modal button.sl-primary:active:not(:disabled),
-.sl-modal button.sl-danger:active:not(:disabled) {
+.fd-status button.fd-primary:active:not(:disabled),
+.fd-banner button.fd-primary:active:not(:disabled),
+.fd-modal button.fd-primary:active:not(:disabled),
+.fd-modal button.fd-danger:active:not(:disabled) {
   transform: translate(2px, 2px);
   box-shadow: none;
 }
 
-.sl-toast {
+.fd-toast {
   box-shadow: none;
 }
 
-.sl-waiting {
-  box-shadow: 2px 2px 0 var(--sl-ink);
+.fd-waiting {
+  box-shadow: 2px 2px 0 var(--fd-ink);
 }

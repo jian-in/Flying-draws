@@ -61,24 +61,53 @@ export function emptyBoardScene(opts?: { title?: string | null }): Record<string
   return {
     type: 'excalidraw',
     version: 2,
-    source: 'sketchlink',
+    source: 'flyingdraws',
     elements: [],
     appState: { viewBackgroundColor: '#ffffff' },
     files: {},
-    sketchlink: {
+    flyingdraws: {
       version: 1,
       ...(title ? { title } : {})
     }
   }
 }
 
+// 项目原来叫 Sketchlink，旧画板里的标记都挂在这个名字下面
+const LEGACY_KEY = 'sketchlink'
+
+// 把旧画板升级成现在的格式：画板自己的元数据和每个元素上的作者标记，都从旧名字挪到 flyingdraws 下面。
+// 已经是新格式的原样返回；读不懂的内容也原样返回，交给后面的代码按原来的方式报错。
+export function upgradeLegacyScene(sceneJson: string): string {
+  if (!sceneJson.includes(`"${LEGACY_KEY}"`)) return sceneJson
+  let scene: Record<string, unknown>
+  try {
+    scene = JSON.parse(sceneJson) as Record<string, unknown>
+  } catch {
+    return sceneJson
+  }
+  if (!scene || typeof scene !== 'object') return sceneJson
+  const move = (holder: Record<string, unknown>): void => {
+    if (!(LEGACY_KEY in holder)) return
+    if (!('flyingdraws' in holder)) holder.flyingdraws = holder[LEGACY_KEY]
+    delete holder[LEGACY_KEY]
+  }
+  move(scene)
+  if (scene.source === LEGACY_KEY) scene.source = 'flyingdraws'
+  if (Array.isArray(scene.elements)) {
+    for (const el of scene.elements as { customData?: unknown }[]) {
+      if (el?.customData && typeof el.customData === 'object') move(el.customData as Record<string, unknown>)
+    }
+  }
+  return JSON.stringify(scene)
+}
+
 export function updateBoardSceneTitle(sceneJson: string, title: string | null): string {
-  const scene = JSON.parse(sceneJson) as { sketchlink?: Record<string, unknown>; [key: string]: unknown }
+  const scene = JSON.parse(sceneJson) as { flyingdraws?: Record<string, unknown>; [key: string]: unknown }
   const cleanTitle = normalizeBoardTitle(title)
-  const prev = scene.sketchlink && typeof scene.sketchlink === 'object' ? { ...scene.sketchlink } : {}
+  const prev = scene.flyingdraws && typeof scene.flyingdraws === 'object' ? { ...scene.flyingdraws } : {}
   const version = Number(prev.version) || 1
   delete prev.title
-  scene.sketchlink = { ...prev, version, ...(cleanTitle ? { title: cleanTitle } : {}) }
+  scene.flyingdraws = { ...prev, version, ...(cleanTitle ? { title: cleanTitle } : {}) }
   return JSON.stringify(scene)
 }
 
@@ -86,11 +115,11 @@ export function parseBoardMeta(id: string, json: string, updatedAt: string): Boa
   try {
     const scene = JSON.parse(json) as {
       elements?: { isDeleted?: boolean }[]
-      sketchlink?: { version?: unknown; title?: unknown }
+      flyingdraws?: { version?: unknown; title?: unknown }
     }
     const elements = Array.isArray(scene.elements) ? scene.elements.filter((el) => !el?.isDeleted).length : 0
-    const version = Number(scene?.sketchlink?.version) || 1
-    const title = normalizeBoardTitle(scene?.sketchlink?.title)
+    const version = Number(scene?.flyingdraws?.version) || 1
+    const title = normalizeBoardTitle(scene?.flyingdraws?.title)
     return { board: id, title, version, elements, updatedAt }
   } catch {
     return { board: id, title: null, version: 1, elements: 0, updatedAt }

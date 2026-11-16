@@ -29,7 +29,7 @@ declare global {
   }
 
   interface Window {
-    sketchlink: {
+    flyingdraws: {
       loadBoard: () => Promise<BoardLoadResult>
       listBoards: () => Promise<{ current: string; boards: BoardSummary[] }>
       saveBoard: (json: string) => Promise<{ board: string; path: string; saveCount: number; version: number; savedAt: string }>
@@ -43,6 +43,9 @@ declare global {
       }) => Promise<BoardLoadResult>
       deleteBoard: (payload: { board: string; currentSceneJson?: string }) => Promise<BoardLoadResult>
       revealBoard: () => Promise<void>
+      setTheme: (theme: 'light' | 'dark') => void
+      reloadWindow: () => void
+      toggleDevTools: () => void
       getHubState: () => Promise<HubState>
       onHubState: (fn: (state: HubState) => void) => () => void
       submit: (payload: {

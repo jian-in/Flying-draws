@@ -14,7 +14,7 @@ export interface DiffElement {
   containerId?: string | null
   startBinding?: { elementId: string } | null
   endBinding?: { elementId: string } | null
-  customData?: { sketchlink?: { author?: string; layer?: string; proposal?: string } } | null
+  customData?: { flyingdraws?: { author?: string; layer?: string; proposal?: string } } | null
 }
 
 interface BaselineItem {
@@ -63,7 +63,7 @@ export function captureBaseline(elements: readonly DiffElement[], proposalId: st
   const items: BaselineItem[] = []
   const names: Record<string, string> = {}
   for (const el of live) {
-    if (el.customData?.sketchlink?.proposal !== proposalId) continue
+    if (el.customData?.flyingdraws?.proposal !== proposalId) continue
     if (el.type === 'text' && el.containerId) continue // 绑在容器上的文字算容器的标签，不单独记
     const kind: BaselineItem['kind'] = el.type === 'arrow' ? 'edge' : el.type === 'text' ? 'text' : 'node'
     const from = el.startBinding?.elementId ?? null
@@ -149,7 +149,7 @@ export function diffProposal(baseline: ProposalBaseline, elementsNow: readonly D
 
   // 用户后来自己加的东西：提议画上去时还不存在，也不是 agent 画的
   const known = new Set(baseline.elementIds)
-  const added = live.filter((el) => !known.has(el.id) && el.customData?.sketchlink?.author !== 'agent')
+  const added = live.filter((el) => !known.has(el.id) && el.customData?.flyingdraws?.author !== 'agent')
   if (added.length) {
     const parts: string[] = []
     const count = (type: string) => added.filter((el) => el.type === type).length

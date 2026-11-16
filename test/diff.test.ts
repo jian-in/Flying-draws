@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { captureBaseline, diffProposal, type DiffElement } from '../src/main/diff.ts'
 
-const mark = { customData: { sketchlink: { author: 'agent', layer: 'proposal', proposal: 'p1' } } }
+const mark = { customData: { flyingdraws: { author: 'agent', layer: 'proposal', proposal: 'p1' } } }
 
 // 提议：「查缓存」→「直接返回」，连线上标着「命中」，旁边一段文字；外加一个用户自己的节点「入口」
 function scene(): DiffElement[] {
@@ -41,7 +41,7 @@ test('什么都没改：没有改动', () => {
 })
 
 test('接受提议只是换了标记和样式，不算改动', () => {
-  const accepted = scene().map((el) => (el.customData ? { ...el, customData: { sketchlink: { author: 'agent', layer: 'final' } } } : el))
+  const accepted = scene().map((el) => (el.customData ? { ...el, customData: { flyingdraws: { author: 'agent', layer: 'final' } } } : el))
   assert.deepEqual(diffProposal(baseline(), accepted), [])
 })
 
@@ -83,7 +83,7 @@ test('用户自己加的东西单独列出来，agent 后来画的不算', () =>
     { id: 'x2', type: 'arrow', x: 520, y: 250, width: 80, height: 0 },
     { id: 'x3', type: 'freedraw', x: 0, y: 500, width: 30, height: 30 },
     { id: 'x4', type: 'freedraw', x: 40, y: 500, width: 30, height: 30 },
-    { id: 'x5', type: 'rectangle', x: 900, y: 0, width: 100, height: 60, customData: { sketchlink: { author: 'agent', layer: 'final' } } }
+    { id: 'x5', type: 'rectangle', x: 900, y: 0, width: 100, height: 60, customData: { flyingdraws: { author: 'agent', layer: 'final' } } }
   ]
   assert.deepEqual(diffProposal(baseline(), now), ['自己加了：节点「写缓存」、1 条连线、2 笔手绘'])
 })

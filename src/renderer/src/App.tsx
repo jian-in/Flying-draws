@@ -132,7 +132,7 @@ function applyChanges(elements: SceneEl[], plan: DrawPlan): SceneEl[] {
   const gone = new Set(plan.deletes)
   const goneNodes = new Set(plan.deletes.filter((id) => byId.get(id)?.type !== 'arrow'))
   for (const el of elements as Loose[]) {
-    if (el.isDeleted || el.type !== 'arrow' || el.customData?.sketchlink?.author !== 'agent') continue
+    if (el.isDeleted || el.type !== 'arrow' || el.customData?.flyingdraws?.author !== 'agent') continue
     if ((el.startBinding && goneNodes.has(el.startBinding.elementId)) || (el.endBinding && goneNodes.has(el.endBinding.elementId))) gone.add(el.id)
   }
 
@@ -238,7 +238,7 @@ async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): P
     : { strokeColor: AGENT_COLOR }
   const mark = proposalId ? { author: 'agent', layer: 'proposal', proposal: proposalId } : { author: 'agent', layer: 'final' }
   const fresh = created.map((el) => {
-    const tagged = { ...el, ...look, customData: { ...el.customData, sketchlink: mark } }
+    const tagged = { ...el, ...look, customData: { ...el.customData, flyingdraws: mark } }
     const edge = edgeById.get(el.id)
     if (!edge || el.type !== 'arrow') return tagged
     attach(edge.fromElementId, el.id)
@@ -267,7 +267,7 @@ async function applyPlan(api: Api, plan: DrawPlan, proposalId: string | null): P
 // 拒绝：删掉。用户在提议上改过的地方原样保留，用户自己删掉的不会回来。
 function resolveProposal(api: Api, proposalId: string, accept: boolean): void {
   const isProposed = (el: SceneEl): boolean => {
-    const mark = el.customData?.sketchlink
+    const mark = el.customData?.flyingdraws
     return !el.isDeleted && mark?.layer === 'proposal' && mark?.proposal === proposalId
   }
   const all = api.getSceneElementsIncludingDeleted()
@@ -278,7 +278,7 @@ function resolveProposal(api: Api, proposalId: string, accept: boolean): void {
         ? newElementWith(el, {
             opacity: 100,
             strokeStyle: 'solid',
-            customData: { ...el.customData, sketchlink: { author: 'agent', layer: 'final' } }
+            customData: { ...el.customData, flyingdraws: { author: 'agent', layer: 'final' } }
           })
         : newElementWith(el, { isDeleted: true })
     }
@@ -325,7 +325,7 @@ export default function App() {
   }, [hub.inbox])
   const [composing, setComposing] = useState(false)
   const [initialData] = useState(() =>
-    window.sketchlink.loadBoard().then((res) => {
+    window.flyingdraws.loadBoard().then((res) => {
       setBoardInfo({ board: res.board, title: res.title })
       setBoards(res.boards)
       setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
@@ -376,7 +376,7 @@ export default function App() {
       currentApi.history.clear()
       setBoardInfo({ board: res.board, title: res.title })
       if (res.boards) setBoards(res.boards)
-      else void window.sketchlink.listBoards().then((list) => setBoards(list.boards))
+      else void window.flyingdraws.listBoards().then((list) => setBoards(list.boards))
       if (res.hubState) {
         lastInbox.current = res.hubState.inbox
         setHub(res.hubState)
@@ -401,7 +401,7 @@ export default function App() {
     const [elements, appState, files] = scene
     try {
       const json = serializeAsJSON(elements, appState, files, 'local')
-      const res = await window.sketchlink.saveBoard(json)
+      const res = await window.flyingdraws.saveBoard(json)
       lastSavedVersion.current = elementsVersion(elements)
       setStatus({ kind: 'saved', path: res.path, version: res.version, savedAt: res.savedAt })
     } catch (err) {
@@ -412,8 +412,9 @@ export default function App() {
   const onChange = useCallback<OnChange>(
     (elements, appState, files) => {
       // 横幅和弹窗画在 Excalidraw 外面，要自己跟着它的深浅色走
-      if (document.documentElement.dataset.slTheme !== appState.theme) {
-        document.documentElement.dataset.slTheme = appState.theme
+      if (document.documentElement.dataset.fdTheme !== appState.theme) {
+        document.documentElement.dataset.fdTheme = appState.theme
+        window.flyingdraws.setTheme(appState.theme === 'dark' ? 'dark' : 'light')
       }
       latest.current = [elements, appState, files]
       const version = elementsVersion(elements)
@@ -440,28 +441,28 @@ export default function App() {
 
   // 订阅 agent 请求的状态
   useEffect(() => {
-    const off = window.sketchlink.onHubState(setHub)
-    void window.sketchlink.getHubState().then(setHub)
+    const off = window.flyingdraws.onHubState(setHub)
+    void window.flyingdraws.getHubState().then(setHub)
     return off
   }, [])
 
   // 处理主进程发来的调用。画布 API 准备好以后才通知主进程"页面就绪"
   useEffect(() => {
     if (!api) return
-    const off = window.sketchlink.onRpc(async ({ id, method, params }) => {
+    const off = window.flyingdraws.onRpc(async ({ id, method, params }) => {
       const current = apiRef.current
       try {
         if (!current) throw new Error('canvas is not ready')
         if (method === 'snapshot') {
           const withImage = Boolean((params as { image?: boolean })?.image)
-          window.sketchlink.rpcReply(id, await snapshot(current, withImage))
+          window.flyingdraws.rpcReply(id, await snapshot(current, withImage))
         } else if (method === 'applyPlan') {
           const { plan, proposalId } = params as { plan: DrawPlan; proposalId: string | null }
-          window.sketchlink.rpcReply(id, await applyPlan(current, plan, proposalId))
+          window.flyingdraws.rpcReply(id, await applyPlan(current, plan, proposalId))
         } else if (method === 'loadScene') {
           const next = params as { board: string; title: string | null; version: number; json: string | null }
           applyLoadedScene(current, next)
-          window.sketchlink.rpcReply(id, { ok: true })
+          window.flyingdraws.rpcReply(id, { ok: true })
         } else if (method === 'syncBoards') {
           const next = params as {
             board: string
@@ -477,15 +478,15 @@ export default function App() {
           setStatus((prev) =>
             prev.kind === 'saved' ? { ...prev, version: next.version, savedAt: new Date().toISOString() } : prev
           )
-          window.sketchlink.rpcReply(id, { ok: true })
+          window.flyingdraws.rpcReply(id, { ok: true })
         } else {
           throw new Error(`unknown method ${method}`)
         }
       } catch (err) {
-        window.sketchlink.rpcReply(id, null, err instanceof Error ? err.message : String(err))
+        window.flyingdraws.rpcReply(id, null, err instanceof Error ? err.message : String(err))
       }
     })
-    window.sketchlink.ready()
+    window.flyingdraws.ready()
     return off
   }, [api, applyLoadedScene])
 
@@ -495,7 +496,7 @@ export default function App() {
       if (!current || targetBoard === boardInfo.board) return
       try {
         const snap = await snapshot(current, false)
-        const res = await window.sketchlink.switchBoard({ board: targetBoard, currentSceneJson: snap.sceneJson })
+        const res = await window.flyingdraws.switchBoard({ board: targetBoard, currentSceneJson: snap.sceneJson })
         applyLoadedScene(current, res)
       } catch (err) {
         setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
@@ -510,7 +511,7 @@ export default function App() {
       if (!current) return
       const trimmed = rawName.trim()
       const snap = await snapshot(current, false)
-      const res = await window.sketchlink.createBoard({
+      const res = await window.flyingdraws.createBoard({
         name: trimmed,
         title: /\s/.test(trimmed) ? trimmed : undefined,
         currentSceneJson: snap.sceneJson
@@ -527,7 +528,7 @@ export default function App() {
     if (!current) return
     const trimmed = rawName.trim()
     const snap = await snapshot(current, false)
-    const res = await window.sketchlink.renameBoard({
+    const res = await window.flyingdraws.renameBoard({
       board: boardInfo.board,
       name: trimmed,
       title: /\s/.test(trimmed) ? trimmed : null,
@@ -549,7 +550,7 @@ export default function App() {
     if (!current) return
     const snap = await snapshot(current, false)
     const target = boardInfo.board
-    const res = await window.sketchlink.deleteBoard({
+    const res = await window.flyingdraws.deleteBoard({
       board: target,
       currentSceneJson: snap.sceneJson
     })
@@ -564,7 +565,7 @@ export default function App() {
       // 有 agent 正等着（或者这是在回应它的请求）时，画会直接交到它手上；否则先放进收件箱
       const direct = requestId !== null || hubRef.current.agentWaiting
       const snap = await snapshot(apiRef.current, true)
-      await window.sketchlink.submit({ requestId, note, ...snap })
+      await window.flyingdraws.submit({ requestId, note, ...snap })
       if (direct) setToast('agent 已经收到你的画')
       lastSavedVersion.current = elementsVersion(apiRef.current.getSceneElements())
       setComposing(false)
@@ -578,7 +579,7 @@ export default function App() {
     if (!current) return
     resolveProposal(current, proposalId, accept)
     const snap = await snapshot(current, true)
-    await window.sketchlink.submit({ requestId, note, decision: accept ? 'accepted' : 'rejected', ...snap })
+    await window.flyingdraws.submit({ requestId, note, decision: accept ? 'accepted' : 'rejected', ...snap })
     lastSavedVersion.current = elementsVersion(current.getSceneElements())
   }, [])
 
@@ -594,7 +595,7 @@ export default function App() {
     // 应用刚启动时画板可能还没载入完，等提议的元素出现了再移
     let tries = 0
     const timer = setInterval(() => {
-      const mine = api.getSceneElements().filter((el) => el.customData?.sketchlink?.proposal === proposalId)
+      const mine = api.getSceneElements().filter((el) => el.customData?.flyingdraws?.proposal === proposalId)
       if (!mine.length && ++tries < 20) return
       clearInterval(timer)
       showElements(api, mine, true)
@@ -604,7 +605,7 @@ export default function App() {
 
   // 端到端测试要直接操作画布（模拟用户拖动、改字），只在隔离的测试实例上开放
   useEffect(() => {
-    if (api && window.sketchlink.testMode) (window as unknown as { __sketchlinkApi?: Api }).__sketchlinkApi = api
+    if (api && window.flyingdraws.testMode) (window as unknown as { __flyingdrawsApi?: Api }).__flyingdrawsApi = api
   }, [api])
 
   const nextBoardName = () => {
@@ -617,15 +618,21 @@ export default function App() {
 
   return (
     <>
+      {/* 自己画的标题栏：和画布一个颜色，整条可以拖动窗口 */}
+      <div className="fd-titlebar">
+        <span className="fd-titlebar-app">Flying draws</span>
+        <span className="fd-titlebar-board">{boardInfo.title ? `${boardInfo.title} (${boardInfo.board})` : boardInfo.board}</span>
+      </div>
+      <div className="fd-canvas">
       <Excalidraw
         excalidrawAPI={setApi}
         initialData={initialData}
         onChange={onChange}
         langCode="zh-CN"
         renderTopRightUI={() => (
-          <div className="sl-status">
+          <div className="fd-status">
             <select
-              className="sl-board-select"
+              className="fd-board-select"
               aria-label="切换画板"
               title="切换当前画板"
               value={boardInfo.board}
@@ -641,7 +648,7 @@ export default function App() {
               ))}
             </select>
             <button
-              className="sl-icon sl-new-board"
+              className="fd-icon fd-new-board"
               onClick={() => setCreating(true)}
               aria-label="新建画板"
               title="新建一块空白画板"
@@ -655,9 +662,17 @@ export default function App() {
                 {
                   label: '打开文件位置',
                   title: '在资源管理器中显示画板文件',
-                  onSelect: () => void window.sketchlink.revealBoard()
+                  onSelect: () => void window.flyingdraws.revealBoard()
                 },
                 {
+                  label: '重新加载',
+                  title: '重新载入页面（没存盘的修改会先保存）',
+                  sepBefore: true,
+                  onSelect: () => void save().then(() => window.flyingdraws.reloadWindow())
+                },
+                { label: '开发者工具', title: '打开或关闭开发者工具', onSelect: () => window.flyingdraws.toggleDevTools() },
+                {
+                  sepBefore: true,
                   label: '删除',
                   title: boards.length <= 1 ? '至少保留一块画板' : '删除当前画板',
                   danger: true,
@@ -667,12 +682,13 @@ export default function App() {
               ]}
             />
             <StatusText status={status} />
-            <button className="sl-primary" onClick={() => setComposing(true)} title="把当前画布发给 agent">
+            <button className="fd-primary" onClick={() => setComposing(true)} title="把当前画布发给 agent">
               发给 agent
             </button>
           </div>
         )}
       />
+      </div>
       {creating ? (
         <BoardNameModal
           modeTitle="新建画板"
@@ -721,7 +737,7 @@ export default function App() {
           prompt={request.prompt}
           queued={queued}
           onSend={(note) => submit(request.id, note)}
-          onCancel={() => void window.sketchlink.cancel(request.id)}
+          onCancel={() => void window.flyingdraws.cancel(request.id)}
           cancelLabel="不画了"
         />
       ) : composing ? (
@@ -737,14 +753,14 @@ export default function App() {
           cancelLabel="取消"
         />
       ) : hub.agentWaiting ? (
-        <div className="sl-waiting sl-waiting-live">agent 正在等你：画好后点右上角「发给 agent」</div>
+        <div className="fd-waiting fd-waiting-live">agent 正在等你：画好后点右上角「发给 agent」</div>
       ) : hub.inbox > 0 ? (
-        <div className="sl-waiting">
+        <div className="fd-waiting">
           已发出{hub.inbox > 1 ? ` ${hub.inbox} 份` : ''}，agent 还没来取。在聊天里跟它说一声「画好了」
         </div>
       ) : null}
       {toast ? (
-        <div className="sl-toast" role="status">
+        <div className="fd-toast" role="status">
           {toast}
         </div>
       ) : null}
@@ -778,9 +794,9 @@ function BoardNameModal(props: {
     }
   }
   return (
-    <div className="sl-modal-backdrop" onClick={() => !busy && props.onClose()}>
-      <div className="sl-modal" role="dialog" aria-label={props.modeTitle} onClick={(e) => e.stopPropagation()}>
-        <div className="sl-modal-title">{props.modeTitle}</div>
+    <div className="fd-modal-backdrop" onClick={() => !busy && props.onClose()}>
+      <div className="fd-modal" role="dialog" aria-label={props.modeTitle} onClick={(e) => e.stopPropagation()}>
+        <div className="fd-modal-title">{props.modeTitle}</div>
         <input
           autoFocus
           value={name}
@@ -793,12 +809,12 @@ function BoardNameModal(props: {
             if (e.key === 'Escape' && !busy) props.onClose()
           }}
         />
-        {error ? <div className="sl-error">{error}</div> : null}
-        <div className="sl-modal-actions">
+        {error ? <div className="fd-error">{error}</div> : null}
+        <div className="fd-modal-actions">
           <button onClick={props.onClose} disabled={busy}>
             取消
           </button>
-          <button className="sl-primary" onClick={() => void submit()} disabled={busy}>
+          <button className="fd-primary" onClick={() => void submit()} disabled={busy}>
             {busy ? props.busyLabel : props.submitLabel}
           </button>
         </div>
@@ -828,9 +844,9 @@ function ConfirmModal(props: {
     }
   }
   return (
-    <div className="sl-modal-backdrop" onClick={() => !busy && props.onClose()}>
+    <div className="fd-modal-backdrop" onClick={() => !busy && props.onClose()}>
       <div
-        className="sl-modal"
+        className="fd-modal"
         role="dialog"
         aria-label={props.title}
         onClick={(e) => e.stopPropagation()}
@@ -839,14 +855,14 @@ function ConfirmModal(props: {
           if (e.key === 'Escape' && !busy) props.onClose()
         }}
       >
-        <div className="sl-modal-title">{props.title}</div>
+        <div className="fd-modal-title">{props.title}</div>
         <div>{props.message}</div>
-        {error ? <div className="sl-error">{error}</div> : null}
-        <div className="sl-modal-actions">
+        {error ? <div className="fd-error">{error}</div> : null}
+        <div className="fd-modal-actions">
           <button autoFocus onClick={props.onClose} disabled={busy}>
             取消
           </button>
-          <button className="sl-danger" onClick={() => void confirm()} disabled={busy}>
+          <button className="fd-danger" onClick={() => void confirm()} disabled={busy}>
             {busy ? props.busyLabel : props.confirmLabel}
           </button>
         </div>
@@ -879,12 +895,12 @@ function Banner(props: {
   }
   const send = () => run(props.onSend)
   return (
-    <div className="sl-banner" role="dialog" aria-label={props.title}>
-      <div className="sl-banner-title">{props.title}</div>
-      <div className="sl-banner-prompt">{props.prompt}</div>
-      {props.queued ? <div className="sl-banner-queued">处理完这个，后面还有 {props.queued} 个请求</div> : null}
+    <div className="fd-banner" role="dialog" aria-label={props.title}>
+      <div className="fd-banner-title">{props.title}</div>
+      <div className="fd-banner-prompt">{props.prompt}</div>
+      {props.queued ? <div className="fd-banner-queued">处理完这个，后面还有 {props.queued} 个请求</div> : null}
       <input
-        className="sl-banner-note"
+        className="fd-banner-note"
         placeholder="想补充一句话吗？（可不填）"
         value={note}
         onChange={(e) => setNote(e.target.value)}
@@ -893,12 +909,12 @@ function Banner(props: {
           if (e.key === 'Enter' && !sending) void send()
         }}
       />
-      {error ? <div className="sl-error">{error}</div> : null}
-      <div className="sl-banner-actions">
+      {error ? <div className="fd-error">{error}</div> : null}
+      <div className="fd-banner-actions">
         <button onClick={() => void run(props.onCancel)} disabled={sending}>
           {props.cancelLabel}
         </button>
-        <button className="sl-primary" onClick={() => void send()} disabled={sending}>
+        <button className="fd-primary" onClick={() => void send()} disabled={sending}>
           {sending ? '发送中…' : (props.sendLabel ?? '发送')}
         </button>
       </div>
@@ -906,7 +922,7 @@ function Banner(props: {
   )
 }
 
-type MenuItem = { label: string; title?: string; danger?: boolean; disabled?: boolean; onSelect: () => void }
+type MenuItem = { label: string; title?: string; danger?: boolean; disabled?: boolean; sepBefore?: boolean; onSelect: () => void }
 
 // 右上角的「⋯」菜单：不常用的画板操作收在这里，免得和 Excalidraw 的工具栏抢位置
 function MoreMenu({ items }: { items: MenuItem[] }) {
@@ -941,9 +957,9 @@ function MoreMenu({ items }: { items: MenuItem[] }) {
     }
   }, [open])
   return (
-    <div className="sl-more-wrap" ref={wrap}>
+    <div className="fd-more-wrap" ref={wrap}>
       <button
-        className="sl-icon sl-more"
+        className="fd-icon fd-more"
         aria-label="更多画板操作"
         aria-haspopup="menu"
         aria-expanded={open}
@@ -954,12 +970,13 @@ function MoreMenu({ items }: { items: MenuItem[] }) {
       </button>
       {pos
         ? createPortal(
-            <div className="sl-menu" role="menu" ref={menu} style={{ top: pos.top, right: pos.right }}>
-              {items.map((item) => (
+            <div className="fd-menu" role="menu" ref={menu} style={{ top: pos.top, right: pos.right }}>
+              {items.flatMap((item) => [
+                item.sepBefore ? <div key={`${item.label}-sep`} className="fd-menu-sep" role="separator" /> : null,
                 <button
                   key={item.label}
                   role="menuitem"
-                  className={item.danger ? 'sl-menu-danger' : undefined}
+                  className={item.danger ? 'fd-menu-danger' : undefined}
                   title={item.title}
                   disabled={item.disabled}
                   onClick={() => {
@@ -969,7 +986,7 @@ function MoreMenu({ items }: { items: MenuItem[] }) {
                 >
                   {item.label}
                 </button>
-              ))}
+              ])}
             </div>,
             document.body
           )
@@ -982,13 +999,13 @@ function MoreMenu({ items }: { items: MenuItem[] }) {
 function StatusText({ status }: { status: Status }) {
   switch (status.kind) {
     case 'loading':
-      return <span className="sl-save">载入中…</span>
+      return <span className="fd-save">载入中…</span>
     case 'idle':
-      return <span className="sl-save">未修改</span>
+      return <span className="fd-save">未修改</span>
     case 'saved':
       return (
         <span
-          className="sl-save sl-save-ok"
+          className="fd-save fd-save-ok"
           title={`v${status.version} · ${new Date(status.savedAt).toLocaleTimeString()}\n${status.path}`}
         >
           已保存
@@ -996,7 +1013,7 @@ function StatusText({ status }: { status: Status }) {
       )
     case 'error':
       return (
-        <span className="sl-save sl-save-error" title={status.message}>
+        <span className="fd-save fd-save-error" title={status.message}>
           出错了：{status.message}
         </span>
       )

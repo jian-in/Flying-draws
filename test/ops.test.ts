@@ -177,7 +177,7 @@ test('指令有问题时整批拒绝，错误信息说明是哪一条', () => {
 })
 
 test('agent 画的元素在摘要里单独标出来', () => {
-  const mine: SceneElement = { id: 'rc', type: 'rectangle', x: 0, y: 200, width: 100, height: 60, customData: { sketchlink: { author: 'agent' } } }
+  const mine: SceneElement = { id: 'rc', type: 'rectangle', x: 0, y: 200, width: 100, height: 60, customData: { flyingdraws: { author: 'agent' } } }
   const g = buildGraph([...existing, mine])
   assert.deepEqual(
     g.nodes.map((n) => n.author),
@@ -189,7 +189,7 @@ test('agent 画的元素在摘要里单独标出来', () => {
 })
 
 // 画板：用户的「入口」(N1) → agent 的「校验」(N2) → agent 的「入库」(N3)，外加一个还没确认的提议「缓存」(N4)
-const agent = { customData: { sketchlink: { author: 'agent', layer: 'final' } } }
+const agent = { customData: { flyingdraws: { author: 'agent', layer: 'final' } } }
 const mixed: SceneElement[] = [
   { id: 'u', type: 'rectangle', x: 0, y: 0, width: 100, height: 60 },
   { id: 'ut', type: 'text', x: 10, y: 10, width: 40, height: 20, text: '入口', containerId: 'u' },
@@ -199,7 +199,7 @@ const mixed: SceneElement[] = [
   { id: 'bt', type: 'text', x: 610, y: 10, width: 40, height: 20, text: '入库', containerId: 'b', ...agent },
   { id: 'e1', type: 'arrow', x: 100, y: 30, width: 200, height: 0, startBinding: { elementId: 'u' }, endBinding: { elementId: 'a' }, endArrowhead: 'arrow' },
   { id: 'e2', type: 'arrow', x: 400, y: 30, width: 200, height: 0, startBinding: { elementId: 'a' }, endBinding: { elementId: 'b' }, endArrowhead: 'arrow', ...agent },
-  { id: 'p', type: 'rectangle', x: 900, y: 0, width: 100, height: 60, customData: { sketchlink: { author: 'agent', layer: 'proposal' } } },
+  { id: 'p', type: 'rectangle', x: 900, y: 0, width: 100, height: 60, customData: { flyingdraws: { author: 'agent', layer: 'proposal' } } },
   { id: 'pt', type: 'text', x: 910, y: 10, width: 40, height: 20, text: '缓存', containerId: 'p' }
 ]
 
@@ -287,7 +287,7 @@ test('还没确认的提议和已经画上去的分开标', () => {
     y: 200,
     width: 100,
     height: 60,
-    customData: { sketchlink: { author: 'agent', layer: 'proposal' } }
+    customData: { flyingdraws: { author: 'agent', layer: 'proposal' } }
   }
   const g = buildGraph([...existing, proposed])
   assert.deepEqual(

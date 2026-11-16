@@ -28,19 +28,19 @@ export interface SceneElement {
   groupIds?: readonly string[]
   frameId?: string | null
   name?: string | null
-  customData?: { sketchlink?: { author?: string; layer?: string } } | null
+  customData?: { flyingdraws?: { author?: string; layer?: string } } | null
 }
 
 export type Author = 'user' | 'agent'
 
-// 元素是谁画的。agent 画的元素在 customData.sketchlink.author 里有标记，其余都算用户画的。
+// 元素是谁画的。agent 画的元素在 customData.flyingdraws.author 里有标记，其余都算用户画的。
 export function authorOf(el: SceneElement): Author {
-  return el.customData?.sketchlink?.author === 'agent' ? 'agent' : 'user'
+  return el.customData?.flyingdraws?.author === 'agent' ? 'agent' : 'user'
 }
 
 // 作者，以及是不是还在提议层上（agent 画的提议，用户还没确认）
 function provenance(el: SceneElement): { author: Author; proposed: boolean } {
-  return { author: authorOf(el), proposed: el.customData?.sketchlink?.layer === 'proposal' }
+  return { author: authorOf(el), proposed: el.customData?.flyingdraws?.layer === 'proposal' }
 }
 
 export interface SemanticNode {

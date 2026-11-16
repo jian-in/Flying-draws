@@ -2,7 +2,7 @@
 // 在画布窗口里点按钮（扮演用户），把 open / read / request / wait 的各条路径都走一遍。
 //
 // 用法（先 npm run build）：
-//   1. 关掉已经开着的 Sketchlink 窗口
+//   1. 关掉已经开着的 Flying draws 窗口
 //   2. npx electron . --remote-debugging-port=9333     （另开一个终端，保持运行）
 //   3. node scripts/e2e.mjs [截图输出目录]
 //
@@ -59,7 +59,7 @@ const cdp = (method, params = {}) =>
 const js = async (e) => (await cdp('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true })).result?.result?.value
 const clickButton = (label) =>
   js(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===${JSON.stringify(label)}); if(!b) return false; b.click(); return true })()`)
-const bannerText = () => js(`document.querySelector('.sl-banner, .sl-waiting')?.innerText ?? null`)
+const bannerText = () => js(`document.querySelector('.fd-banner, .fd-waiting')?.innerText ?? null`)
 async function waitFor(fn, ms = 10000) {
   const end = Date.now() + ms
   while (Date.now() < end) {
@@ -76,7 +76,7 @@ for (let i = 0; i < 40; i++) {
 await sleep(800)
 
 // ---------- MCP：扮演 agent ----------
-const client = new Client({ name: 'sketchlink-e2e', version: '0.0.1' })
+const client = new Client({ name: 'flying-draws-e2e', version: '0.0.1' })
 await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, 'out/bridge/index.js')], stderr: 'inherit' }))
 const call = (name, args = {}) => client.callTool({ name, arguments: args }, undefined, { timeout: 120000 })
 const textOf = (res) => res.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n')
@@ -103,7 +103,7 @@ const reqId = reqText.match(/req_\w+/)?.[0]
 check(Boolean(reqId), `canvas_request 返回 ${reqId}`)
 const waiting = call('canvas_wait', { request_id: reqId, timeout_s: 30, image: 'never' })
 check(/把登录流程画一下/.test((await waitFor(bannerText)) ?? ''), '画布上出现请求横幅')
-await js(`document.querySelector('.sl-banner-note')?.focus()`)
+await js(`document.querySelector('.fd-banner-note')?.focus()`)
 await cdp('Input.insertText', { text: '左边是入口，右边是登录页' })
 await clickButton('发送')
 const answered = textOf(await waiting)

@@ -1,4 +1,4 @@
-# Sketchlink 设计草案
+# Flying draws 设计草案
 
 > 暂定名，发布前需要查一下 GitHub 和 npm 上有没有重名。
 > 版本：v0.1 草案 · 2026-11-14
@@ -62,7 +62,7 @@
 
 ```
 ┌──────────────┐  stdio MCP   ┌─────────────────┐  WebSocket   ┌─────────────────────────┐
-│ 任意 agent    │ ───────────▶ │ sketchlink-mcp  │ ───────────▶ │ Sketchlink 桌面应用       │
+│ 任意 agent    │ ───────────▶ │ flying-draws-mcp  │ ───────────▶ │ Flying draws 桌面应用       │
 │ Claude Code   │              │ （轻量桥接进程）  │  127.0.0.1   │  ├ 主进程：本地服务、存储   │
 │ Codex / Cursor│  HTTP MCP    │                 │  + token     │  ├ 渲染进程：Excalidraw    │
 │ Gemini CLI ...│ ────────────────────────────────────────────▶ │  └ 语义层：画布 → 描述      │
@@ -70,7 +70,7 @@
 ```
 
 - **桌面应用**：常驻运行，负责画布窗口、本地存储和语义翻译。主进程在 `127.0.0.1` 上开一个 WebSocket 服务，同时提供 Streamable HTTP 的 MCP 端点，给支持 HTTP 的 agent 直连。
-- **sketchlink-mcp 桥接**：agent 通过 stdio 启动的一个小进程，只负责转发。连接时如果发现桌面应用没在运行，就自动把它拉起来。用 `npx sketchlink-mcp` 就能装。
+- **flying-draws-mcp 桥接**：agent 通过 stdio 启动的一个小进程，只负责转发。连接时如果发现桌面应用没在运行，就自动把它拉起来。用 `npx flying-draws-mcp` 就能装。
 - **为什么拆成两个进程**：stdio MCP 进程的生命周期由 agent 控制，agent 一退出它就没了。画布要比单次会话活得久，多个 agent 也要能同时连到同一块画布上。
 
 ### 技术选型
@@ -126,7 +126,7 @@
 
 **为什么要拆出 `canvas_wait`**：用户画图可能要好几分钟，但已知的 MCP 客户端超时情况很杂。有用户报告 Claude Code 的 HTTP 传输写死了 60 秒，桌面 app 的 stdio 调用约 60 秒就会被取消。把"发起请求"和"等待结果"分成两个工具，每次最多等 45 秒，在哪种客户端上都不会撞上超时。
 
-**MCP Resources（可选）**：`sketchlink://boards`、`sketchlink://board/{id}/summary`。用户点"发送"时推送资源更新通知，给支持订阅的客户端用。
+**MCP Resources（可选）**：`flyingdraws://boards`、`flyingdraws://board/{id}/summary`。用户点"发送"时推送资源更新通知，给支持订阅的客户端用。
 
 ## 8. 嵌入和编辑
 
@@ -140,7 +140,7 @@
 
 ## 9. 数据和隐私
 
-- 画板存在 `~/.sketchlink/boards/`，每块画板一个 `.excalidraw` 文件，旁边放一个版本历史目录。
+- 画板存在 `~/.flyingdraws/boards/`，每块画板一个 `.excalidraw` 文件，旁边放一个版本历史目录。
 - 元素的来源（作者、图层、对应的请求 ID）写在 Excalidraw 元素的 `customData` 字段里，导出后其他 Excalidraw 也能正常打开。（`customData` 的具体用法要在 Excalidraw 源码里确认。）
 - 本地服务只绑定 `127.0.0.1`。桥接进程连接时要带一个随机 token，token 存在用户目录下，防止本机其他网页直接连进来改画布。
 - 不收集任何遥测数据。

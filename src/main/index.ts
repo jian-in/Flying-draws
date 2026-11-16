@@ -20,17 +20,33 @@ import {
   parseBoardMeta,
   pickFallbackBoard,
   updateBoardSceneTitle,
+  upgradeLegacyScene,
   validateBoardId,
   type BoardMeta
 } from './boards'
 
-// 设了 SKETCHLINK_HOME 就把画板、连接信息和 Electron 自己的数据都放到那个目录下。
+// 设了 FLYINGDRAWS_HOME 就把画板、连接信息和 Electron 自己的数据都放到那个目录下。
 // 测试用它开一个和用户画板完全隔离的实例（单实例锁也是按 userData 目录算的）。
-const HOME = process.env['SKETCHLINK_HOME'] || join(homedir(), '.sketchlink')
-if (process.env['SKETCHLINK_HOME']) app.setPath('userData', join(HOME, 'electron-data'))
+const HOME = process.env['FLYINGDRAWS_HOME'] || join(homedir(), '.flyingdraws')
+if (process.env['FLYINGDRAWS_HOME']) app.setPath('userData', join(HOME, 'electron-data'))
+else migrateLegacyDirs()
+
+// 项目原来叫 Sketchlink。第一次用新名字启动时，把旧的数据目录 ~/.sketchlink 整个改名过来
+// （画板、待处理请求、当前画板记录）。新目录已经存在就什么都不做，不会覆盖任何东西。
+// 改名失败只记一行日志，不拦住应用启动。Electron 自己的数据目录（缓存之类）不搬，里面没有用户的东西。
+function migrateLegacyDirs(): void {
+  const from = join(homedir(), '.sketchlink')
+  try {
+    if (existsSync(HOME) || !existsSync(from)) return
+    renameSync(from, HOME)
+    console.error(`[flyingdraws] moved ${from} to ${HOME}`)
+  } catch (err) {
+    console.error('[flyingdraws] could not move the legacy data directory:', err)
+  }
+}
 // 端到端测试要在页面里点按钮，用这个变量打开 Chrome DevTools 端口。只在隔离实例上认。
-if (process.env['SKETCHLINK_HOME'] && process.env['SKETCHLINK_DEBUG_PORT']) {
-  app.commandLine.appendSwitch('remote-debugging-port', String(Number(process.env['SKETCHLINK_DEBUG_PORT'])))
+if (process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']) {
+  app.commandLine.appendSwitch('remote-debugging-port', String(Number(process.env['FLYINGDRAWS_DEBUG_PORT'])))
 }
 const BOARDS_DIR = join(HOME, 'boards')
 const legacyM0Path = join(BOARDS_DIR, 'm0.excalidraw')
@@ -83,7 +99,7 @@ function persistCurrentBoard(): void {
     mkdirSync(HOME, { recursive: true })
     writeFileSync(statePath, JSON.stringify({ currentBoard: currentBoardId }), 'utf8')
   } catch (err) {
-    console.error('[sketchlink] could not save active board:', err)
+    console.error('[flyingdraws] could not save active board:', err)
   }
 }
 
@@ -105,7 +121,14 @@ function getSession(id: string): BoardSession {
 function updateWindowTitle(): void {
   if (!win || win.isDestroyed()) return
   const s = getSession(currentBoardId)
-  win.setTitle(s.title ? `Sketchlink — ${s.title} (${s.id})` : `Sketchlink — ${s.id}`)
+  win.setTitle(s.title ? `Flying draws — ${s.title} (${s.id})` : `Flying draws — ${s.id}`)
+}
+
+// 顶上那一条的高度和颜色，要和 styles.css 里的 --fd-titlebar-h、--fd-paper 保持一致
+const TITLEBAR_HEIGHT = 36
+const TITLEBAR_COLORS = {
+  light: { color: '#fffbe6', symbolColor: '#2b2a26' },
+  dark: { color: '#181508', symbolColor: '#e9e2c8' }
 }
 
 // ---------- 画板读写与版本号 ----------
@@ -132,10 +155,10 @@ async function loadBoard(id = currentBoardId): Promise<{ board: string; title: s
     await rename(legacyM0Path, path)
   }
   try {
-    const json = await readFile(path, 'utf8')
+    const json = upgradeLegacyScene(await readFile(path, 'utf8'))
     const scene = JSON.parse(json)
-    session.version = Number(scene?.sketchlink?.version) || 1
-    session.title = typeof scene?.sketchlink?.title === 'string' && scene.sketchlink.title.trim() ? scene.sketchlink.title.trim() : null
+    session.version = Number(scene?.flyingdraws?.version) || 1
+    session.title = typeof scene?.flyingdraws?.title === 'string' && scene.flyingdraws.title.trim() ? scene.flyingdraws.title.trim() : null
     session.lastElementsKey = elementsKey(scene.elements ?? [])
     return { board: id, title: session.title, version: session.version, json, path }
   } catch (err) {
@@ -157,7 +180,7 @@ async function acceptScene(json: string, id = currentBoardId): Promise<number> {
   if (key === session.lastElementsKey) return session.version
   session.lastElementsKey = key
   session.version += 1
-  scene.sketchlink = { version: session.version, ...(session.title ? { title: session.title } : {}) }
+  scene.flyingdraws = { version: session.version, ...(session.title ? { title: session.title } : {}) }
   await atomicWriteJson(path, scene)
   saveCount += 1
   return session.version
@@ -180,7 +203,7 @@ async function listBoards(): Promise<BoardInfo[]> {
     const file = boardFilePath(BOARDS_DIR, id)
     try {
       const [json, st] = await Promise.all([readFile(file, 'utf8'), stat(file)])
-      items.push({ ...parseBoardMeta(id, json, st.mtime.toISOString()), active: id === currentBoardId })
+      items.push({ ...parseBoardMeta(id, upgradeLegacyScene(json), st.mtime.toISOString()), active: id === currentBoardId })
     } catch {}
   }
   if (!seen.has(currentBoardId)) {
@@ -249,7 +272,7 @@ async function switchBoard(
     await atomicWriteJson(targetPath, emptyBoardScene({ title: nextTitle }))
   } else if (nextTitle !== undefined) {
     try {
-      const updated = updateBoardSceneTitle(await readFile(targetPath, 'utf8'), nextTitle)
+      const updated = updateBoardSceneTitle(upgradeLegacyScene(await readFile(targetPath, 'utf8')), nextTitle)
       await atomicWriteJson(targetPath, JSON.parse(updated))
     } catch {}
   }
@@ -308,7 +331,7 @@ async function renameBoard(
     throw new Error(`画板「${toId}」已存在`)
   }
 
-  const rawJson = fromExists ? await readFile(fromPath, 'utf8') : JSON.stringify(emptyBoardScene())
+  const rawJson = fromExists ? upgradeLegacyScene(await readFile(fromPath, 'utf8')) : JSON.stringify(emptyBoardScene())
   const nextTitle = opts.title !== undefined ? normalizeBoardTitle(opts.title) : null
   const updatedScene = JSON.parse(updateBoardSceneTitle(rawJson, nextTitle)) as Record<string, unknown>
   await atomicWriteJson(toPath, updatedScene)
@@ -485,12 +508,34 @@ function createWindow(): void {
   win = new BrowserWindow({
     width: 1280,
     height: 820,
-    title: 'Sketchlink',
+    title: 'Flying draws',
+    // 不用系统自带的标题栏和菜单栏：顶上那一条由页面自己画成纸色，只留系统的最小化/最大化/关闭按钮
+    titleBarStyle: 'hidden',
+    titleBarOverlay: { ...TITLEBAR_COLORS.light, height: TITLEBAR_HEIGHT },
+    backgroundColor: TITLEBAR_COLORS.light.color,
+    autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       sandbox: true
     }
+  })
+  const overlayTarget = win
+  ipcMain.removeAllListeners('window:theme')
+  ipcMain.on('window:theme', (_e, theme: unknown) => {
+    if (overlayTarget.isDestroyed()) return
+    const colors = theme === 'dark' ? TITLEBAR_COLORS.dark : TITLEBAR_COLORS.light
+    // 只有 Windows 和 Linux 上能改这几个按钮的颜色
+    if (process.platform !== 'darwin') overlayTarget.setTitleBarOverlay({ ...colors, height: TITLEBAR_HEIGHT })
+    overlayTarget.setBackgroundColor(colors.color)
+  })
+  ipcMain.removeAllListeners('window:reload')
+  ipcMain.on('window:reload', () => {
+    if (!overlayTarget.isDestroyed()) overlayTarget.webContents.reload()
+  })
+  ipcMain.removeAllListeners('window:devtools')
+  ipcMain.on('window:devtools', () => {
+    if (!overlayTarget.isDestroyed()) overlayTarget.webContents.toggleDevTools()
   })
   windowReady = new Promise((resolve) => ipcMain.once('renderer:ready', () => resolve()))
   updateWindowTitle()
@@ -552,7 +597,7 @@ function persistPending(): void {
     writeFileSync(tmp, JSON.stringify(payload), 'utf8')
     renameSync(tmp, pendingPath)
   } catch (err) {
-    console.error('[sketchlink] could not save pending requests:', err)
+    console.error('[flyingdraws] could not save pending requests:', err)
   }
 }
 
@@ -590,9 +635,9 @@ function restorePending(): void {
     let proposalsOnBoard = new Set<string>()
     if (boardExists) {
       try {
-        const elements = (JSON.parse(readFileSync(boardPath, 'utf8')).elements ?? []) as DiffElement[]
+        const elements = (JSON.parse(upgradeLegacyScene(readFileSync(boardPath, 'utf8'))).elements ?? []) as DiffElement[]
         proposalsOnBoard = new Set(
-          elements.filter((el) => !el.isDeleted && el.customData?.sketchlink?.layer === 'proposal').map((el) => String(el.customData?.sketchlink?.proposal))
+          elements.filter((el) => !el.isDeleted && el.customData?.flyingdraws?.layer === 'proposal').map((el) => String(el.customData?.flyingdraws?.proposal))
         )
       } catch {}
     }

@@ -3,8 +3,8 @@
 // 用法（先 npm run build）：
 //   node scripts/e2e-draw.mjs
 //
-// 用 SKETCHLINK_HOME 把画板和连接信息都指到 out/e2e-home，
-// 不会碰用户的 ~/.sketchlink，也不用先关掉用户开着的画布。
+// 用 FLYINGDRAWS_HOME 把画板和连接信息都指到 out/e2e-home，
+// 不会碰用户的 ~/.flyingdraws，也不用先关掉用户开着的画布。
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -61,13 +61,13 @@ async function connectPage() {
     return null
   }
   return {
-    bannerText: () => js(`document.querySelector('.sl-banner')?.innerText ?? null`),
-    waitForBanner: () => waitFor(() => js(`document.querySelector('.sl-banner')?.innerText ?? null`)),
-    waitForNoBanner: () => waitFor(() => js(`!document.querySelector('.sl-banner')`)),
+    bannerText: () => js(`document.querySelector('.fd-banner')?.innerText ?? null`),
+    waitForBanner: () => waitFor(() => js(`document.querySelector('.fd-banner')?.innerText ?? null`)),
+    waitForNoBanner: () => waitFor(() => js(`!document.querySelector('.fd-banner')`)),
     click: (label) =>
       js(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===${JSON.stringify(label)}); if(!b) return false; b.click(); return true })()`),
     typeNote: async (t) => {
-      await js(`document.querySelector('.sl-banner-note')?.focus()`)
+      await js(`document.querySelector('.fd-banner-note')?.focus()`)
       await cdp('Input.insertText', { text: t })
     },
     js,
@@ -82,12 +82,12 @@ const check = (ok, label) => {
   if (!ok) failures += 1
 }
 
-const client = new Client({ name: 'sketchlink-e2e-draw', version: '0.0.1' })
+const client = new Client({ name: 'flying-draws-e2e-draw', version: '0.0.1' })
 await client.connect(
   new StdioClientTransport({
     command: process.execPath,
     args: [join(ROOT, 'out/bridge/index.js')],
-    env: { ...process.env, SKETCHLINK_HOME: HOME, SKETCHLINK_DEBUG_PORT: String(DEBUG_PORT) },
+    env: { ...process.env, FLYINGDRAWS_HOME: HOME, FLYINGDRAWS_DEBUG_PORT: String(DEBUG_PORT) },
     stderr: 'inherit'
   })
 )
@@ -170,7 +170,7 @@ try {
 
   // 落盘的文件里有作者标记，别的 Excalidraw 也能打开
   const saved = JSON.parse(readFileSync(join(HOME, 'boards', 'default.excalidraw'), 'utf8'))
-  const mine = saved.elements.filter((el) => el.customData?.sketchlink?.author === 'agent' && !el.isDeleted)
+  const mine = saved.elements.filter((el) => el.customData?.flyingdraws?.author === 'agent' && !el.isDeleted)
   check(saved.type === 'excalidraw' && mine.length === saved.elements.filter((el) => !el.isDeleted).length, `画板文件里 ${mine.length} 个元素都标了 agent`)
   const arrow = saved.elements.find((el) => el.type === 'arrow')
   const target = saved.elements.find((el) => el.id === arrow.endBinding?.elementId)
@@ -190,7 +190,7 @@ try {
   // 扮演用户直接改画布上的一个元素
   const userEdits = (label, patchSrc) =>
     user.js(`(() => {
-      const api = window.__sketchlinkApi
+      const api = window.__flyingdrawsApi
       const all = api.getSceneElementsIncludingDeleted()
       const text = all.find((e) => !e.isDeleted && e.type === 'text' && e.text === ${JSON.stringify(label)})
       const patch = ${patchSrc}
@@ -235,7 +235,7 @@ try {
 
   // 用户画的东西不能动
   await user.js(`(() => {
-    const api = window.__sketchlinkApi
+    const api = window.__flyingdrawsApi
     const all = api.getSceneElementsIncludingDeleted()
     const model = all.find((e) => !e.isDeleted && e.type === 'rectangle')
     const mine = { ...model, id: 'user_box_0', x: model.x - 400, boundElements: null, strokeColor: '#1e1e1e' }
@@ -268,8 +268,8 @@ try {
   check(!/「归档」/.test((await readNow()).t), '冲突时整批都没画')
 
   // ---------- 用户主动"发给 agent"：发出后要有反馈 ----------
-  const notice = () => user.js(`document.querySelector('.sl-waiting')?.innerText ?? null`)
-  const toast = () => user.js(`document.querySelector('.sl-toast')?.innerText ?? null`)
+  const notice = () => user.js(`document.querySelector('.fd-waiting')?.innerText ?? null`)
+  const toast = () => user.js(`document.querySelector('.fd-toast')?.innerText ?? null`)
   const until = async (fn, ms = 6000) => {
     for (const end = Date.now() + ms; Date.now() < end; await sleep(150)) if (await fn()) return true
     return false
@@ -329,8 +329,8 @@ try {
   check(/ACCEPTED/.test(r2) && /exactly as you drew it/.test(r2), '接受：agent 收到结果，并被告知用户没有改动')
   check(/「查缓存」菱形【agent 画的】/.test(r2) && !/提议/.test(r2), '接受后提议变成正式内容')
   const after = JSON.parse(readFileSync(join(HOME, 'boards', 'default.excalidraw'), 'utf8')).elements.filter((el) => !el.isDeleted)
-  const merged = after.find((el) => el.type === 'diamond' && el.customData?.sketchlink?.layer === 'final' && el.strokeStyle === 'solid' && el.opacity === 100)
-  check(after.length > before && !after.some((el) => el.customData?.sketchlink?.layer === 'proposal') && Boolean(merged), '画板文件里没有残留的提议层元素')
+  const merged = after.find((el) => el.type === 'diamond' && el.customData?.flyingdraws?.layer === 'final' && el.strokeStyle === 'solid' && el.opacity === 100)
+  check(after.length > before && !after.some((el) => el.customData?.flyingdraws?.layer === 'proposal') && Boolean(merged), '画板文件里没有残留的提议层元素')
   await user.screenshot(join(OUT, 'propose-accepted.png'))
 
   // 第三次：两个提议排队，用户在第一个上改了再接受
@@ -351,10 +351,10 @@ try {
 
   // 扮演用户直接改画布：把「发告警」往下拖、改成「发短信」，再自己画一个框
   const edited = await user.js(`(async () => {
-    const api = window.__sketchlinkApi
-    const pid = (await window.sketchlink.getHubState()).pending[0].proposalId
+    const api = window.__flyingdrawsApi
+    const pid = (await window.flyingdraws.getHubState()).pending[0].proposalId
     const all = api.getSceneElementsIncludingDeleted()
-    const label = all.find((e) => e.type === 'text' && e.text === '发告警' && e.customData?.sketchlink?.proposal === pid)
+    const label = all.find((e) => e.type === 'text' && e.text === '发告警' && e.customData?.flyingdraws?.proposal === pid)
     const node = all.find((e) => e.id === label.containerId)
     const bump = (e, patch) => ({ ...e, ...patch, version: e.version + 1, versionNonce: Math.floor(Math.random() * 1e9), updated: Date.now() })
     const next = all.map((e) =>
@@ -413,7 +413,7 @@ try {
   const openedNew = textOf(await call('canvas_open', { board: 'login-flow', title: '登录流程' }))
   check(/Created and opened canvas "login-flow"/.test(openedNew), 'canvas_open 支持传入新 board 和 title 创建并切换')
   await sleep(300)
-  const selectValAfterMcp = await user2.js(`document.querySelector('.sl-board-select')?.value`)
+  const selectValAfterMcp = await user2.js(`document.querySelector('.fd-board-select')?.value`)
   check(selectValAfterMcp === 'login-flow', 'MCP 切画板后，页面右上角下拉框同步切到 login-flow')
 
   const drawnNew = textOf(
@@ -428,17 +428,17 @@ try {
   check(/画板「login-flow」/.test(drawnNew) && /「输入账号」/.test(drawnNew) && !/重试三次/.test(drawnNew), '新画板 login-flow 独立绘制，不混入 default 的内容')
 
   // 扮演用户点「+ 新建画板」按钮在 UI 上创建一块新画板
-  await user2.js(`document.querySelector('.sl-new-board').click()`)
+  await user2.js(`document.querySelector('.fd-new-board').click()`)
   await sleep(200)
   await user2.js(`(() => {
-    const input = document.querySelector('.sl-modal input')
+    const input = document.querySelector('.fd-modal input')
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
     setter.call(input, 'ui-board')
     input.dispatchEvent(new Event('input', { bubbles: true }))
   })()`)
   await user2.click('创建')
   await sleep(400)
-  const uiSelect = await user2.js(`document.querySelector('.sl-board-select')?.value`)
+  const uiSelect = await user2.js(`document.querySelector('.fd-board-select')?.value`)
   check(uiSelect === 'ui-board', '页面点「+ 新建画板」能创建并切到 ui-board')
 
   const uiRead = textOf(await call('canvas_read'))
@@ -457,7 +457,7 @@ try {
   await user2.typeNote('重启前发出的画')
   await user2.click('发送')
   const waitingBeforeRestart = await until(
-    async () => /已发出，agent 还没来取/.test((await user2.js(`document.querySelector('.sl-waiting')?.textContent ?? ''`)) ?? '')
+    async () => /已发出，agent 还没来取/.test((await user2.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)) ?? '')
   )
   check(waitingBeforeRestart, '没有 agent 等待时发画会显示等待查看横幅')
   const pendingWithInbox = JSON.parse(readFileSync(join(HOME, 'pending.json'), 'utf8'))
@@ -473,14 +473,14 @@ try {
   await call('canvas_open')
   const user3 = await connectPage()
   const waitingAfterRestart = await until(
-    async () => /已发出，agent 还没来取/.test((await user3.js(`document.querySelector('.sl-waiting')?.textContent ?? ''`)) ?? '')
+    async () => /已发出，agent 还没来取/.test((await user3.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)) ?? '')
   )
   check(waitingAfterRestart, '应用重启后收件箱等待横幅自动恢复')
 
   const readInboxAfterRestart = textOf(await call('canvas_read', { image: 'never' }))
   check(/重启前发出的画/.test(readInboxAfterRestart), '重启后调用 canvas_read 能收到用户之前发来的画与附言')
   await sleep(300)
-  const waitingAfterRead = await user3.js(`document.querySelector('.sl-waiting')?.textContent ?? ''`)
+  const waitingAfterRead = await user3.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)
   const pendingClearedInbox = JSON.parse(readFileSync(join(HOME, 'pending.json'), 'utf8'))
   check(!waitingAfterRead && !pendingClearedInbox.inbox, '收件箱取走后等待横幅消失且 pending.json 已清空')
 
@@ -489,21 +489,21 @@ try {
   await sleep(300)
   // 重命名和删除收在「⋯」菜单里，先点开
   const openMenu = async () => {
-    await user3.js(`void (document.querySelector('.sl-menu') || document.querySelector('.sl-more').click())`)
+    await user3.js(`void (document.querySelector('.fd-menu') || document.querySelector('.fd-more').click())`)
     await sleep(150)
   }
   await openMenu()
   await user3.click('重命名')
   await sleep(200)
   await user3.js(`(() => {
-    const input = document.querySelector('.sl-modal input')
+    const input = document.querySelector('.fd-modal input')
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
     setter.call(input, 'renamed-ui')
     input.dispatchEvent(new Event('input', { bubbles: true }))
   })()`)
   await user3.click('保存')
   await sleep(400)
-  const selectAfterUiRename = await user3.js(`document.querySelector('.sl-board-select')?.value`)
+  const selectAfterUiRename = await user3.js(`document.querySelector('.fd-board-select')?.value`)
   check(
     selectAfterUiRename === 'renamed-ui' &&
       !existsSync(join(HOME, 'boards', 'ui-board.excalidraw')) &&
@@ -513,7 +513,7 @@ try {
 
   const mcpRenamed = textOf(await call('canvas_rename', { board: 'renamed-ui', new_board: 'renamed-by-mcp', title: 'MCP 重命名' }))
   await sleep(300)
-  const selectAfterMcpRename = await user3.js(`document.querySelector('.sl-board-select')?.value`)
+  const selectAfterMcpRename = await user3.js(`document.querySelector('.fd-board-select')?.value`)
   check(
     /Renamed board "renamed-ui" to "renamed-by-mcp"/.test(mcpRenamed) && selectAfterMcpRename === 'renamed-by-mcp',
     'MCP canvas_rename 能重命名画板并同步更新页面下拉框'
@@ -524,7 +524,7 @@ try {
   await sleep(200)
   await user3.click('确认删除')
   await sleep(400)
-  const selectAfterUiDelete = await user3.js(`document.querySelector('.sl-board-select')?.value`)
+  const selectAfterUiDelete = await user3.js(`document.querySelector('.fd-board-select')?.value`)
   const listedAfterUiDelete = textOf(await call('canvas_list'))
   check(
     selectAfterUiDelete === 'default' &&
@@ -549,15 +549,15 @@ try {
 
   // 界面截图：浅色和深色各一张，菜单开着
   await user3.screenshot(join(OUT, 'ui-menu.png'))
-  await user3.js(`window.__sketchlinkApi.updateScene({ appState: { theme: 'dark' } })`)
+  await user3.js(`window.__flyingdrawsApi.updateScene({ appState: { theme: 'dark' } })`)
   await sleep(300)
   await user3.click('发给 agent')
   await sleep(200)
   await openMenu()
   await user3.screenshot(join(OUT, 'ui-dark.png'))
-  check((await user3.js(`document.documentElement.dataset.slTheme`)) === 'dark', '切到深色后，横幅和菜单跟着变深色')
+  check((await user3.js(`document.documentElement.dataset.fdTheme`)) === 'dark', '切到深色后，横幅和菜单跟着变深色')
   await user3.click('取消')
-  await user3.js(`window.__sketchlinkApi.updateScene({ appState: { theme: 'light' } })`)
+  await user3.js(`window.__flyingdrawsApi.updateScene({ appState: { theme: 'light' } })`)
   await sleep(200)
 
   user3.close()

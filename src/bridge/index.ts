@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// sketchlink-mcp：agent 通过 stdio 启动的轻量桥接进程。
+// flying-draws-mcp：agent 通过 stdio 启动的轻量桥接进程。
 // 只负责把 MCP 工具调用转发给桌面应用的本地服务；应用没开时自动拉起来。
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
@@ -10,8 +10,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 
-// SKETCHLINK_HOME 和桌面应用用的是同一个变量；桥接拉起应用时环境变量会传下去
-const DAEMON_INFO = join(process.env.SKETCHLINK_HOME || join(homedir(), '.sketchlink'), 'daemon.json')
+// FLYINGDRAWS_HOME 和桌面应用用的是同一个变量；桥接拉起应用时环境变量会传下去
+const DAEMON_INFO = join(process.env.FLYINGDRAWS_HOME || join(homedir(), '.flyingdraws'), 'daemon.json')
 const APP_ROOT = resolve(__dirname, '..', '..')
 const LAUNCH_TIMEOUT_MS = 30_000
 
@@ -20,7 +20,7 @@ interface DaemonInfo {
   token: string
 }
 
-const log = (...args: unknown[]) => console.error('[sketchlink-mcp]', ...args) // stdout 留给 MCP 协议
+const log = (...args: unknown[]) => console.error('[flying-draws-mcp]', ...args) // stdout 留给 MCP 协议
 
 function readInfo(): DaemonInfo | null {
   try {
@@ -36,7 +36,7 @@ function call(info: DaemonInfo, path: string, body: unknown, timeoutMs: number):
     const isGet = path === '/health'
     const data = Buffer.from(JSON.stringify(body ?? {}))
     // GET 不能带 content-length：连接复用时服务端会把下一个请求的开头当成这次的请求体
-    const headers: http.OutgoingHttpHeaders = { 'x-sketchlink-token': info.token }
+    const headers: http.OutgoingHttpHeaders = { 'x-flyingdraws-token': info.token }
     if (!isGet) {
       headers['content-type'] = 'application/json'
       headers['content-length'] = data.length
@@ -78,7 +78,7 @@ async function healthy(info: DaemonInfo | null): Promise<boolean> {
 
 function launchApp(): void {
   if (!existsSync(join(APP_ROOT, 'out', 'main', 'index.js'))) {
-    throw new Error(`Sketchlink is not built yet. Run "npm run build" in ${APP_ROOT} first.`)
+    throw new Error(`Flying draws is not built yet. Run "npm run build" in ${APP_ROOT} first.`)
   }
   // 在 Node 里 require('electron') 拿到的是 Electron 可执行文件的路径
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -104,7 +104,7 @@ async function ensureDaemon(): Promise<DaemonInfo> {
         const fresh = readInfo()
         if (await healthy(fresh)) return fresh!
       }
-      throw new Error('Sketchlink canvas app did not start within 30s')
+      throw new Error('Flying draws canvas app did not start within 30s')
     })().finally(() => {
       launching = null
     })
@@ -138,7 +138,7 @@ async function guarded(fn: () => Promise<{ content: Content[] }>): Promise<{ con
   try {
     return await fn()
   } catch (err) {
-    return { content: [{ type: 'text', text: `Sketchlink error: ${err instanceof Error ? err.message : String(err)}` }], isError: true }
+    return { content: [{ type: 'text', text: `Flying draws error: ${err instanceof Error ? err.message : String(err)}` }], isError: true }
   }
 }
 
@@ -156,14 +156,14 @@ const boardSchema = z
   .optional()
   .describe('Optional board id/name (e.g. "default", "login-flow"). Omit to use the currently active board.')
 
-const server = new McpServer({ name: 'sketchlink', version: '0.1.0' })
+const server = new McpServer({ name: 'flying-draws', version: '0.1.0' })
 
 server.registerTool(
   'canvas_open',
   {
-    title: 'Open or create a Sketchlink canvas board',
+    title: 'Open or create a Flying draws canvas board',
     description:
-      'Open the local Sketchlink drawing canvas window (starting the app if needed) and bring it to the front. ' +
+      'Open the local Flying draws drawing canvas window (starting the app if needed) and bring it to the front. ' +
       'Optionally pass "board" to switch to another board or create a new blank board if it does not exist yet.',
     inputSchema: {
       board: z.string().min(1).optional().describe('Optional board id/name to open or create. Omit to open the current active board.'),
@@ -181,8 +181,8 @@ server.registerTool(
 server.registerTool(
   'canvas_list',
   {
-    title: 'List Sketchlink canvas boards',
-    description: 'List all available boards in Sketchlink, showing which one is currently active, its title, version, and element count.',
+    title: 'List Flying draws canvas boards',
+    description: 'List all available boards in Flying draws, showing which one is currently active, its title, version, and element count.',
     inputSchema: {}
   },
   () => guarded(async () => {
@@ -207,7 +207,7 @@ server.registerTool(
 server.registerTool(
   'canvas_rename',
   {
-    title: 'Rename a Sketchlink canvas board',
+    title: 'Rename a Flying draws canvas board',
     description: 'Rename an existing board and/or update its display title. Preserves the active session and undo history.',
     inputSchema: {
       board: z.string().min(1).optional().describe('Board id to rename. Omit to rename the current active board.'),
@@ -225,10 +225,10 @@ server.registerTool(
 server.registerTool(
   'canvas_delete',
   {
-    title: 'Delete a Sketchlink canvas board',
+    title: 'Delete a Flying draws canvas board',
     description:
-      'Delete a board from Sketchlink and remove its .excalidraw file. Cannot delete the last remaining board. ' +
-      'If deleting the active board, Sketchlink automatically switches to another board.',
+      'Delete a board from Flying draws and remove its .excalidraw file. Cannot delete the last remaining board. ' +
+      'If deleting the active board, Flying draws automatically switches to another board.',
     inputSchema: {
       board: z.string().min(1).optional().describe('Board id to delete. Omit to delete the current active board.')
     }
@@ -245,7 +245,7 @@ server.registerTool(
   {
     title: 'Read the canvas',
     description:
-      'Read what is currently drawn on the Sketchlink canvas. Returns a description of nodes (boxes with their text), ' +
+      'Read what is currently drawn on the Flying draws canvas. Returns a description of nodes (boxes with their text), ' +
       'arrows between them, free text notes and where they sit, and hand-drawn strokes. ' +
       'The first line shows the canvas version (e.g. v12). Node ids like N1 are valid only for that version. Use this right away when the user says they drew something, sent you the canvas, or refers to "the canvas" / "my sketch": ' +
       'the canvas cannot notify you by itself, so a drawing the user sent just waits until you read it.',
@@ -450,7 +450,7 @@ server.registerTool(
   {
     title: 'Draw on the canvas',
     description:
-      'Draw nodes, arrows and text on the Sketchlink canvas so the user can see your understanding or plan as a diagram. ' +
+      'Draw nodes, arrows and text on the Flying draws canvas so the user can see your understanding or plan as a diagram. ' +
       'You only say what to add; the canvas lays the new nodes out automatically, below whatever is already there. ' +
       'You can also change the text of, or delete, nodes and arrows that YOU drew earlier (update_node, delete_node, update_edge, delete_edge). ' +
       'You cannot change or delete what the user drew, and nothing can be moved. ' +

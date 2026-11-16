@@ -11,6 +11,7 @@ import {
   pickFallbackBoard,
   suggestBoardId,
   updateBoardSceneTitle,
+  upgradeLegacyScene,
   validateBoardId
 } from '../src/main/boards.ts'
 
@@ -42,16 +43,16 @@ test('emptyBoardScene 生成标准 Excalidraw 场景并保留可选标题', () =
   const plain = emptyBoardScene()
   assert.equal(plain.type, 'excalidraw')
   assert.deepEqual(plain.elements, [])
-  assert.deepEqual(plain.sketchlink, { version: 1 })
+  assert.deepEqual(plain.flyingdraws, { version: 1 })
 
   const titled = emptyBoardScene({ title: '  登录流程  ' })
-  assert.deepEqual(titled.sketchlink, { version: 1, title: '登录流程' })
+  assert.deepEqual(titled.flyingdraws, { version: 1, title: '登录流程' })
 })
 
 test('parseBoardMeta 统计未删除元素、版本号和标题', () => {
   const json = JSON.stringify({
     elements: [{ id: '1', isDeleted: false }, { id: '2', isDeleted: true }, { id: '3' }],
-    sketchlink: { version: 7, title: '主流程' }
+    flyingdraws: { version: 7, title: '主流程' }
   })
   assert.deepEqual(parseBoardMeta('flow', json, '2026-11-15T12:00:00.000Z'), {
     board: 'flow',
@@ -87,23 +88,49 @@ test('updateBoardSceneTitle 更新并可清空画板标题且保留版本号与�
   const initial = JSON.stringify({
     type: 'excalidraw',
     elements: [{ id: 'e1' }],
-    sketchlink: { version: 5, title: '旧标题', custom: 'keep' }
+    flyingdraws: { version: 5, title: '旧标题', custom: 'keep' }
   })
   const renamed = JSON.parse(updateBoardSceneTitle(initial, '  新标题  ')) as {
     elements: unknown[]
-    sketchlink: Record<string, unknown>
+    flyingdraws: Record<string, unknown>
   }
   assert.equal(renamed.elements.length, 1)
-  assert.deepEqual(renamed.sketchlink, { version: 5, custom: 'keep', title: '新标题' })
+  assert.deepEqual(renamed.flyingdraws, { version: 5, custom: 'keep', title: '新标题' })
 
   const cleared = JSON.parse(updateBoardSceneTitle(JSON.stringify(renamed), null)) as {
-    sketchlink: Record<string, unknown>
+    flyingdraws: Record<string, unknown>
   }
-  assert.deepEqual(cleared.sketchlink, { version: 5, custom: 'keep' })
+  assert.deepEqual(cleared.flyingdraws, { version: 5, custom: 'keep' })
 })
 
 test('pickFallbackBoard 优先回退到 default，否则选第一块剩余画板', () => {
   assert.equal(pickFallbackBoard([{ board: 'a' }, { board: 'default' }]), 'default')
   assert.equal(pickFallbackBoard([{ board: 'a' }, { board: 'b' }]), 'a')
   assert.equal(pickFallbackBoard([]), null)
+})
+
+test('upgradeLegacyScene 把旧名字下的画板元数据和作者标记挪到新名字下', () => {
+  const legacy = JSON.stringify({
+    type: 'excalidraw',
+    source: 'sketchlink',
+    elements: [
+      { id: 'a', type: 'rectangle', customData: { sketchlink: { author: 'agent', layer: 'final' }, other: 1 } },
+      { id: 'b', type: 'text', text: '用户写的 "sketchlink": 不该被动' },
+      { id: 'c', type: 'ellipse', customData: null }
+    ],
+    sketchlink: { version: 7, title: '主流程' }
+  })
+  const upgraded = JSON.parse(upgradeLegacyScene(legacy))
+  assert.deepEqual(upgraded.flyingdraws, { version: 7, title: '主流程' })
+  assert.equal('sketchlink' in upgraded, false)
+  assert.equal(upgraded.source, 'flyingdraws')
+  assert.deepEqual(upgraded.elements[0].customData, { other: 1, flyingdraws: { author: 'agent', layer: 'final' } })
+  assert.equal(upgraded.elements[1].text, '用户写的 "sketchlink": 不该被动')
+  assert.equal(parseBoardMeta('default', upgradeLegacyScene(legacy), 'now').version, 7)
+})
+
+test('upgradeLegacyScene 不动新格式的画板，读不懂的内容原样返回', () => {
+  const current = JSON.stringify(emptyBoardScene({ title: '新画板' }))
+  assert.equal(upgradeLegacyScene(current), current)
+  assert.equal(upgradeLegacyScene('not json "sketchlink"'), 'not json "sketchlink"')
 })

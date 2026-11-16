@@ -1,5 +1,5 @@
 // 本地服务：只监听 127.0.0.1，供 MCP 桥接进程调用。
-// 连接信息（端口和 token）写在 ~/.sketchlink/daemon.json。
+// 连接信息（端口和 token）写在 ~/.flyingdraws/daemon.json。
 import http from 'node:http'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
@@ -73,7 +73,7 @@ export async function startDaemon(
       if (!req.headers.host?.startsWith('127.0.0.1:')) throw new HttpError(403, 'bad host')
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       if (url.pathname === '/health') return send(200, { ok: true, pid: process.pid })
-      if (!sameToken(String(req.headers['x-sketchlink-token'] ?? ''), token)) throw new HttpError(401, 'bad token')
+      if (!sameToken(String(req.headers['x-flyingdraws-token'] ?? ''), token)) throw new HttpError(401, 'bad token')
       if (req.method !== 'POST') throw new HttpError(405, 'use POST')
       const handler = routes[url.pathname]
       if (!handler) throw new HttpError(404, `no route ${url.pathname}`)

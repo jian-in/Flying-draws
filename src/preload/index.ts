@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
 // 渲染进程只能通过这几个函数和主进程打交道，拿不到完整的 Node 能力
-contextBridge.exposeInMainWorld('sketchlink', {
+contextBridge.exposeInMainWorld('flyingdraws', {
   loadBoard: () => ipcRenderer.invoke('board:load'),
   listBoards: () => ipcRenderer.invoke('board:list'),
   saveBoard: (json: string) => ipcRenderer.invoke('board:save', json),
@@ -12,6 +12,11 @@ contextBridge.exposeInMainWorld('sketchlink', {
     ipcRenderer.invoke('board:rename', payload),
   deleteBoard: (payload: { board: string; currentSceneJson?: string }) => ipcRenderer.invoke('board:delete', payload),
   revealBoard: () => ipcRenderer.invoke('board:reveal'),
+  // 页面的深浅色变了：让窗口右上角的最小化/关闭按钮跟着换颜色
+  setTheme: (theme: 'light' | 'dark') => ipcRenderer.send('window:theme', theme),
+  // 系统菜单栏去掉以后，这两项挪到了页面的「⋯」菜单里
+  reloadWindow: () => ipcRenderer.send('window:reload'),
+  toggleDevTools: () => ipcRenderer.send('window:devtools'),
 
   getHubState: () => ipcRenderer.invoke('hub:state'),
   onHubState: (fn: (state: unknown) => void) => {
@@ -38,5 +43,5 @@ contextBridge.exposeInMainWorld('sketchlink', {
   ready: () => ipcRenderer.send('renderer:ready'),
 
   // 隔离的测试实例上为 true，页面据此把画布接口挂到 window 上供端到端测试用
-  testMode: Boolean(process.env['SKETCHLINK_HOME'] && process.env['SKETCHLINK_DEBUG_PORT'])
+  testMode: Boolean(process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT'])
 })
