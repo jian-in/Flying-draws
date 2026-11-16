@@ -3,3 +3,5 @@ out/
 dist/
 src/renderer/public/fonts/
 *.log
+.rivet/
+.rivet.md
