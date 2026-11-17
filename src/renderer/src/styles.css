@@ -754,3 +754,11 @@ body {
   margin-right: 6px;
   vertical-align: middle;
 }
+
+/* 「描边宽度」换成 0–100 的滑杆（StrokeWidthSlider.tsx）：藏掉原来的三个档位按钮 */
+.excalidraw fieldset.fd-stroke-host > :not(legend):not(.fd-stroke-slider) {
+  display: none;
+}
+.excalidraw .fd-stroke-slider .range-wrapper {
+  padding-bottom: 22px;
+}

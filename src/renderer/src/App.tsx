@@ -17,6 +17,7 @@ import {
   MAX_EXPORT_BYTES,
   nextExportSizeForBytes
 } from './exportSize'
+import { StrokeWidthSlider } from './StrokeWidthSlider'
 import '@excalidraw/excalidraw/index.css'
 
 type ExcalidrawProps = ComponentProps<typeof Excalidraw>
@@ -1189,6 +1190,7 @@ export default function App() {
         </MainMenu>
       </Excalidraw>
       </div>
+      {api ? <StrokeWidthSlider api={api} /> : null}
       {creating ? (
         <BoardNameModal
           modeTitle="新建画板"
