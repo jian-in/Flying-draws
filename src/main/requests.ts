@@ -70,6 +70,10 @@ export interface HubState {
   onlineSeats?: OnlineSeat[] // 当前连着画布的在线 agent 席位
 }
 
+// 已经有结果（回应了或取消了）的请求留最近这么多条：agent 可能重复来取同一个结果，
+// 但每条都带着整份画布和截图，全留着的话应用开得越久占的内存越多
+export const FINISHED_KEEP = 8
+
 export class RequestHub {
   private requests = new Map<string, DrawRequest>()
   private inbox: Submission[] = []
@@ -170,6 +174,20 @@ export class RequestHub {
     this.listener?.(this.state())
   }
 
+  // 请求有了结果：底稿和待执行的改动用不上了，马上丢掉；再把最早结束的那些请求清掉。
+  // 清掉以后 agent 再拿那个 request_id 来等，会得到 unknown_request。
+  private finish(req: DrawRequest, status: 'submitted' | 'cancelled', submission: Submission | null): void {
+    req.status = status
+    req.submission = submission
+    req.baseline = null
+    req.pending = null
+    // 挪到最后，让 Map 里已结束的请求按结束的先后排
+    this.requests.delete(req.id)
+    this.requests.set(req.id, req)
+    const finished = [...this.requests.values()].filter((r) => r.status !== 'waiting')
+    for (const old of finished.slice(0, Math.max(0, finished.length - FINISHED_KEEP))) this.requests.delete(old.id)
+  }
+
   // 还在等用户回应的请求，用来存盘
   waiting(): DrawRequest[] {
     return [...this.requests.values()].filter((r) => r.status === 'waiting')
@@ -238,9 +256,9 @@ export class RequestHub {
     const req = sub.requestId ? this.requests.get(sub.requestId) : undefined
     let delivered = true
     if (req && req.status === 'waiting') {
-      req.status = 'submitted'
-      req.submission = { ...sub, to: null }
-      this.settle((t) => 'requestId' in t && t.requestId === req.id, { status: 'submitted', submission: req.submission })
+      const submission = { ...sub, to: null }
+      this.finish(req, 'submitted', submission)
+      this.settle((t) => 'requestId' in t && t.requestId === req.id, { status: 'submitted', submission })
     } else {
       // 主动发送，或者请求已经失效：交给正在等收件箱的 agent（点选了席位就只交给那个席位），没人等就放进收件箱
       const fresh = { ...sub, requestId: null, to: sub.to || null }
@@ -254,7 +272,7 @@ export class RequestHub {
   cancel(id: string): boolean {
     const req = this.requests.get(id)
     if (!req || req.status !== 'waiting') return false
-    req.status = 'cancelled'
+    this.finish(req, 'cancelled', null)
     this.settle((t) => 'requestId' in t && t.requestId === id, { status: 'cancelled', requestId: id })
     this.emit()
     return true
@@ -263,9 +281,9 @@ export class RequestHub {
   // 删除画板时统一清理该画板下未完成的等待请求和收件箱
   cancelAll(): void {
     let changed = false
-    for (const req of this.requests.values()) {
+    for (const req of [...this.requests.values()]) {
       if (req.status !== 'waiting') continue
-      req.status = 'cancelled'
+      this.finish(req, 'cancelled', null)
       this.settle((t) => 'requestId' in t && t.requestId === req.id, { status: 'cancelled', requestId: req.id })
       changed = true
     }

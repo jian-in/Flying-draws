@@ -1065,6 +1065,8 @@ const routes = {
         ...describe(h.sceneJson, h.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, h.pngBase64, boardId, viewer)
       }
     }
+    // 请求已经被清掉了（或从来不存在）：它属于哪块画板的记录也不用留
+    if (result.status === 'unknown_request' && requestId) requestBoard.delete(requestId)
     if (result.status !== 'submitted') return { ...result, request_id: requestId }
     const sub = result.submission
     return {

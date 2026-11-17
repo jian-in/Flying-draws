@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { pickupHint, RequestHub, type DrawRequest, type Handoff, type Submission } from '../src/main/requests.ts'
+import { FINISHED_KEEP, pickupHint, RequestHub, type DrawRequest, type Handoff, type Submission } from '../src/main/requests.ts'
 
 function sampleSubmission(overrides: Partial<Submission> = {}): Submission {
   return {
@@ -210,4 +210,46 @@ test('pickupHint 写清画板、版本、目标席位和取画方式', () => {
     '我在 Flying draws 画板「登录流程」（login-flow）上画好了（v6），发给席位「接口组」。请调用 canvas_read（board: "login-flow"，as: "接口组"）来取。'
   )
   assert.equal(pickupHint({ board: 'default', version: 2 }), '我在 Flying draws 画板「default」上画好了（v2）。请调用 canvas_read（board: "default"）来取。')
+})
+
+test('已结束的请求只留最近几条，底稿和待执行改动在有结果后立刻丢掉', async () => {
+  const hub = new RequestHub()
+  const ids: string[] = []
+  for (let i = 0; i < FINISHED_KEEP + 3; i += 1) {
+    const req = hub.create(`第 ${i} 个提议`, `prop_${i}`, { big: 'baseline' }, { big: 'pending' })
+    ids.push(req.id)
+    if (i % 2) hub.cancel(req.id)
+    else hub.submit(sampleSubmission({ requestId: req.id, decision: 'accepted' }))
+  }
+
+  // 最早结束的三条被清掉，再来等会被告知不认识这个请求
+  for (const id of ids.slice(0, 3)) {
+    assert.equal(hub.get(id), undefined)
+    assert.deepEqual(await hub.wait({ requestId: id }, 10), { status: 'unknown_request', requestId: id })
+  }
+  // 留下的还能重复取到结果，但不再带着底稿和待执行改动
+  for (const id of ids.slice(3)) {
+    const kept = hub.get(id)
+    assert.ok(kept)
+    assert.equal(kept.baseline, null)
+    assert.equal(kept.pending, null)
+    const res = await hub.wait({ requestId: id }, 10)
+    assert.ok(res.status === 'submitted' || res.status === 'cancelled')
+  }
+})
+
+test('还在等用户回应的请求不会被清理，不管后面结束了多少个', async () => {
+  const hub = new RequestHub()
+  const waiting = hub.create('请画架构图', 'prop_keep', { base: 1 }, { change: 1 })
+  for (let i = 0; i < FINISHED_KEEP * 2; i += 1) hub.cancel(hub.create(`临时 ${i}`).id)
+
+  assert.deepEqual(hub.waiting().map((r) => r.id), [waiting.id])
+  assert.deepEqual(hub.get(waiting.id)?.baseline, { base: 1 })
+  assert.deepEqual(hub.get(waiting.id)?.pending, { change: 1 })
+
+  // 删画板时一次取消很多个，同样只留最近几条
+  const many = Array.from({ length: FINISHED_KEEP + 2 }, (_, i) => hub.create(`批量 ${i}`).id)
+  hub.cancelAll()
+  assert.equal(hub.waiting().length, 0)
+  assert.equal(many.filter((id) => hub.get(id)).length, FINISHED_KEEP)
 })
