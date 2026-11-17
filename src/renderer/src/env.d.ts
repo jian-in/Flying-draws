@@ -50,7 +50,10 @@ declare global {
     flyingdraws: {
       loadBoard: () => Promise<BoardLoadResult>
       listBoards: () => Promise<{ current: string; boards: BoardSummary[] }>
-      saveBoard: (json: string) => Promise<{ board: string; path: string; saveCount: number; version: number; savedAt: string }>
+      saveBoard: (
+        json: string,
+        board?: string
+      ) => Promise<{ board: string; path: string; saveCount: number; version: number; savedAt: string; skipped?: boolean }>
       createBoard: (payload: { name: string; title?: string; currentSceneJson?: string }) => Promise<BoardLoadResult>
       switchBoard: (payload: { board: string; currentSceneJson?: string }) => Promise<BoardLoadResult>
       renameBoard: (payload: {

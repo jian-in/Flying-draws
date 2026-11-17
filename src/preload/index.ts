@@ -4,7 +4,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 contextBridge.exposeInMainWorld('flyingdraws', {
   loadBoard: () => ipcRenderer.invoke('board:load'),
   listBoards: () => ipcRenderer.invoke('board:list'),
-  saveBoard: (json: string) => ipcRenderer.invoke('board:save', json),
+  saveBoard: (json: string, board?: string) => ipcRenderer.invoke('board:save', json, board),
   createBoard: (payload: { name: string; title?: string; currentSceneJson?: string }) =>
     ipcRenderer.invoke('board:create', payload),
   switchBoard: (payload: { board: string; currentSceneJson?: string }) => ipcRenderer.invoke('board:switch', payload),

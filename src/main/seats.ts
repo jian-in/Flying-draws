@@ -5,6 +5,15 @@ export const SEAT_COLORS = ['#1971c2', '#7048e8', '#0c8599', '#d9480f', '#2f9e44
 
 export const SEAT_TTL_MS = 90_000
 
+// 给新席位挑颜色：优先用色板里还没人用的；六种都用过了再按席位个数循环。
+// 不能直接按「已有席位数」取下标——画板上留下来的席位不一定占着色板的前几种颜色
+// （比如第一个席位画的东西被删光了），那样新席位会和还在的席位撞色。
+export function nextSeatColor(used: Iterable<string>, count: number): string {
+  const taken = new Set(used)
+  for (const c of SEAT_COLORS) if (!taken.has(c)) return c
+  return SEAT_COLORS[count % SEAT_COLORS.length]
+}
+
 export interface OnlineSeat {
   name: string
   color: string
@@ -136,14 +145,9 @@ export class SeatRegistry {
     const usedColors = new Set(ctx.boardSeats.values())
     let fallbackIdx = ctx.boardSeats.size
     const pickPreviewColor = (): string => {
-      for (const c of SEAT_COLORS) {
-        if (!usedColors.has(c)) {
-          usedColors.add(c)
-          return c
-        }
-      }
-      const c = SEAT_COLORS[fallbackIdx % SEAT_COLORS.length]
-      fallbackIdx += 1
+      const c = nextSeatColor(usedColors, fallbackIdx)
+      if (usedColors.has(c)) fallbackIdx += 1
+      else usedColors.add(c)
       return c
     }
 

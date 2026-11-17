@@ -17,6 +17,7 @@ export interface ExportSizeElement {
   isDeleted?: boolean
   fontSize?: number
   text?: string
+  points?: readonly (readonly number[])[]
   customData?: Record<string, unknown>
 }
 
@@ -58,10 +59,33 @@ export function measureScene(
       continue
     }
 
-    const x1 = Math.min(el.x, el.x + el.width)
-    const x2 = Math.max(el.x, el.x + el.width)
-    const y1 = Math.min(el.y, el.y + el.height)
-    const y2 = Math.max(el.y, el.y + el.height)
+    let x1 = Math.min(el.x, el.x + el.width)
+    let x2 = Math.max(el.x, el.x + el.width)
+    let y1 = Math.min(el.y, el.y + el.height)
+    let y2 = Math.max(el.y, el.y + el.height)
+    // 箭头、线条、手绘的 x/y 是第一个点的位置，不是外接框左上角：往左或往上画时，
+    // 实际占的地方在 x/y 的左边或上边，要按各个点算
+    if (Array.isArray(el.points) && el.points.length > 0) {
+      let px1 = Infinity
+      let py1 = Infinity
+      let px2 = -Infinity
+      let py2 = -Infinity
+      for (const p of el.points) {
+        const px = p?.[0]
+        const py = p?.[1]
+        if (typeof px !== 'number' || typeof py !== 'number' || !Number.isFinite(px) || !Number.isFinite(py)) continue
+        if (px < px1) px1 = px
+        if (px > px2) px2 = px
+        if (py < py1) py1 = py
+        if (py > py2) py2 = py
+      }
+      if (px1 <= px2 && py1 <= py2) {
+        x1 = el.x + px1
+        x2 = el.x + px2
+        y1 = el.y + py1
+        y2 = el.y + py2
+      }
+    }
 
     if (x1 < minX) minX = x1
     if (y1 < minY) minY = y1

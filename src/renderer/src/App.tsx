@@ -674,6 +674,7 @@ export default function App() {
   const [sendTo, setSendTo] = useState<string | null>(null) // 「发给 agent」时点选的席位，null 是所有 agent
   const [initialData] = useState(() =>
     window.flyingdraws.loadBoard().then((res) => {
+      boardIdRef.current = res.board
       setBoardInfo({ board: res.board, title: res.title })
       setBoards(res.boards)
       setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
@@ -690,6 +691,9 @@ export default function App() {
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const apiRef = useRef<Api | null>(null)
   apiRef.current = api
+  // 画布上现在这份内容属于哪块画板（存盘时带给主进程），以及载入过几次画板（用来认出「存到一半画板换了」）
+  const boardIdRef = useRef<string | null>(null)
+  const sceneEpoch = useRef(0)
 
   const applyLoadedScene = useCallback(
     (
@@ -712,6 +716,8 @@ export default function App() {
       const nextElements = parsed?.elements ?? []
       lastSavedVersion.current = elementsVersion(nextElements)
       latest.current = null
+      boardIdRef.current = res.board
+      sceneEpoch.current += 1
       hiddenStateRef.current.clear()
       filterRef.current = 'all'
       setFilter('all')
@@ -757,9 +763,18 @@ export default function App() {
     const scene = latest.current
     if (!scene) return
     const [elements, appState, files] = scene
+    const epoch = sceneEpoch.current
     try {
       const json = serializeAsJSON(unmaskElements(elements, hiddenStateRef.current), appState, files, 'local')
-      const res = await window.flyingdraws.saveBoard(json)
+      const res = await window.flyingdraws.saveBoard(json, boardIdRef.current ?? undefined)
+      // 存的过程中画布已经换成另一块画板：这次的结果和现在的画面无关，不动它的保存状态
+      if (epoch !== sceneEpoch.current) return
+      if (res.skipped) {
+        // 画板在存盘途中被改了名（内容没换）：等页面拿到新名字后再存一次
+        if (timer.current) clearTimeout(timer.current)
+        timer.current = setTimeout(() => void save(), SAVE_DELAY_MS)
+        return
+      }
       lastSavedVersion.current = elementsVersion(elements)
       setStatus({ kind: 'saved', path: res.path, version: res.version, savedAt: res.savedAt })
     } catch (err) {
@@ -857,6 +872,7 @@ export default function App() {
             boards: BoardSummary[]
             hubState: HubState
           }
+          boardIdRef.current = next.board
           setBoardInfo({ board: next.board, title: next.title })
           setBoards(next.boards)
           lastInbox.current = next.hubState.inbox
@@ -920,6 +936,7 @@ export default function App() {
       title: /\s/.test(trimmed) ? trimmed : null,
       currentSceneJson: snap.sceneJson
     })
+    boardIdRef.current = res.board
     setBoardInfo({ board: res.board, title: res.title })
     setBoards(res.boards)
     if (res.hubState) {

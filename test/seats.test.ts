@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { SEAT_COLORS, SEAT_TTL_MS, SeatRegistry } from '../src/main/seats.ts'
+import { SEAT_COLORS, SEAT_TTL_MS, SeatRegistry, nextSeatColor } from '../src/main/seats.ts'
 
 test('SeatRegistry 支持连接后立即显示在线席位，并在传入 as 时原地升级而不重复出现', () => {
   const reg = new SeatRegistry()
@@ -57,4 +57,23 @@ test('SeatRegistry 复用当前画板已落笔颜色，并在离场或超时后�
   // 桥接主动离场立即撤下
   assert.equal(reg.leave('b1'), true)
   assert.deepEqual(reg.list({ boardSeats, drawnNames, now: 2000 + SEAT_TTL_MS }), [])
+})
+
+test('新席位的颜色避开画板上还在用的颜色，色板用完才循环', () => {
+  assert.equal(nextSeatColor([], 0), SEAT_COLORS[0])
+  assert.equal(nextSeatColor([SEAT_COLORS[0]], 1), SEAT_COLORS[1])
+  // 画板上只剩第二个席位（第一个席位画的已被删光）：新席位不能再拿到第二种颜色
+  assert.equal(nextSeatColor([SEAT_COLORS[1]], 1), SEAT_COLORS[0])
+  assert.equal(nextSeatColor([SEAT_COLORS[0], SEAT_COLORS[2]], 2), SEAT_COLORS[1])
+  assert.equal(nextSeatColor(SEAT_COLORS, 6), SEAT_COLORS[0])
+  assert.equal(nextSeatColor(SEAT_COLORS, 7), SEAT_COLORS[1])
+})
+
+test('在线席位的预览色和落笔时实际分到的颜色一致', () => {
+  const reg = new SeatRegistry()
+  reg.touch({ bridgeId: 'b1', as: '新来的', now: 1000 })
+  const boardSeats = new Map([['老席位', SEAT_COLORS[1]]])
+  const preview = reg.list({ boardSeats, now: 1000 }).find((s) => s.name === '新来的')
+  assert.equal(preview?.color, nextSeatColor(boardSeats.values(), boardSeats.size))
+  assert.notEqual(preview?.color, SEAT_COLORS[1])
 })

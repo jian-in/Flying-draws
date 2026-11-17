@@ -2,13 +2,14 @@ import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { bboxOf, buildGraph, summarize, type SceneElement } from './semantic'
 import { OpsError, planOps, rebaseOps, toProposalPlan, type DrawOp, type DrawPlan, type PendingChanges } from './ops'
 import { pickupHint, RequestHub, type HubState, type Submission, type WaitResult } from './requests'
 import { PendingStore } from './pending'
-import { SEAT_COLORS, SeatRegistry } from './seats'
+import { SEAT_COLORS, nextSeatColor, SeatRegistry } from './seats'
+import { atomicWriteJson } from './atomicWrite'
 import { captureBaseline, diffProposal, type DiffElement, type ProposalBaseline } from './diff'
 import { createDaemonLifecycle, startDaemon } from './daemon'
 import { WindowDock, type DockState } from './dock'
@@ -128,7 +129,7 @@ function syncBoardSeats(boardId: string, elements: readonly SceneElement[]): voi
       drawn.add(mark.agent)
       if (!session.seats.has(mark.agent)) {
         const existingColor =
-          typeof mark.color === 'string' && mark.color ? mark.color : SEAT_COLORS[session.seats.size % SEAT_COLORS.length]
+          typeof mark.color === 'string' && mark.color ? mark.color : nextSeatColor(session.seats.values(), session.seats.size)
         session.seats.set(mark.agent, existingColor)
       }
     }
@@ -176,13 +177,6 @@ function elementsKey(elements: { version?: number }[]): number {
   let sum = 0
   for (const el of elements) sum += el.version ?? 0
   return sum + elements.length
-}
-
-async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
-  await mkdir(BOARDS_DIR, { recursive: true })
-  const tmp = `${filePath}.tmp`
-  await writeFile(tmp, JSON.stringify(data), 'utf8')
-  await rename(tmp, filePath)
 }
 
 async function loadBoard(id = currentBoardId): Promise<{ board: string; title: string | null; version: number; json: string | null; path: string }> {
@@ -733,7 +727,7 @@ function resolveActor(
   if (!agent) return { agent: null, seat: false, color: SEAT_COLORS[0] }
   let color = session.seats.get(agent)
   if (!color) {
-    color = SEAT_COLORS[session.seats.size % SEAT_COLORS.length]
+    color = nextSeatColor(session.seats.values(), session.seats.size)
     session.seats.set(agent, color)
   }
   return { agent, seat: Boolean(asName), color }
@@ -1092,10 +1086,18 @@ ipcMain.handle('board:load', async () => {
   return { ...loaded, boards: await listBoards() }
 })
 ipcMain.handle('board:list', async () => ({ current: currentBoardId, boards: await listBoards() }))
-ipcMain.handle('board:save', async (_e, json: unknown) => {
+// 页面带上这份内容属于哪块画板：自动保存是延时触发的，可能在 agent 切换、重命名或删除画板之后才到，
+// 只按「当前画板」存的话，上一块画板的内容会盖到新切过去的画板上。
+ipcMain.handle('board:save', async (_e, json: unknown, board?: unknown) => {
   if (typeof json !== 'string') throw new Error('board:save expects a JSON string')
-  const ver = await acceptScene(json, currentBoardId)
-  return { board: currentBoardId, path: boardFilePath(BOARDS_DIR, currentBoardId), saveCount, version: ver, savedAt: new Date().toISOString() }
+  const boardId = typeof board === 'string' && isValidBoardId(board) ? board : currentBoardId
+  const path = boardFilePath(BOARDS_DIR, boardId)
+  if (boardId !== currentBoardId && !existsSync(path)) {
+    // 那块画板已经被改名或删除：不存，让页面自己决定要不要按新名字重存
+    return { board: boardId, path, saveCount, version: 0, savedAt: new Date().toISOString(), skipped: true }
+  }
+  const ver = await acceptScene(json, boardId)
+  return { board: boardId, path, saveCount, version: ver, savedAt: new Date().toISOString(), skipped: false }
 })
 ipcMain.handle('board:create', (_e, payload: { name: string; title?: string; currentSceneJson?: string }) =>
   serialized(() =>

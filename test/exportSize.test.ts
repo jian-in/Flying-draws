@@ -154,3 +154,26 @@ test('nextExportSizeForBytes：字节预算内或已到底线返回 null，超�
   assert.equal(clamped, EXPORT_MIN_SIZE)
   assert.equal(nextExportSizeForBytes(clamped!, 2 * MAX_EXPORT_BYTES, MAX_EXPORT_BYTES), null)
 })
+
+test('measureScene 按各个点算箭头和手绘的范围：往左上画的线不会被算到右下去', () => {
+  // 从 (1000, 1000) 往左上画到 (0, 0) 的箭头：x/y 是起点，实际范围在它的左上方
+  const arrow = {
+    type: 'arrow',
+    x: 1000,
+    y: 1000,
+    width: 1000,
+    height: 1000,
+    points: [
+      [0, 0],
+      [-1000, -1000]
+    ]
+  }
+  const box = { type: 'rectangle', x: 0, y: 0, width: 200, height: 100 }
+  const stats = measureScene([arrow, box], 0)
+  assert.equal(stats.width, 1000)
+  assert.equal(stats.height, 1000)
+
+  // points 里混进坏数据时退回 x/y/width/height
+  const broken = measureScene([{ ...arrow, points: [[Number.NaN, 0]] }], 0)
+  assert.equal(broken.width, 1000)
+})
