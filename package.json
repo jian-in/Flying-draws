@@ -13,11 +13,14 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build && tsc -p tsconfig.bridge.json",
     "build:bridge": "tsc -p tsconfig.bridge.json",
+    "build:fuxi": "node scripts/build-fuxi.mjs",
+    "package:desktop": "node scripts/package-desktop.mjs",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --test \"test/*.test.ts\"",
     "e2e": "node scripts/e2e.mjs",
     "e2e:draw": "node scripts/e2e-draw.mjs",
+    "e2e:agent": "node scripts/e2e-agent.mjs",
     "inspect": "node scripts/inspect.mjs"
   },
   "dependencies": {

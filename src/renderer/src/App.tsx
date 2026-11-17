@@ -18,6 +18,8 @@ import {
   nextExportSizeForBytes
 } from './exportSize'
 import { StrokeWidthSlider } from './StrokeWidthSlider'
+import { AgentPanel } from './AgentPanel'
+import { AGENT_SEAT } from '../../shared/agent'
 import '@excalidraw/excalidraw/index.css'
 
 type ExcalidrawProps = ComponentProps<typeof Excalidraw>
@@ -105,11 +107,23 @@ type ViewBox = { x: number; y: number; w: number; h: number }
 async function snapshot(
   api: Api,
   withImage: boolean,
-  hidden?: HiddenMap
-): Promise<{ sceneJson: string; pngBase64: string | null; view: ViewBox | null }> {
+  hidden?: HiddenMap,
+  selectionOnly = false
+): Promise<{ sceneJson: string; pngBase64: string | null; view: ViewBox | null; selectedIds: string[] }> {
   const raw = api.getSceneElements()
-  const elements = hidden ? unmaskElements(raw, hidden) : raw
+  let elements = hidden ? unmaskElements(raw, hidden) : raw
   const appState = api.getAppState()
+  const selected = new Set(Object.entries(appState.selectedElementIds).filter(([, yes]) => yes).map(([id]) => id))
+  const selectedIds = selectionOnly ? [...selected] : []
+  if (selectionOnly && selected.size) {
+    for (const element of elements) {
+      if (!selected.has(element.id)) continue
+      const edge = element as Loose
+      if (edge.startBinding) selected.add(edge.startBinding.elementId)
+      if (edge.endBinding) selected.add(edge.endBinding.elementId)
+    }
+    elements = elements.filter(element => selected.has(element.id) || ((element as Loose).containerId && selected.has((element as Loose).containerId!)))
+  }
   const files = api.getFiles()
   const sceneJson = serializeAsJSON(elements, appState, files, 'local')
   let pngBase64: string | null = null
@@ -133,7 +147,7 @@ async function snapshot(
     }
     pngBase64 = await blobToBase64(blob)
   }
-  return { sceneJson, pngBase64, view: visibleArea(appState) }
+  return { sceneJson, pngBase64, view: visibleArea(appState), selectedIds }
 }
 
 // 画布默认是淡黄的纸色。用户自己换过背景色的画板不动，只把还是默认白底的换掉。
@@ -618,6 +632,7 @@ type Status =
   | { kind: 'error'; message: string }
 
 export default function App() {
+  const [agentOpen, setAgentOpen] = useState(false)
   const [api, setApi] = useState<Api | null>(null)
   const [status, setStatus] = useState<Status>({ kind: 'loading' })
   const [boardInfo, setBoardInfo] = useState<{ board: string; title: string | null }>({ board: 'default', title: null })
@@ -1118,6 +1133,7 @@ export default function App() {
             ]}
           />
           <StatusText status={status} />
+          <button className={agentOpen ? 'fd-primary' : undefined} onClick={() => setAgentOpen(value => !value)} aria-expanded={agentOpen}>内置 Agent</button>
           {dock.docked ? (
             <button
               type="button"
@@ -1162,6 +1178,7 @@ export default function App() {
           )}
         </div>
       </div>
+      <div className="fd-workspace">
       <div className={`fd-canvas${request || composing || hub.agentWaiting || hub.handoff || hub.inbox > 0 ? ' fd-has-notice' : ''}`}>
       <Excalidraw
         excalidrawAPI={setApi}
@@ -1189,6 +1206,36 @@ export default function App() {
           <MainMenu.DefaultItems.ChangeCanvasBackground />
         </MainMenu>
       </Excalidraw>
+      </div>
+      <AgentPanel open={agentOpen} board={boardInfo.board} onClose={() => setAgentOpen(false)} insertImage={async (image, dataURL) => {
+        const current = apiRef.current
+        const targetBoard = boardIdRef.current
+        if (!current) throw new Error('画布还没准备好')
+        if (userIsBusy(current)) throw new Error('请先完成当前绘制或编辑')
+        const bitmap = new Image()
+        bitmap.src = dataURL
+        await bitmap.decode()
+        if (apiRef.current !== current || boardIdRef.current !== targetBoard) throw new Error('画板已切换，请回到原画板再放入图片')
+        const scale = Math.min(1, 700 / bitmap.naturalWidth, 500 / bitmap.naturalHeight)
+        const elements = unmaskElements(current.getSceneElementsIncludingDeleted(), hiddenStateRef.current)
+        const view = visibleArea(current.getAppState())
+        const x = (view?.x ?? 0) + 20
+        const y = elements.filter(el => !el.isDeleted).reduce((bottom, el) => Math.max(bottom, el.y + el.height), view?.y ?? 0) + 40
+        type ImageEl = Extract<SceneEl, { type: 'image' }>
+        const fileId = image.id as NonNullable<ImageEl['fileId']>
+        current.addFiles([{ id: fileId, dataURL: dataURL as Parameters<Api['addFiles']>[0][number]['dataURL'], mimeType: image.mediaType, created: Date.now() }])
+        const added = convertToExcalidrawElements([{ type: 'image', fileId, x, y, width: bitmap.naturalWidth * scale, height: bitmap.naturalHeight * scale,
+          customData: { flyingdraws: { author: 'agent', agent: AGENT_SEAT, seat: true, layer: 'final', result: image.id } } }])
+        current.updateScene({ elements: [...elements, ...added], captureUpdate: CaptureUpdateAction.IMMEDIATELY })
+        if (filterRef.current !== 'all') applyAuthorFilter(current, filterRef.current, hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(seatInfoRef.current))
+        const visibleAdded = current.getSceneElements().filter(el => added.some(added => added.id === el.id) && el.opacity > 0)
+        showElements(current, visibleAdded, false)
+      }} capture={async () => {
+        const current = apiRef.current
+        if (!current) throw new Error('画布还没准备好')
+        const snap = await snapshot(current, true, hiddenStateRef.current, true)
+        return { sceneJson: snap.sceneJson, pngBase64: snap.pngBase64, selectedIds: snap.selectedIds }
+      }} />
       </div>
       {api ? <StrokeWidthSlider api={api} /> : null}
       {creating ? (

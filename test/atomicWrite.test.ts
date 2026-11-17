@@ -1,9 +1,23 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { atomicWriteJson } from '../src/main/atomicWrite.ts'
+import { atomicWriteBytes, atomicWriteJson } from '../src/main/atomicWrite.ts'
+
+test('图片原子写会替换残缺旧文件，并保留提交时的字节', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'flyingdraws-image-'))
+  try {
+    const file = join(dir, 'blob')
+    writeFileSync(file, 'partial')
+    const bytes = Buffer.from([137, 80, 78, 71, 1, 2, 3])
+    const write = atomicWriteBytes(file, bytes)
+    bytes.fill(0)
+    await write
+    assert.deepEqual([...readFileSync(file)], [137, 80, 78, 71, 1, 2, 3])
+    assert.deepEqual(readdirSync(dir), ['blob'])
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
 
 test('同一个文件同时写多次：都成功，最后落盘的是最后一次调用的内容，不留临时文件', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'flyingdraws-write-'))

@@ -1,5 +1,40 @@
 # 接手文档
 
+## 最新：内置 Fuxi Agent（2026-11-17）
+
+产品已转向以画布为主界面的独立 Agent；原 MCP 画布功能保留。实现契约与分工见 [fuxi-host-plan.md](fuxi-host-plan.md)。下方旧里程碑描述原 MCP 阶段，不再代表全部现状。
+
+- `src/main/agentClient.ts`：无界面 Fuxi 子进程、NDJSON 请求/事件、按 req 等待命令完成、退出时拒绝在途请求。
+- `src/main/agent.ts`：配置/会话连接、画布上下文、工作项与 run 映射、终态、历史记录与图片 blob。重启不自动执行；损坏历史备份后继续记录，未知版本或超限记录保留原文并阻止新执行。
+- `src/main/agentIpc.ts`、preload 的 `agent`：只暴露业务方法，包含原生目录选择；不暴露任意 shell 或文件读取。
+- `src/renderer/src/AgentPanel.tsx`：模型设置、目录、任务历史、计划确认、工具审批、停止、图片预览与放回画布。`App.tsx` 提供选区截图和图像插入。
+- Rust 源码在 `/path/to/fuxi-code`，`fuxi --host --host-data DIR --config DIR/config.toml`；宿主与原 desktop 共用 `workspace_boot`。CLI/TUI/ACP 保持原入口。
+- `npm run build:fuxi -- --debug` 构建并复制内核到被 git 忽略的 `resources/fuxi/`；可用 `--source` 或 `FLYINGDRAWS_FUXI_SOURCE` 指定另一处源码。默认离线构建，`--online` 才允许获取 Cargo 依赖。
+- `npm run package:desktop` 使用现有 Electron 与运行时依赖生成 Windows 独立目录包；不能覆盖已存在的输出。
+- `npm run e2e:agent` 使用真实应用、内核、MCP 和本机 SSE 假供应商，所有文件在隔离目录，结束后清理；截图和摘要在 `out/e2e/agent*`。测试实例关闭后台节流，并用 Electron 原生 capturePage 捕获隐藏窗口。
+
+任务与画板的边界已处理：未完成任务可显式选择「继续原任务」或「同会话新目标」，失败默认新目标；目录丢失会回退到应用工作区并新建会话、保留旧记录和提示；改名迁移任务并作废待执行计划；删除画板归档任务，同名新画板不会继承旧会话。执行与画板变更互斥，运行中切画板后会重新连接当前画板。结果图片插入保留作者筛选和删除标记。
+
+交付与验证（2026-11-17）：
+
+- 独立目录包：`dist/Flying-draws-win32-x64/Flying draws.exe`，需保留同目录全部文件。随包内核为 debug 构建，来源和 SHA-256 记录在 `resources/fuxi/manifest.json`；原安装程序未替换。
+- Electron 类型检查、构建通过；107 个单元测试通过，最终持久化调整后的 10 个针对性测试通过。
+- 实际独立包端到端验证通过：首次模型设置、选区截图、MCP 审批与图片回传、计划执行、取消/显式续接、画板改名保护、缺失目录恢复、相对 HOME、作者筛选和删除标记。报告 `out/e2e/agent-report.json`，浅色/深色截图 `out/e2e/agent.png`、`agent-dark.png`。使用本机假供应商，没有调用真实模型。
+- Claude 完成 Rust 宿主、图片协议和规划失败终态修复，并运行宿主契约测试及相关检查；多智能体并行审查后，9 项 P2 均已修复并由其再次只读核实闭合，复核路径内没有剩余 P1/P2。
+- 两个仓库的改动尚未提交。早期缺依赖的目录包保留在 `dist/Flying-draws-win32-x64-incomplete`，不用于交付。
+
+后续改动（2026-11-17 晚，Claude）：
+
+- **思考折叠**：内核的 `thinking_delta` 存进 run 的 `thinkingDraft`（流式预览，落盘时清空），最终消息的思考块存进 `thinking`（上限 6 万字，超出保留最新部分；被停止的轮次保留已流出的部分）。面板在回复上方显示「思考中…」/「思考过程」，默认收起。
+- **计划只显示一次**：规划轮的回复放在「待确认的计划」框里，不再另显示一遍；内核计划摘要里重复的请求和画布上下文不展示。
+- **工具名**：`workspace.open` 返回 `tools:[{name,label}]`（MCP 为 `server/原名`），`shared/agent.ts` 的 `toolDisplayName()` 翻成中文，用于工具记录和审批卡。
+- **规划时可读画布**：Fuxi 认 MCP 工具的 `annotations.readOnlyHint`，只读模式下可调用但仍要逐次审批；桥接的 `canvas_read`、`canvas_list` 带此标记。
+- **席位名统一**：`AGENT_SEAT = 'Fuxi'`，提示词、桥接环境变量 `FLYINGDRAWS_SEAT`、插回画布的图片作者都用它；画布在线标记不再同时出现 `fuxi` 和 `Fuxi`。
+- **后台常驻**：关窗口（× / Alt+F4）只隐藏窗口，页面不降频，画布读写和 Agent 任务照常进行；托盘图标（`src/main/trayIcon.ts` 按像素画出，不需要图标文件）单击打开，右键菜单可退出，或勾选「开机时在后台启动」（只在打包应用、默认数据目录下可用，启动参数 `--background`）。真正退出走托盘「退出」或系统注销/关机。隔离测试实例（`FLYINGDRAWS_HOME` + `FLYINGDRAWS_DEBUG_PORT`）不建托盘，关窗口仍直接退出。
+- 验证：单元测试 111 个通过、类型检查通过；Fuxi 侧 MCP、宿主契约、全工作区 Clippy、fmt 通过；隔离实例实测关窗口后隐藏、隐藏时规划任务读画布成功、在线标记只剩 `Fuxi`、`app.quit` 后所有进程 1 秒内退出；`npm run e2e:agent` 对新包通过。之前的包改名保留为 `dist/Flying-draws-win32-x64-prev-20261117`（Codex 交付版）和 `-prev2-thinking`（中间版）。
+
+当前限制：单 Agent、单个活动工作区；工具图片每个 MCP 结果只保留首张；宿主不改原 Fuxi 全局配置，但作业和产物仍可能写所选工作区的 `.rivet`。计划是进程内状态，重连/切会话后须重新拟定。没有真实模型质量结论，真实模型调用前需明确设置费用上限。
+
 > 新会话动手前先读这份，再按需看 [design.md](design.md)。
 > 最后更新：2026-11-16，手感优化（发送快捷键、画板工具挪进标题栏、agent 新内容找空位落笔、连线绕开障碍）之后。
 

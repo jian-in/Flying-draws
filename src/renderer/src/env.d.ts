@@ -1,3 +1,4 @@
+import type { AgentApi } from '../../shared/agent'
 export {}
 
 declare global {
@@ -48,6 +49,8 @@ declare global {
 
   interface Window {
     flyingdraws: {
+      agent: AgentApi
+      captureWindow?: () => Promise<string>
       loadBoard: () => Promise<BoardLoadResult>
       listBoards: () => Promise<{ current: string; boards: BoardSummary[] }>
       saveBoard: (

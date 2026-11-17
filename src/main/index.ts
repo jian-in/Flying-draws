@@ -1,5 +1,5 @@
-import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
-import { join } from 'node:path'
+import { app, BrowserWindow, clipboard, ipcMain, Menu, nativeImage, shell, Tray } from 'electron'
+import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
@@ -13,6 +13,8 @@ import { atomicWriteJson } from './atomicWrite'
 import { captureBaseline, diffProposal, type DiffElement, type ProposalBaseline } from './diff'
 import { createDaemonLifecycle, startDaemon } from './daemon'
 import { WindowDock, type DockState } from './dock'
+import { registerAgent } from './agentIpc'
+import { trayIconPixels } from './trayIcon'
 import {
   BOARD_EXT,
   DEFAULT_BOARD_ID,
@@ -30,7 +32,7 @@ import {
 
 // 设了 FLYINGDRAWS_HOME 就把画板、连接信息和 Electron 自己的数据都放到那个目录下。
 // 测试用它开一个和用户画板完全隔离的实例（单实例锁也是按 userData 目录算的）。
-const HOME = process.env['FLYINGDRAWS_HOME'] || join(homedir(), '.flyingdraws')
+const HOME = resolve(process.env['FLYINGDRAWS_HOME'] || join(homedir(), '.flyingdraws'))
 if (process.env['FLYINGDRAWS_HOME']) app.setPath('userData', join(HOME, 'electron-data'))
 // 端到端测试要在页面里点按钮，用这个变量打开 Chrome DevTools 端口。只在隔离实例上认。
 if (process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']) {
@@ -46,6 +48,84 @@ const WAIT_MAX_S = 45
 const WAIT_DEFAULT_S = 40
 
 let win: BrowserWindow | null = null
+const agent = registerAgent(HOME, () => win, () => currentBoardId)
+
+// ---------- 后台常驻 ----------
+// 关窗口只是把窗口藏起来：页面还活着，画布读写、内置 Agent 和外部 agent 的连接都照常工作。
+// 真正退出走托盘菜单的「退出」（或系统注销/关机）。隔离的测试实例不常驻，关窗口照旧退出。
+const BACKGROUND_ARG = '--background'
+const TEST_INSTANCE = Boolean(process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT'])
+let tray: Tray | null = null
+let quitting = false
+let backgroundHintShown = false
+// 开机自启时带着 --background，第一次只建窗口不显示
+let launchHidden = process.argv.includes(BACKGROUND_ARG)
+
+function trayImage(): Electron.NativeImage {
+  const image = nativeImage.createEmpty()
+  for (const [size, scaleFactor] of [[16, 1], [24, 1.5], [32, 2]] as const) {
+    image.addRepresentation({ width: size, height: size, scaleFactor, buffer: trayIconPixels(size) })
+  }
+  return image
+}
+
+// 开机自启只在打包后的应用里提供：开发时注册的会是 electron.exe；自定义数据目录的实例开机时也带不上那个目录
+const loginItemSupported = (): boolean => app.isPackaged && !process.env['FLYINGDRAWS_HOME']
+const openAtLogin = (): boolean =>
+  loginItemSupported() && app.getLoginItemSettings({ args: [BACKGROUND_ARG] }).openAtLogin
+
+function refreshTrayMenu(): void {
+  if (!tray) return
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '打开 Flying draws', click: () => bringToFront() },
+    { type: 'separator' },
+    {
+      label: '开机时在后台启动',
+      type: 'checkbox',
+      checked: openAtLogin(),
+      enabled: loginItemSupported(),
+      click: (item) => {
+        app.setLoginItemSettings({ openAtLogin: item.checked, args: [BACKGROUND_ARG] })
+        refreshTrayMenu()
+      }
+    },
+    { type: 'separator' },
+    { label: '退出 Flying draws', click: () => { quitting = true; app.quit() } }
+  ]))
+}
+
+function createTray(): void {
+  if (tray || TEST_INSTANCE) return
+  tray = new Tray(trayImage())
+  tray.setToolTip('Flying draws')
+  tray.on('click', () => bringToFront())
+  refreshTrayMenu()
+  // 托盘提示跟着内置 Agent 的状态走：藏在后台时也看得出它是不是还在干活
+  agent.on('state', (state: { busy: boolean }) => {
+    tray?.setToolTip(state.busy ? 'Flying draws · Agent 正在工作' : 'Flying draws')
+  })
+}
+
+/** 隐藏到后台；页面不降频，画布读写和 Agent 回填照常及时。 */
+function hideToBackground(target: BrowserWindow): void {
+  target.webContents.setBackgroundThrottling(false)
+  target.hide()
+  if (backgroundHintShown || !tray) return
+  backgroundHintShown = true
+  if (process.platform === 'win32') {
+    tray.displayBalloon({
+      iconType: 'info',
+      title: 'Flying draws 还在后台运行',
+      content: '内置 Agent 和画布连接都保持可用。点托盘图标打开，右键菜单里可以退出。'
+    })
+  }
+}
+if (process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']) {
+  ipcMain.handle('test:capture-window', async () => {
+    if (!win || win.isDestroyed()) throw new Error('测试窗口未就绪')
+    return (await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })).toPNG().toString('base64')
+  })
+}
 
 // ---------- 多画板会话状态 ----------
 
@@ -355,6 +435,7 @@ async function renameBoard(
 }> {
   const fromId = rawFrom?.trim() ? validateBoardId(rawFrom) : currentBoardId
   const toId = normalizeBoardId(rawTo)
+  return agent.withBoardChange(fromId, async () => {
   const fromPath = boardFilePath(BOARDS_DIR, fromId)
   const toPath = boardFilePath(BOARDS_DIR, toId)
 
@@ -391,6 +472,7 @@ async function renameBoard(
   }
   persistPending()
 
+  await agent.renameBoard(fromId, toId)
   const loaded = await loadBoard(toId)
   updateWindowTitle()
   if (toId === currentBoardId) pushHubState()
@@ -417,6 +499,7 @@ async function renameBoard(
     boards,
     hubState
   }
+  })
 }
 
 async function deleteBoard(
@@ -433,6 +516,7 @@ async function deleteBoard(
   hubState: HubState
 }> {
   const targetId = rawBoard?.trim() ? validateBoardId(rawBoard) : currentBoardId
+  return agent.withBoardChange(targetId, async () => {
   const all = await listBoards()
   if (!all.some((b) => b.board === targetId)) {
     throw new Error(`画板「${targetId}」不存在`)
@@ -446,6 +530,7 @@ async function deleteBoard(
 
   const targetPath = boardFilePath(BOARDS_DIR, targetId)
   if (existsSync(targetPath)) await unlink(targetPath)
+  await agent.deleteBoard(targetId)
 
   const oldSession = sessions.get(targetId)
   if (oldSession) {
@@ -489,6 +574,7 @@ async function deleteBoard(
     boards,
     hubState
   }
+  })
 }
 
 // ---------- 主进程向页面发起调用（RPC） ----------
@@ -544,6 +630,7 @@ let dock: WindowDock | null = null
 
 function createWindow(): void {
   win = new BrowserWindow({
+    show: !launchHidden && !(process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT'] && process.env['FLYINGDRAWS_TEST_HIDDEN'] === '1'),
     width: 1280,
     height: 820,
     title: 'Flying draws',
@@ -553,6 +640,7 @@ function createWindow(): void {
     backgroundColor: TITLEBAR_COLORS.light.color,
     autoHideMenuBar: true,
     webPreferences: {
+      backgroundThrottling: !(process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']),
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       sandbox: true
@@ -588,6 +676,23 @@ function createWindow(): void {
   })
   win.on('closed', () => {
     win = null
+  })
+  if (launchHidden) {
+    launchHidden = false
+    win.webContents.setBackgroundThrottling(false)
+  }
+  win.on('close', (event) => {
+    if (quitting || !tray) return
+    event.preventDefault()
+    hideToBackground(overlayTarget)
+  })
+  win.on('show', () => {
+    // 回到前台后恢复默认的后台降频设置（测试实例本来就关着降频）
+    overlayTarget.webContents.setBackgroundThrottling(!(process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']))
+  })
+  // Windows 注销、关机时没有 before-quit，这里放行关窗口，别挡住系统
+  win.on('session-end', () => {
+    quitting = true
   })
 
   const devUrl = process.env['ELECTRON_RENDERER_URL']
@@ -1151,8 +1256,7 @@ type SubmitPayload = {
   skipped?: string[]
   to?: string | null // 主动发送时点选的目标席位
 }
-// 隔离的测试实例不碰系统剪贴板，免得跑测试时冲掉用户正在用的内容
-const TEST_INSTANCE = Boolean(process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT'])
+// 隔离的测试实例（TEST_INSTANCE）不碰系统剪贴板，免得跑测试时冲掉用户正在用的内容
 ipcMain.handle('hub:submit', async (_e, payload: SubmitPayload) => {
   const boardId = currentBoardId
   const hub = getSession(boardId).hub
@@ -1216,6 +1320,7 @@ if (!app.requestSingleInstanceLock()) {
     if (daemon.isQuitting()) return
     restorePending()
     createWindow()
+    createTray()
     await daemon.start(() => startDaemon(daemonInfoPath, routes))
   })
 
@@ -1224,11 +1329,26 @@ if (!app.requestSingleInstanceLock()) {
   })
 
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit()
+    // 常驻时窗口只是藏起来；万一页面进程崩了窗口没了，托盘还在，点它会重新打开
+    if (process.platform !== 'darwin' && (quitting || !tray)) app.quit()
   })
 
   app.on('before-quit', () => {
+    quitting = true
     daemon.markQuitting()
+  })
+
+  let engineClosing = false
+  let engineClosed = false
+  app.on('before-quit', (event) => {
+    if (engineClosed) return
+    event.preventDefault()
+    if (engineClosing) return
+    engineClosing = true
+    void agent.close().catch(error => console.error('[flyingdraws] agent shutdown failed:', error)).finally(() => {
+      engineClosed = true
+      app.quit()
+    })
   })
 
   app.on('will-quit', (event) => {

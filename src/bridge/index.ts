@@ -12,7 +12,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 
 // FLYINGDRAWS_HOME 和桌面应用用的是同一个变量；桥接拉起应用时环境变量会传下去
-const DAEMON_INFO = join(process.env.FLYINGDRAWS_HOME || join(homedir(), '.flyingdraws'), 'daemon.json')
+const OVERRIDE_HOME = process.env.FLYINGDRAWS_HOME ? resolve(process.env.FLYINGDRAWS_HOME) : null
+const DAEMON_INFO = join(OVERRIDE_HOME || join(homedir(), '.flyingdraws'), 'daemon.json')
 const APP_ROOT = resolve(__dirname, '..', '..')
 const LAUNCH_TIMEOUT_MS = 30_000
 
@@ -81,10 +82,22 @@ function launchApp(): void {
   if (!existsSync(join(APP_ROOT, 'out', 'main', 'index.js'))) {
     throw new Error(`Flying draws is not built yet. Run "npm run build" in ${APP_ROOT} first.`)
   }
+  // 独立目录包已经自带 Electron，不依赖开发环境的 electron npm 包。
+  const bundled = process.platform === 'win32' ? resolve(APP_ROOT, '..', '..', 'Flying draws.exe') : null
+  if (bundled && existsSync(bundled)) {
+    const env = { ...process.env }
+    if (OVERRIDE_HOME) env.FLYINGDRAWS_HOME = OVERRIDE_HOME
+    delete env.ELECTRON_RUN_AS_NODE
+    const child = spawn(bundled, [], { detached: true, stdio: 'ignore', windowsHide: true, env })
+    child.on('error', () => log('Could not start the packaged Flying draws application.'))
+    child.unref()
+    return
+  }
   // 在 Node 里 require('electron') 拿到的是 Electron 可执行文件的路径
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const electronPath = require('electron') as string
   const env = { ...process.env }
+  if (OVERRIDE_HOME) env.FLYINGDRAWS_HOME = OVERRIDE_HOME
   delete env.ELECTRON_RUN_AS_NODE
   const child = spawn(electronPath, [APP_ROOT], { detached: true, stdio: 'ignore', env, windowsHide: false })
   child.unref()
@@ -229,7 +242,8 @@ server.registerTool(
   {
     title: 'List Flying draws canvas boards',
     description: 'List all available boards in Flying draws, showing which one is currently active, its title, version, and element count.',
-    inputSchema: { as: asSchema }
+    inputSchema: { as: asSchema },
+    annotations: { readOnlyHint: true }
   },
   ({ as }) => guarded(async () => {
     const res = await daemon('/list', { as: rememberSeat(as) })
@@ -295,7 +309,10 @@ server.registerTool(
       'arrows between them, free text notes (id like T1) and where they sit, and hand-drawn strokes/groups (id like S1). ' +
       'The first line shows the canvas version (e.g. v12). Element ids (N1, T1, S1) are valid only for that version. Use this right away when the user says they drew something, sent you the canvas, or refers to "the canvas" / "my sketch": ' +
       'the canvas cannot notify you by itself, so a drawing the user sent just waits until you read it.',
-    inputSchema: { board: boardSchema, format: formatSchema, image: imageSchema, as: asSchema }
+    inputSchema: { board: boardSchema, format: formatSchema, image: imageSchema, as: asSchema },
+    // Reading only hands over what the user already sent; it never edits a board.
+    // Lets an agent's read-only planning look at the canvas.
+    annotations: { readOnlyHint: true }
   },
   ({ board, format, image, as }) => guarded(async () => {
     const res = await daemon('/read', { board, format: format ?? 'summary', image: image ?? 'auto', as: rememberSeat(as) }, 20_000)

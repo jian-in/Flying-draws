@@ -10,6 +10,14 @@ let seq = 0
 export function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
   // 调用时就序列化：排队期间调用方再改这个对象也不影响这次要写的内容
   const text = JSON.stringify(data)
+  return atomicWrite(filePath, text)
+}
+
+export function atomicWriteBytes(filePath: string, bytes: Uint8Array): Promise<void> {
+  return atomicWrite(filePath, Buffer.from(bytes))
+}
+
+function atomicWrite(filePath: string, text: string | Buffer): Promise<void> {
   const prev = chains.get(filePath) ?? Promise.resolve()
   const run = prev.then(async () => {
     await mkdir(dirname(filePath), { recursive: true })

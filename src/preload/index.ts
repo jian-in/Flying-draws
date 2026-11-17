@@ -2,6 +2,27 @@ import { contextBridge, ipcRenderer } from 'electron'
 
 // 渲染进程只能通过这几个函数和主进程打交道，拿不到完整的 Node 能力
 contextBridge.exposeInMainWorld('flyingdraws', {
+  agent: {
+    state: () => ipcRenderer.invoke('agent:state'),
+    connect: (board: string) => ipcRenderer.invoke('agent:connect', board),
+    configure: (draft: unknown) => ipcRenderer.invoke('agent:configure', draft),
+    selectModel: (provider: string, model: string) => ipcRenderer.invoke('agent:model', provider, model),
+    chooseWorkspace: (board: string) => ipcRenderer.invoke('agent:workspace', board),
+    newTask: (board: string) => ipcRenderer.invoke('agent:new', board),
+    openTask: (id: string) => ipcRenderer.invoke('agent:open', id),
+    submit: (input: unknown) => ipcRenderer.invoke('agent:submit', input),
+    execute: (text: string) => ipcRenderer.invoke('agent:execute', text),
+    cancel: () => ipcRenderer.invoke('agent:cancel'),
+    approve: (requestId: string, approved: boolean) => ipcRenderer.invoke('agent:approve', requestId, approved),
+    image: (id: string) => ipcRenderer.invoke('agent:image', id),
+    onState: (fn: (state: unknown) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, state: unknown) => fn(state)
+      ipcRenderer.on('agent:state', listener)
+      return () => ipcRenderer.removeListener('agent:state', listener)
+    }
+  },
+  captureWindow: process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']
+    ? () => ipcRenderer.invoke('test:capture-window') : undefined,
   loadBoard: () => ipcRenderer.invoke('board:load'),
   listBoards: () => ipcRenderer.invoke('board:list'),
   saveBoard: (json: string, board?: string) => ipcRenderer.invoke('board:save', json, board),
