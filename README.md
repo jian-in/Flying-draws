@@ -3,7 +3,7 @@
 **用画跟 Agent 对话的本地桌面画布与视觉工作台**  
 *Draw to talk, edit proposals on canvas, and iterate visually with coding agents*
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20.19-339933.svg)](package.json)
 [![MCP Tools](https://img.shields.io/badge/MCP-10%20Tools-1971c2.svg)](#10-个-mcp-画布工具)
 
@@ -208,4 +208,4 @@ test/           纯函数与 CLI 自动化测试集
 - 画布底层交互组件基于开源项目 [`@excalidraw/excalidraw`](https://github.com/excalidraw/excalidraw)（MIT License）构建；Flying draws 为独立开源项目，与 Excalidraw 官方无隶属或背书关系。
 - 随附预编译 **Fuxi** 执行内核采用 MIT License 分发（`resources/fuxi/LICENSE`）；随包第三方运行时库、字体资产与 Rust 内核依赖的完整版权声明及许可证文本见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 - 特别鸣谢首席驻场监工 **哈吉米**——在多轮并发压测、像素逆映射校准与深夜重构期间提供了稳定的呼噜声算力与精神监理（尽管当事人至今坚称自己只是顺路过来看看）。
-- 本项目采用 [MIT License](LICENSE) 开源（Copyright (c) 2026 Bofei Jian）。
+- 本项目采用 [Apache License 2.0](LICENSE) 开源（Copyright 2026 Bofei Jian，署名声明见 [NOTICE](NOTICE)）。

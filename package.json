@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Local interactive canvas & visual workbench for coding agents (built-in Fuxi runtime + MCP)",
   "author": "Bofei Jian",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jian-in/Flying-draws.git"
@@ -19,6 +19,7 @@
     "out/preload/",
     "out/renderer/",
     "LICENSE",
+    "NOTICE",
     "THIRD_PARTY_NOTICES.md",
     "README.md"
   ],

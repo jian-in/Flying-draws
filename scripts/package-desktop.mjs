@@ -77,7 +77,7 @@ await rename(join(destination, 'electron.exe'), join(destination, 'Flying draws.
 if (existsSync(join(destination, 'LICENSE'))) {
   await rename(join(destination, 'LICENSE'), join(destination, 'LICENSE.electron.txt'))
 }
-for (const doc of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
+for (const doc of ['LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md']) {
   if (existsSync(join(root, doc))) await cp(join(root, doc), join(destination, doc))
 }
 const app = join(destination, 'resources', 'app')
