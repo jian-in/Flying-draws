@@ -331,7 +331,7 @@ test('fetch-fuxi.mjs 支持解压校验 SHA-256、幂等跳过、篡改拒绝与
     assert.equal(hits, 1)
     const binName = process.platform === 'win32' ? 'fuxi.exe' : 'fuxi'
     assert.deepEqual(readFileSync(join(dest, binName)), fakeBinary)
-    assert.ok(existsSync(join(dest, 'LICENSE')))
+    assert.equal(existsSync(join(dest, 'LICENSE')), false, '内核不随包附带许可证文件')
     const manifest = JSON.parse(readFileSync(join(dest, 'manifest.json'), 'utf8')) as { sha256: string; profile: string }
     assert.equal(manifest.sha256, expectedSha)
     assert.equal(manifest.profile, 'release')

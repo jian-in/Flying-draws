@@ -18,29 +18,6 @@ const DEFAULT_URL = `https://github.com/${REPO}/releases/download/${RELEASE_TAG}
 const SOURCE_COMMIT = 'cdf23f0a35cbb479b8cdabf0d800e2db936f87c9'
 const DEFAULT_EXE_SHA256 = '57d4c2a80e27d9150e3119d60ba68382780a390e604cd12c13712d41388b0245'
 
-const MIT_LICENSE = `MIT License
-
-Copyright (c) 2026 Bofei Jian
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-`
-
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const rawArgs = process.argv.slice(2)
 
@@ -58,7 +35,8 @@ const expectedSha256 = (takeOption('--expected-sha256') || DEFAULT_EXE_SHA256).t
 const destination = resolve(customDest || join(root, 'resources', 'fuxi'))
 const binaryName = process.platform === 'win32' ? 'fuxi.exe' : 'fuxi'
 const binaryPath = join(destination, binaryName)
-const licensePath = join(destination, 'LICENSE')
+// 内核是维护者的私有组件，不随包附带许可证文件；以前版本留下的 LICENSE 会被清掉
+const staleLicensePath = join(destination, 'LICENSE')
 const manifestPath = join(destination, 'manifest.json')
 
 function sha256Hex(buffer) {
@@ -66,9 +44,7 @@ function sha256Hex(buffer) {
 }
 
 async function writeMetadata(sha256) {
-  if (!existsSync(licensePath)) {
-    await writeFile(licensePath, MIT_LICENSE, 'utf8')
-  }
+  await rm(staleLicensePath, { force: true })
   const manifest = {
     protocol: 1,
     sourceCommit: SOURCE_COMMIT,

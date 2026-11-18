@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
@@ -23,7 +23,8 @@ const binary = join(target, debug ? 'debug' : 'release', filename)
 const destination = join(root, 'resources', 'fuxi')
 await mkdir(destination, { recursive: true })
 await copyFile(binary, join(destination, filename))
-await copyFile(join(source, 'LICENSE'), join(destination, 'LICENSE'))
+// 内核是维护者的私有组件，不随包附带许可证文件
+await rm(join(destination, 'LICENSE'), { force: true })
 const commit = spawnSync('git', ['-C', source, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true }).stdout?.trim() || null
 const dirty = Boolean(spawnSync('git', ['-C', source, 'status', '--porcelain'], { encoding: 'utf8', windowsHide: true }).stdout?.trim())
 await writeFile(join(destination, 'manifest.json'), JSON.stringify({ protocol: 1, sourceCommit: commit, sourceDirty: dirty, profile: debug ? 'debug' : 'release', sha256: createHash('sha256').update(await readFile(binary)).digest('hex') }, null, 2))
