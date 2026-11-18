@@ -24,7 +24,7 @@
 - `src/main/agent.ts`：配置/会话连接、画布上下文、工作项与 run 映射、终态、历史记录与图片 blob。重启不自动执行；损坏历史备份后继续记录，未知版本或超限记录保留原文并阻止新执行。
 - `src/main/agentIpc.ts`、preload 的 `agent`：只暴露业务方法，包含原生目录选择；不暴露任意 shell 或文件读取。
 - `src/renderer/src/AgentPanel.tsx`：模型设置、目录、任务历史、计划确认、工具审批、停止、图片预览与放回画布。`App.tsx` 提供选区截图和图像插入。
-- Rust 源码在 `/path/to/fuxi-code`，`fuxi --host --host-data DIR --config DIR/config.toml`；宿主与原 desktop 共用 `workspace_boot`。CLI/TUI/ACP 保持原入口。
+- Rust 源码可通过 `--source` 或 `FLYINGDRAWS_FUXI_SOURCE` 指定（默认尝试同级 `../fuxi-code`），运行方式 `fuxi --host --host-data DIR --config DIR/config.toml`；宿主与原 desktop 共用 `workspace_boot`。CLI/TUI/ACP 保持原入口。
 - `npm run build:fuxi -- --debug` 构建并复制内核到被 git 忽略的 `resources/fuxi/`；可用 `--source` 或 `FLYINGDRAWS_FUXI_SOURCE` 指定另一处源码。默认离线构建，`--online` 才允许获取 Cargo 依赖。
 - `npm run package:desktop` 使用现有 Electron 与运行时依赖生成 Windows 独立目录包；不能覆盖已存在的输出。
 - `npm run e2e:agent` 使用真实应用、内核、MCP 和本机 SSE 假供应商，所有文件在隔离目录，结束后清理；截图和摘要在 `out/e2e/agent*`。测试实例关闭后台节流，并用 Electron 原生 capturePage 捕获隐藏窗口。
@@ -68,8 +68,8 @@ Flying draws：本地桌面画布（Electron + Excalidraw），通过 MCP 接任
 | M2-b 自动排版 | ✅ 新节点用 dagre 排版，可选从左到右或从上到下；箭头按图形轮廓起止，跨层连线会绕开节点 | 见 git log |
 | M2-c 提议层 | ✅ `canvas_propose`：agent 画的提议是蓝色虚线半透明，用户点接受或拒绝，结果经 `canvas_wait` 回到 agent；已在真实 Antigravity 会话中走通接受流程 | 见 git log |
 | M2-d diff 和并发 | ✅ 用户改了提议的 diff、待处理请求重启后恢复、按元素判断冲突、agent 改字和删除自己画的东西 | 见 git log |
-| 多画板新建与切换（M4 提前引入） | ✅ 页面右上角支持切换画板和「+ 新建画板」，MCP 新增 `canvas_list`、`canvas_open(board?, title?)` 及各读写工具可选 `board` 参数 | `2f341c6` |
-| 画板重命名/删除与收件箱持久化 | ✅ 页面支持「重命名」「删除」（至少保留一块，非切换操作走 `syncBoards` 保留撤销栈）；MCP 新增 `canvas_rename`、`canvas_delete`；未取走的「发给 agent」收件箱随 `pending.json` 持久化并在重启后恢复 | `2f341c6` |
+| 多画板新建与切换（M4 提前引入） | ✅ 页面右上角支持切换画板和「+ 新建画板」，MCP 新增 `canvas_list`、`canvas_open(board?, title?)` 及各读写工具可选 `board` 参数 | `3e4092a` |
+| 画板重命名/删除与收件箱持久化 | ✅ 页面支持「重命名」「删除」（至少保留一块，非切换操作走 `syncBoards` 保留撤销栈）；MCP 新增 `canvas_rename`、`canvas_delete`；未取走的「发给 agent」收件箱随 `pending.json` 持久化并在重启后恢复 | `3e4092a` |
 | agent 干预用户内容、改样式与作者筛选 | ✅ 独立文字（`T1`）和手绘（`S1`）纳入编号与改删；新增 `update_text` / `delete_text` / `delete_strokes` / `set_style`；`canvas_draw` 与 `canvas_propose` 均可改删任意已确认元素（提议中以虚线标记框预览，支持单处删除拒绝）；记录 `agent` 署名并在页面底部提供作者筛选标签 | 见 git log |
 | 多席位联手作画与「递画笔」接力 | ✅ 工具支持 `as` 声明席位并自动分配 6 色固定色板；底部筛选栏按实际席位动态生成带色点标签；新增 `canvas_pass` 工具，支持与 `canvas_wait` / `canvas_read` 席位间直接或挂起交接画笔 | 见 git log |
 | 手感优化 | ✅ `Ctrl+Shift+Enter` 打开「发给 agent」、再按一次发出，横幅里 Enter 发送、Esc 取消；画板切换、新建、「⋯」菜单和保存状态挪进标题栏，画布右上角只留「发给 agent」；agent 的新内容紧挨着它连接的节点或落在用户视野里的空位（`placeBlock()`），直线会压到东西时加拐点绕开（`detourPoint()`）；新内容已在眼前时不再移动视野 | 见 git log |
@@ -184,9 +184,9 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试；scripts/e2e-agent.m
 
 ## 开发与本地调试提示
 
-- MCP 服务 `flying-draws` 已用 `claude mcp add` 注册在 **/path/to/flying-draws 项目的 local scope**，命令 `node /path/to/flying-draws/out/bridge/index.js`。只有在这个文件夹里新开的会话才有这几个工具，工具全名是 `mcp__flying-draws__canvas_*`。
-- 用户的画板 `~/.flyingdraws/boards/default.excalidraw` 里有**用户自己画的东西**（手写字、涂鸦），测试时只读，不要清空或覆盖。
-- npm 用的是 npmmirror 镜像，Electron 也从镜像下载。
+- 推荐用 `node out/bridge/index.js setup` 生成当前机器的 MCP 客户端注册命令（例如 `claude mcp add --scope user flying-draws -- node /path/to/flying-draws/out/bridge/index.js`）；注册在 Claude Code 里的工具全名是 `mcp__flying-draws__canvas_*`。
+- 默认数据目录 `~/.flyingdraws/boards/default.excalidraw` 存放用户日常画板；自动化测试务必传入环境变量 `FLYINGDRAWS_HOME` 跑在隔离临时目录，切勿清空或覆盖用户画板。
+- 国内网络环境下安装依赖或下载 Electron 二进制时，可配合 `ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/` 加速。
 
 ## 踩过的坑
 

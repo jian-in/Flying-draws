@@ -2,7 +2,12 @@
   "name": "flying-draws",
   "version": "0.1.0",
   "description": "Spatial memory, visual diff & live proposal pad for coding agents",
+  "author": "Bofei Jian",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jian-in/Flying-draws.git"
+  },
   "main": "./out/main/index.js",
   "bin": {
     "flying-draws": "out/bridge/index.js",

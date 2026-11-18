@@ -162,7 +162,7 @@ test('点选了席位的画只交给那个席位：别的席位读不走、等�
 test('点选的席位正在等时直接送达；只有别的席位在等时进收件箱，没点选的仍交给任意等待者', async () => {
   const hub = new RequestHub()
   const boss = hub.wait({ inbox: true, agent: '架构组' }, 200)
-  // 老大在等，但这份是给接口组的：不能交给老大
+  // 架构组在等，但这份是给接口组的：不能交给架构组
   assert.equal(hub.submit(sampleSubmission({ note: '给接口组的', to: '接口组' })), false)
   assert.equal(hub.state().inbox, 1)
 
@@ -170,13 +170,13 @@ test('点选的席位正在等时直接送达；只有别的席位在等时进�
   const got = await second
   assert.equal(got.status, 'submitted')
 
-  // 没点选席位的，交给还在等的老大
+  // 没点选席位的，交给还在等的架构组
   assert.equal(hub.submit(sampleSubmission({ note: '给大家的', at: '2026-11-16T08:00:00.000Z' })), true)
   const bossGot = await boss
   assert.equal(bossGot.status, 'submitted')
   if (bossGot.status === 'submitted') assert.equal(bossGot.submission.note, '给大家的')
 
-  // 老二正在等时点选老二：直接送达，不进收件箱
+  // 接口组正在等时点选接口组：直接送达，不进收件箱
   const again = hub.wait({ inbox: true, agent: '接口组' }, 200)
   assert.equal(hub.submit(sampleSubmission({ note: '再给接口组', to: '接口组', at: '2026-11-16T08:01:00.000Z' })), true)
   assert.equal((await again).status, 'submitted')

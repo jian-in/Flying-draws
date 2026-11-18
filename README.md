@@ -207,4 +207,5 @@ test/           纯函数与 CLI 自动化测试集
 
 - 画布渲染与手绘交互基于 [Excalidraw](https://github.com/excalidraw/excalidraw)（MIT License）构建；随包第三方字体与运行时依赖声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 - 内置执行内核可选接入 Fuxi（MIT License）。
-- 本项目采用 [MIT License](LICENSE) 开源。
+- 特别鸣谢首席驻场监工 **哈吉米**——在多轮并发压测、像素逆映射校准与深夜重构期间提供了稳定的呼噜声算力与精神监理（尽管当事人至今坚称自己只是顺路过来看看）。
+- 本项目采用 [MIT License](LICENSE) 开源（Copyright (c) 2026 Bofei Jian）。
