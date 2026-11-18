@@ -24,6 +24,7 @@ import { captureBaseline, diffProposal, type DiffElement, type ProposalBaseline 
 import { createDaemonLifecycle, startDaemon } from './daemon'
 import { WindowDock, type DockState } from './dock'
 import { registerAgent } from './agentIpc'
+import { createIpcGuard, isAppRendererUrl } from './ipcGuard'
 import { trayIconPixels } from './trayIcon'
 import { freshApprovals, hasPendingApprovals, trayTooltip } from './agentNotice'
 import { AGENT_SEAT, type AgentState } from '../shared/agent'
@@ -71,7 +72,9 @@ const WAIT_DEFAULT_S = 40
 
 let win: BrowserWindow | null = null
 let libraryWin: BrowserWindow | null = null
-const agent = registerAgent(HOME, () => win, () => currentBoardId)
+const RENDERER_FILE = join(__dirname, '../renderer/index.html')
+const ipc = createIpcGuard(RENDERER_FILE)
+const agent = registerAgent(HOME, () => win, () => currentBoardId, ipc)
 
 // ---------- 后台常驻 ----------
 // 关窗口只是把窗口藏起来：页面还活着，画布读写、内置 Agent 和外部 agent 的连接都照常工作。
@@ -162,7 +165,7 @@ function hideToBackground(target: BrowserWindow): void {
   }
 }
 if (process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']) {
-  ipcMain.handle('test:capture-window', async () => {
+  ipc.handle('test:capture-window', async () => {
     if (!win || win.isDestroyed()) throw new Error('测试窗口未就绪')
     return (await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })).toPNG().toString('base64')
   })
@@ -669,7 +672,7 @@ function rpc<T>(method: string, params: unknown = {}, timeoutMs = 8000): Promise
   })
 }
 
-ipcMain.on('rpc:reply', (_e, msg: { id: number; result?: unknown; error?: string }) => {
+ipc.on('rpc:reply', (_e, msg: { id: number; result?: unknown; error?: string }) => {
   const p = rpcPending.get(msg.id)
   if (!p) return
   clearTimeout(p.timer)
@@ -740,7 +743,7 @@ function createWindow(): void {
         if (!overlayTarget.isDestroyed()) overlayTarget.webContents.send('dock:state', state)
       })
   ipcMain.removeAllListeners('window:theme')
-  ipcMain.on('window:theme', (_e, theme: unknown) => {
+  ipc.on('window:theme', (_e, theme: unknown) => {
     if (overlayTarget.isDestroyed()) return
     const colors = theme === 'dark' ? TITLEBAR_COLORS.dark : TITLEBAR_COLORS.light
     // 只有 Windows 和 Linux 上能改这几个按钮的颜色
@@ -749,11 +752,11 @@ function createWindow(): void {
   })
   const armWindowReady = () => {
     ipcMain.removeAllListeners('renderer:ready')
-    windowReady = new Promise((resolve) => ipcMain.once('renderer:ready', () => resolve()))
+    windowReady = new Promise((resolve) => ipc.once('renderer:ready', () => resolve()))
   }
   armWindowReady()
   ipcMain.removeAllListeners('window:reload')
-  ipcMain.on('window:reload', () => {
+  ipc.on('window:reload', () => {
     if (!overlayTarget.isDestroyed()) {
       rejectPendingRpcs('canvas window reloaded')
       armWindowReady()
@@ -761,11 +764,21 @@ function createWindow(): void {
     }
   })
   ipcMain.removeAllListeners('window:devtools')
-  ipcMain.on('window:devtools', () => {
+  ipc.on('window:devtools', () => {
     if (!overlayTarget.isDestroyed()) overlayTarget.webContents.toggleDevTools()
   })
   updateWindowTitle()
 
+  // 主窗口只显示本应用页面：拖进来的链接/文件、页面里的跳转都不能把它带到外部地址（preload 的 API 只给自己人）
+  win.webContents.on('will-navigate', (event, targetUrl) => {
+    if (isAppRendererUrl(targetUrl, RENDERER_FILE, process.env['ELECTRON_RENDERER_URL'])) return
+    event.preventDefault()
+    if (targetUrl.startsWith('https://') || targetUrl.startsWith('http://')) void shell.openExternal(targetUrl)
+  })
+  win.webContents.on('will-redirect', (event, targetUrl) => {
+    if (!isAppRendererUrl(targetUrl, RENDERER_FILE, process.env['ELECTRON_RENDERER_URL'])) event.preventDefault()
+  })
+  win.webContents.on('will-attach-webview', (event) => event.preventDefault())
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (isExcalidrawLibraryBrowseUrl(url)) {
       openLibraryBrowserWindow(url)
@@ -798,7 +811,7 @@ function createWindow(): void {
 
   const devUrl = process.env['ELECTRON_RENDERER_URL']
   if (devUrl) void win.loadURL(devUrl)
-  else void win.loadFile(join(__dirname, '../renderer/index.html'))
+  else void win.loadFile(RENDERER_FILE)
 }
 
 function pushHubState(): void {
@@ -1352,14 +1365,14 @@ const routes = {
 
 // ---------- 页面发来的调用 ----------
 
-ipcMain.handle('board:load', async () => {
+ipc.handle('board:load', async () => {
   const loaded = await loadBoard(currentBoardId)
   return { ...loaded, boards: await listBoards() }
 })
-ipcMain.handle('board:list', async () => ({ current: currentBoardId, boards: await listBoards() }))
+ipc.handle('board:list', async () => ({ current: currentBoardId, boards: await listBoards() }))
 // 页面带上这份内容属于哪块画板：自动保存是延时触发的，可能在 agent 切换、重命名或删除画板之后才到，
 // 只按「当前画板」存的话，上一块画板的内容会盖到新切过去的画板上。
-ipcMain.handle('board:save', (_e, json: unknown, board?: unknown) =>
+ipc.handle('board:save', (_e, json: unknown, board?: unknown) =>
   serialized(async () => {
     if (typeof json !== 'string') throw new Error('board:save expects a JSON string')
     const rawBoard = typeof board === 'string' && isValidBoardId(board) ? board : currentBoardId
@@ -1373,7 +1386,7 @@ ipcMain.handle('board:save', (_e, json: unknown, board?: unknown) =>
     return { board: boardId, path, saveCount, version: ver, savedAt: new Date().toISOString(), skipped: false }
   })
 )
-ipcMain.handle('board:create', (_e, payload: { name: string; title?: string; currentSceneJson?: string }) =>
+ipc.handle('board:create', (_e, payload: { name: string; title?: string; currentSceneJson?: string }) =>
   serialized(() =>
     switchBoard(payload.name, {
       title: payload.title,
@@ -1382,7 +1395,7 @@ ipcMain.handle('board:create', (_e, payload: { name: string; title?: string; cur
     })
   )
 )
-ipcMain.handle('board:switch', (_e, payload: { board: string; currentSceneJson?: string }) =>
+ipc.handle('board:switch', (_e, payload: { board: string; currentSceneJson?: string }) =>
   serialized(() =>
     switchBoard(payload.board, {
       requireExisting: true,
@@ -1390,7 +1403,7 @@ ipcMain.handle('board:switch', (_e, payload: { board: string; currentSceneJson?:
     })
   )
 )
-ipcMain.handle('board:rename', (_e, payload: { board?: string; name: string; title?: string | null; currentSceneJson?: string }) =>
+ipc.handle('board:rename', (_e, payload: { board?: string; name: string; title?: string | null; currentSceneJson?: string }) =>
   serialized(() =>
     renameBoard(payload.board, payload.name, {
       title: payload.title,
@@ -1398,22 +1411,22 @@ ipcMain.handle('board:rename', (_e, payload: { board?: string; name: string; tit
     })
   )
 )
-ipcMain.handle('board:delete', (_e, payload: { board: string; currentSceneJson?: string }) =>
+ipc.handle('board:delete', (_e, payload: { board: string; currentSceneJson?: string }) =>
   serialized(() =>
     deleteBoard(payload.board, {
       outgoingSceneJson: payload.currentSceneJson
     })
   )
 )
-ipcMain.handle('board:reveal', () => {
+ipc.handle('board:reveal', () => {
   const p = boardFilePath(BOARDS_DIR, currentBoardId)
   if (existsSync(p)) return shell.showItemInFolder(p)
   mkdirSync(BOARDS_DIR, { recursive: true })
   return shell.openPath(BOARDS_DIR)
 })
-ipcMain.handle('hub:state', () => buildHubState(currentBoardId))
-ipcMain.handle('dock:state', (): DockState => dock?.state() ?? { docked: false, side: null, title: null })
-ipcMain.on('dock:release', () => dock?.release())
+ipc.handle('hub:state', () => buildHubState(currentBoardId))
+ipc.handle('dock:state', (): DockState => dock?.state() ?? { docked: false, side: null, title: null })
+ipc.on('dock:release', () => dock?.release())
 type SubmitPayload = {
   board?: string
   requestId: string | null
@@ -1425,7 +1438,7 @@ type SubmitPayload = {
   to?: string | null // 主动发送时点选的目标席位
 }
 // 隔离的测试实例（TEST_INSTANCE）不碰系统剪贴板，免得跑测试时冲掉用户正在用的内容
-ipcMain.handle('hub:submit', (_e, payload: SubmitPayload) =>
+ipc.handle('hub:submit', (_e, payload: SubmitPayload) =>
   serialized(async () => {
     const requestedBoard =
       payload.requestId && requestBoard.has(payload.requestId)
@@ -1471,7 +1484,7 @@ ipcMain.handle('hub:submit', (_e, payload: SubmitPayload) =>
   })
 )
 // 收件箱里还有没被取走的画时，用户可以再要一次那句取画的话（比如剪贴板已经被别的内容盖掉了）
-ipcMain.handle('hub:hint', () => {
+ipc.handle('hub:hint', () => {
   const boardId = currentBoardId
   const session = getSession(boardId)
   const queued = session.hub.queuedInbox()
@@ -1481,12 +1494,12 @@ ipcMain.handle('hub:hint', () => {
   if (!TEST_INSTANCE) clipboard.writeText(hint)
   return hint
 })
-ipcMain.handle('hub:cancel', (_e, requestId: string) => {
+ipc.handle('hub:cancel', (_e, requestId: string) => {
   const boardId = requestBoard.get(requestId) ?? currentBoardId
   return getSession(boardId).hub.cancel(requestId)
 })
-ipcMain.handle('library:load', () => libraryStore.load())
-ipcMain.handle('library:save', (_e, data: { libraryItems?: unknown[] }) =>
+ipc.handle('library:load', () => libraryStore.load())
+ipc.handle('library:save', (_e, data: { libraryItems?: unknown[] }) =>
   libraryStore.save({ libraryItems: Array.isArray(data?.libraryItems) ? data.libraryItems : [] })
 )
 
