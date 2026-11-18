@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { gzipSync } from 'node:zlib'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const BRIDGE_JS = join(ROOT, 'out', 'bridge', 'index.js')
@@ -260,4 +262,114 @@ test('package-desktop.mjs 参数校验拒绝冲突与未知参数', () => {
   })
   assert.notEqual(unknown.status, 0)
   assert.match(unknown.stderr, /未知参数/)
+})
+
+test('fetch-fuxi.mjs 支持解压校验 SHA-256、幂等跳过、篡改拒绝与离线优雅降级', async () => {
+  const fetchScript = join(ROOT, 'scripts', 'fetch-fuxi.mjs')
+  const fakeBinary = Buffer.from('fake-fuxi-host-binary-payload-v1', 'utf8')
+  const expectedSha = createHash('sha256').update(fakeBinary).digest('hex')
+  const compressed = gzipSync(fakeBinary)
+  let hits = 0
+
+  function runScriptAsync(scriptArgs: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> {
+    const env: NodeJS.ProcessEnv = { ...process.env }
+    delete env.ELECTRON_RUN_AS_NODE
+    delete env.HTTP_PROXY
+    delete env.HTTPS_PROXY
+    delete env.http_proxy
+    delete env.https_proxy
+    return new Promise((resolveDone, rejectDone) => {
+      const child = spawn(process.execPath, [fetchScript, ...scriptArgs], {
+        cwd: ROOT,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.setEncoding('utf8')
+      child.stderr.setEncoding('utf8')
+      child.stdout.on('data', (chunk: string) => {
+        stdout += chunk
+      })
+      child.stderr.on('data', (chunk: string) => {
+        stderr += chunk
+      })
+      child.once('error', rejectDone)
+      child.once('close', (status) => resolveDone({ status, stdout, stderr }))
+    })
+  }
+
+  const server = http.createServer((req, res) => {
+    if (req.url === '/fuxi.gz') {
+      hits += 1
+      res.writeHead(200, { 'content-type': 'application/octet-stream' })
+      res.end(compressed)
+      return
+    }
+    res.writeHead(503)
+    res.end('unavailable')
+  })
+  await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const tempDir = mkdtempSync(join(tmpdir(), 'flyingdraws-fetch-fuxi-'))
+
+  try {
+    const dest = join(tempDir, 'fuxi')
+    const okRes = await runScriptAsync([
+      '--require',
+      '--dest',
+      dest,
+      '--url',
+      `${baseUrl}/fuxi.gz`,
+      '--expected-sha256',
+      expectedSha
+    ])
+    assert.equal(okRes.status, 0, `fetch stderr: ${okRes.stderr}`)
+    assert.equal(hits, 1)
+    const binName = process.platform === 'win32' ? 'fuxi.exe' : 'fuxi'
+    assert.deepEqual(readFileSync(join(dest, binName)), fakeBinary)
+    assert.ok(existsSync(join(dest, 'LICENSE')))
+    const manifest = JSON.parse(readFileSync(join(dest, 'manifest.json'), 'utf8')) as { sha256: string; profile: string }
+    assert.equal(manifest.sha256, expectedSha)
+    assert.equal(manifest.profile, 'release')
+
+    // 幂等二次执行应命中本地 SHA-256 校验，不再发起 HTTP 下载
+    const cachedRes = await runScriptAsync([
+      '--require',
+      '--dest',
+      dest,
+      '--url',
+      `${baseUrl}/fuxi.gz`,
+      '--expected-sha256',
+      expectedSha
+    ])
+    assert.equal(cachedRes.status, 0)
+    assert.equal(hits, 1)
+
+    // 哈希不匹配必须拒绝落盘且在 --require 下返回非零退出码
+    const badDest = join(tempDir, 'bad-fuxi')
+    const badShaRes = await runScriptAsync([
+      '--require',
+      '--dest',
+      badDest,
+      '--url',
+      `${baseUrl}/fuxi.gz`,
+      '--expected-sha256',
+      '0'.repeat(64)
+    ])
+    assert.notEqual(badShaRes.status, 0)
+    assert.match(badShaRes.stderr, /SHA-256 校验失败/)
+    assert.equal(existsSync(join(badDest, binName)), false)
+
+    // 默认 postinstall 可选模式下网络失败不阻断 npm install（退出码 0）
+    const offlineRes = await runScriptAsync(['--dest', badDest, '--url', `${baseUrl}/down`, '--expected-sha256', expectedSha])
+    assert.equal(offlineRes.status, 0)
+    assert.match(offlineRes.stderr, /外部 MCP 画布全部 10 个工具仍 100% 可用/)
+  } finally {
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+    rmSync(tempDir, { recursive: true, force: true })
+  }
 })

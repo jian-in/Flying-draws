@@ -150,16 +150,17 @@ npm run package:canvas
 
 ## 进阶：内置 Fuxi 独立 Agent 工作台
 
-除了通过 MCP 接入外部 CLI，当你希望脱离外部终端、直接把画布当作**一体化本地视觉编码工作台**时，可以接入内置的无界面 Rust/Fuxi 执行内核：
+除了通过 MCP 接入外部 CLI，当你希望脱离外部终端、直接把画布当作**一体化本地视觉编码工作台**时，可直接启用随附的预编译 **Fuxi** 执行内核（无需安装 Rust 工具链，也无需拉取内核源码）：
 
-1. **构建或指定 Fuxi 内核**（宿主契约见 [docs/fuxi-host-plan.md](docs/fuxi-host-plan.md)）：
+1. **获取或更新预编译 Fuxi 内核**（宿主契约见 [docs/fuxi-host-plan.md](docs/fuxi-host-plan.md)）：
+   - **GitHub Releases 桌面包**：下载解压 `Flying-draws-win32-x64.zip` 即已内置经过 SHA-256 校验的 `fuxi.exe`，开箱即用。
+   - **源码克隆用户（Windows x64）**：运行 `npm install` 时会自动拉取并校验预编译内核到 `resources/fuxi/`；若首次离线安装跳过，联网后执行一行即可补装：
    ```bash
-   # 从本机 Fuxi 源码构建内核到 resources/fuxi/（默认离线使用 Cargo 缓存，--online 允许拉取依赖）
-   npm run build:fuxi -- --source /你的路径/fuxi-code
+   npm run fetch:fuxi
    npm run build
    npm start
    ```
-   也可直接通过环境变量 `FLYINGDRAWS_FUXI_BIN` 指向已有的兼容内核二进制文件；含内置内核的完整 Windows 打包使用 `npm run package:desktop`。
+   也可通过环境变量 `FLYINGDRAWS_FUXI_BIN` 指向自定义内核二进制文件（维护者从本地源码重编内核可使用 `npm run build:fuxi -- --source /你的路径/fuxi-code`）；含内置内核的完整 Windows 打包使用 `npm run package:desktop`。
 
 2. **面板工作流**：
    - 点击标题栏 **「内置 Agent」**，在「模型设置」填入服务地址、模型 ID 与密钥（支持 **OpenAI 兼容、Anthropic Messages、Gemini**；密钥仅存本机 `~/.flyingdraws/agent/config.toml` 或引用 `env:变量名`，不进画板记录）。

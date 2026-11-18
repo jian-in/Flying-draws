@@ -24,10 +24,10 @@ const hasAppBuild =
   existsSync(join(root, 'out', 'bridge', 'index.js'))
 const hasFuxi = existsSync(join(root, 'resources', 'fuxi', binary))
 if (!hasAppBuild) {
-  throw new Error(withoutFuxi ? '请先运行 npm run build' : '请先运行 npm run build:fuxi 和 npm run build')
+  throw new Error(withoutFuxi ? '请先运行 npm run build' : '请先运行 npm run fetch:fuxi（或 npm run build:fuxi）和 npm run build')
 }
 if (!withoutFuxi && !hasFuxi) {
-  throw new Error('请先运行 npm run build:fuxi 和 npm run build（若只需免 Fuxi 纯画布桌面包，请运行 npm run package:canvas）')
+  throw new Error('请先运行 npm run fetch:fuxi（或 npm run build:fuxi）和 npm run build（若只需免 Fuxi 纯画布桌面包，请运行 npm run package:canvas）')
 }
 if (process.platform !== 'win32') throw new Error('当前目录打包脚本支持 Windows；其他平台仍可运行 npm start')
 const destination = join(root, 'dist', `Flying-draws-${process.platform}-${process.arch}`)

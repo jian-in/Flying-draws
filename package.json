@@ -36,10 +36,11 @@
     "visual-diff"
   ],
   "scripts": {
-    "postinstall": "node node_modules/electron/install.js && node scripts/copy-fonts.mjs",
+    "postinstall": "node node_modules/electron/install.js && node scripts/copy-fonts.mjs && node scripts/fetch-fuxi.mjs",
     "dev": "electron-vite dev",
     "build": "electron-vite build && tsc -p tsconfig.bridge.json",
     "build:bridge": "tsc -p tsconfig.bridge.json",
+    "fetch:fuxi": "node scripts/fetch-fuxi.mjs --require",
     "build:fuxi": "node scripts/build-fuxi.mjs",
     "package:desktop": "node scripts/package-desktop.mjs",
     "package:canvas": "node scripts/package-desktop.mjs --without-fuxi",

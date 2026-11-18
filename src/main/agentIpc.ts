@@ -12,7 +12,7 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
       const override = process.env['FLYINGDRAWS_FUXI_BIN']
       const candidates = override ? [override] : [join(process.resourcesPath, 'fuxi', filename), join(app.getAppPath(), 'resources', 'fuxi', filename)]
       const found = candidates.find(path => existsSync(path))
-      if (!found) throw new Error('尚未找到内置 Fuxi。开发环境请先运行 npm run build:fuxi，然后重新连接。')
+      if (!found) throw new Error('尚未找到内置 Fuxi 内核。请运行 npm run fetch:fuxi 自动获取预编译内核，然后重新连接。')
       return found
     },
     mcpServers: {

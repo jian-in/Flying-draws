@@ -1,0 +1,175 @@
+// 自动获取并校验预编译 Fuxi 宿主内核（免 Rust 工具链、无需公开内核源码）。
+import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { gunzipSync } from 'node:zlib'
+
+const REPO = 'jian-in/Flying-draws'
+const RELEASE_TAG = 'fuxi-kernel-0.2.0'
+const ASSET_NAME = 'fuxi-win32-x64.exe.gz'
+const DEFAULT_URL = `https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${ASSET_NAME}`
+const SOURCE_COMMIT = '3751aedb00ce4693a4d901d34f1b8c27a2042107'
+const DEFAULT_EXE_SHA256 = 'd998f80dfd9d8d4c9fd02b12e55ad1345491f0897447379d50b9268aa9198551'
+
+const MIT_LICENSE = `MIT License
+
+Copyright (c) 2026 Bofei Jian
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+`
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const rawArgs = process.argv.slice(2)
+
+function takeOption(flag) {
+  const idx = rawArgs.indexOf(flag)
+  if (idx < 0) return undefined
+  if (idx + 1 >= rawArgs.length) throw new Error(`参数 ${flag} 缺少取值`)
+  return rawArgs[idx + 1]
+}
+
+const required = rawArgs.includes('--require')
+const customDest = takeOption('--dest')
+const customUrl = takeOption('--url') || process.env.FLYINGDRAWS_FUXI_URL
+const expectedSha256 = (takeOption('--expected-sha256') || DEFAULT_EXE_SHA256).toLowerCase()
+const destination = resolve(customDest || join(root, 'resources', 'fuxi'))
+const binaryName = process.platform === 'win32' ? 'fuxi.exe' : 'fuxi'
+const binaryPath = join(destination, binaryName)
+const licensePath = join(destination, 'LICENSE')
+const manifestPath = join(destination, 'manifest.json')
+
+function sha256Hex(buffer) {
+  return createHash('sha256').update(buffer).digest('hex')
+}
+
+async function writeMetadata(sha256) {
+  if (!existsSync(licensePath)) {
+    await writeFile(licensePath, MIT_LICENSE, 'utf8')
+  }
+  const manifest = {
+    protocol: 1,
+    sourceCommit: SOURCE_COMMIT,
+    sourceDirty: false,
+    profile: 'release',
+    sha256
+  }
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8')
+}
+
+async function downloadCompressedPayload(targetUrl) {
+  const timeoutMs = Number(process.env.FLYINGDRAWS_FUXI_TIMEOUT_MS || 60_000)
+  const response = await fetch(targetUrl, {
+    redirect: 'follow',
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { 'user-agent': 'flying-draws-fetch-fuxi' }
+  })
+  if (response.ok) {
+    return Buffer.from(await response.arrayBuffer())
+  }
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
+  if (response.status === 404 && token && !customUrl) {
+    const metaRes = await fetch(`https://api.github.com/repos/${REPO}/releases/tags/${RELEASE_TAG}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/vnd.github+json',
+        'user-agent': 'flying-draws-fetch-fuxi'
+      }
+    })
+    if (!metaRes.ok) {
+      throw new Error(`HTTP ${metaRes.status} 获取 Release 元数据失败`)
+    }
+    const release = await metaRes.json()
+    const asset = Array.isArray(release.assets) ? release.assets.find(item => item.name === ASSET_NAME) : null
+    if (!asset?.url) {
+      throw new Error(`Release ${RELEASE_TAG} 中未找到资产 ${ASSET_NAME}`)
+    }
+    const assetRes = await fetch(asset.url, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/octet-stream',
+        'user-agent': 'flying-draws-fetch-fuxi'
+      }
+    })
+    if (!assetRes.ok) {
+      throw new Error(`HTTP ${assetRes.status} 下载 Release 资产失败`)
+    }
+    return Buffer.from(await assetRes.arrayBuffer())
+  }
+  throw new Error(`HTTP ${response.status} (${targetUrl})`)
+}
+
+async function main() {
+  if (!required && process.env.FLYINGDRAWS_SKIP_FUXI_DOWNLOAD === '1') {
+    console.log('[fetch-fuxi] 已通过 FLYINGDRAWS_SKIP_FUXI_DOWNLOAD=1 跳过下载')
+    return
+  }
+
+  if (!customUrl && (process.platform !== 'win32' || process.arch !== 'x64')) {
+    const msg = `当前预编译 Fuxi 内核仅提供 win32-x64（当前平台：${process.platform}-${process.arch}）`
+    if (required) throw new Error(msg)
+    console.log(`[fetch-fuxi] ${msg}；外部 MCP 画布全部 10 个工具仍 100% 可用`)
+    return
+  }
+
+  if (existsSync(binaryPath)) {
+    const existing = await readFile(binaryPath)
+    if (sha256Hex(existing) === expectedSha256) {
+      await writeMetadata(expectedSha256)
+      console.log(`[fetch-fuxi] 内置 Fuxi 内核已就绪 -> ${binaryPath}`)
+      return
+    }
+  }
+
+  const targetUrl = customUrl || DEFAULT_URL
+  console.log(`[fetch-fuxi] 正在获取预编译 Fuxi 内核 (${RELEASE_TAG})...`)
+  const compressed = await downloadCompressedPayload(targetUrl)
+  const decompressed = gunzipSync(compressed)
+  const actualSha256 = sha256Hex(decompressed)
+  if (actualSha256 !== expectedSha256) {
+    throw new Error(`Fuxi 内核 SHA-256 校验失败：期望 ${expectedSha256}，实际 ${actualSha256}`)
+  }
+
+  await mkdir(destination, { recursive: true })
+  const tempPath = `${binaryPath}.tmp-${process.pid}`
+  try {
+    await writeFile(tempPath, decompressed)
+    await rename(tempPath, binaryPath)
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {})
+    throw error
+  }
+  await writeMetadata(actualSha256)
+  console.log(`[fetch-fuxi] 内置 Fuxi 内核安装完成 (SHA-256 已校验) -> ${binaryPath}`)
+}
+
+main().catch(error => {
+  const reason = error instanceof Error ? error.message : String(error)
+  if (required) {
+    console.error(`[fetch-fuxi] 获取失败：${reason}`)
+    process.exit(1)
+  }
+  console.warn(
+    `[fetch-fuxi] 提示：未能自动下载预编译 Fuxi 内核（${reason}）。外部 MCP 画布全部 10 个工具仍 100% 可用；联网后可运行 npm run fetch:fuxi 重试。`
+  )
+})

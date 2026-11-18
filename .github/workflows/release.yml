@@ -30,6 +30,8 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
+        env:
+          FLYINGDRAWS_SKIP_FUXI_DOWNLOAD: '1'
         run: npm ci
 
       - name: Typecheck
@@ -42,7 +44,7 @@ jobs:
         run: npm run build
 
   release:
-    name: Package Windows Canvas Bundle & Release
+    name: Package Windows Desktop Bundle & Release
     needs: ci
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
@@ -59,13 +61,20 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
+        env:
+          FLYINGDRAWS_SKIP_FUXI_DOWNLOAD: '1'
         run: npm ci
+
+      - name: Fetch verified prebuilt Fuxi kernel
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run fetch:fuxi
 
       - name: Build application & MCP bridge
         run: npm run build
 
-      - name: Package standalone canvas bundle (without Fuxi)
-        run: npm run package:canvas
+      - name: Package standalone desktop bundle (with built-in Fuxi kernel)
+        run: npm run package:desktop -- --require-fuxi
 
       - name: Create Flying-draws-win32-x64.zip
         shell: pwsh
