@@ -51,7 +51,7 @@ For Electron and Chromium component notices in packaged desktop distributions, s
 
 ## 3. Prebuilt Fuxi Host Kernel Dependencies (`resources/fuxi`)
 
-When distributed with the prebuilt `fuxi` / `fuxi.exe` host runtime (Copyright (c) 2026 Bofei Jian, MIT License), the binary statically links third-party Rust crates under permissive licenses:
+When distributed with the prebuilt `fuxi` / `fuxi.exe` host runtime (Copyright (c) 2026 Bofei Jian), the binary statically links third-party Rust crates under permissive licenses:
 
 | Crate Family | License | Copyright / Upstream |
 |---|---|---|
