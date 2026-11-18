@@ -126,7 +126,7 @@ export interface AgentState {
   workspace: string
   /** 内核把截图、job 日志放在哪：host = 应用数据目录（不写进项目），旧内核没有这一项 */
   toolStorage?: { mode: string; artifactsDir?: string; jobsDir?: string }
-  /** 工具审批模式：auto-safe（默认，按风险询问）或 full-access（YOLO，全部自动执行、不再询问）。用户选择会记住。 */
+  /** 工具审批模式：auto-safe（默认，按风险询问）或 full-access（YOLO，全部自动执行、不再询问）。YOLO 只在本次运行内有效，重启应用回到 auto-safe。 */
   approvalMode: ApprovalMode
   activeItemId: string | null
   items: AgentWorkItem[]
