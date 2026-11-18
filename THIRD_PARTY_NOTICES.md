@@ -2,7 +2,6 @@
 
 Flying draws incorporates or distributes third-party open-source software and font assets listed below.
 For Electron and Chromium component notices in packaged desktop distributions, see `LICENSE.electron.txt` and `LICENSES.chromium.html`.
-For the bundled Fuxi headless agent binary, see `resources/fuxi/LICENSE`.
 
 ---
 
