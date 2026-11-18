@@ -5,7 +5,9 @@ export const DEFAULT_BOARD_ID = 'default'
 export const BOARD_EXT = '.excalidraw'
 
 const INVALID_ID_RE = /[\\/:*?"<>|\x00-\x1f]/
+const WIN_RESERVED_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
 const MAX_BOARD_ID_LEN = 64
+const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin'
 
 export interface BoardMeta {
   board: string
@@ -15,13 +17,27 @@ export interface BoardMeta {
   updatedAt: string
 }
 
-// 校验已有的画板 ID（不允许空白、路径分隔符、相对路径或特殊符号）
+export function sameBoardOnDisk(a: string, b: string): boolean {
+  return CASE_INSENSITIVE_FS ? a.toLowerCase() === b.toLowerCase() : a === b
+}
+
+export function matchExistingBoardId(id: string, existingIds: readonly string[]): string | null {
+  if (existingIds.includes(id)) return id
+  if (!CASE_INSENSITIVE_FS) return null
+  const lower = id.toLowerCase()
+  return existingIds.find((x) => x.toLowerCase() === lower) ?? null
+}
+
+// 校验已有的画板 ID（不允许空白、路径分隔符、相对路径、Windows 保留设备名或特殊符号）
 export function validateBoardId(raw: string): string {
   const id = String(raw ?? '').trim()
   if (!id) throw new Error('画板名称不能为空')
   if (id.length > MAX_BOARD_ID_LEN) throw new Error(`画板名称不能超过 ${MAX_BOARD_ID_LEN} 个字符`)
   if (id === '.' || id === '..' || id.startsWith('.') || id.endsWith('.')) {
     throw new Error(`画板名称不合法：${id}`)
+  }
+  if (WIN_RESERVED_RE.test(id)) {
+    throw new Error(`画板名称不能使用系统保留名：${id}`)
   }
   if (INVALID_ID_RE.test(id) || /\s/.test(id)) {
     throw new Error(`画板名称不能包含空格或特殊字符（\\ / : * ? " < > |）：${id}`)
@@ -104,9 +120,9 @@ export function pickFallbackBoard(remaining: readonly { board: string }[], prefe
 }
 
 export function suggestBoardId(existingIds: readonly string[]): string {
-  const used = new Set(existingIds)
+  const used = new Set(existingIds.map((x) => (CASE_INSENSITIVE_FS ? x.toLowerCase() : x)))
   for (let i = 1; ; i++) {
     const candidate = `board-${i}`
-    if (!used.has(candidate)) return candidate
+    if (!used.has(CASE_INSENSITIVE_FS ? candidate.toLowerCase() : candidate)) return candidate
   }
 }

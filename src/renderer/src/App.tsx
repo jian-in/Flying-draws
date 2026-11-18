@@ -10,6 +10,7 @@ import {
   serializeAsJSON
 } from '@excalidraw/excalidraw'
 import { exitPoint, type ShapeBox } from '../../main/geometry'
+import { displaySizeForImage, planImageLineage, type LineageCanvasElement } from '../../main/lineage'
 import type { DrawPlan, PendingChanges } from '../../main/ops'
 import {
   chooseAdaptiveExportSize,
@@ -81,6 +82,16 @@ const isDynamicSeats = (info: { seats: SeatEntry[]; hasAnonAgent: boolean }): bo
 const seatsKeyOf = (info: { seats: SeatEntry[]; hasAnonAgent: boolean }): string =>
   `${info.seats.map((s) => `${s.name}:${s.color}:${s.explicit ? 1 : 0}`).join('|')}#${info.hasAnonAgent ? 1 : 0}`
 
+function extractPlacedResults(elements: readonly SceneEl[]): string[] {
+  const ids = new Set<string>()
+  for (const el of elements) {
+    if (el.isDeleted || el.type !== 'image') continue
+    const resId = el.customData?.flyingdraws?.result
+    if (typeof resId === 'string' && resId) ids.add(resId)
+  }
+  return [...ids].sort()
+}
+
 function unmaskElements(elements: readonly SceneEl[], hidden: HiddenMap): SceneEl[] {
   if (!hidden.size) return elements as SceneEl[]
   return elements.map((el) => {
@@ -104,23 +115,61 @@ function visibleArea(appState: { scrollX: number; scrollY: number; width: number
 }
 type ViewBox = { x: number; y: number; w: number; h: number }
 
+function elementBox(el: { x: number; y: number; width: number; height: number; points?: readonly (readonly [number, number])[] }): ViewBox {
+  if (Array.isArray(el.points) && el.points.length >= 2) {
+    let minX = Infinity
+    let maxX = -Infinity
+    let minY = Infinity
+    let maxY = -Infinity
+    for (const [px, py] of el.points) {
+      if (px < minX) minX = px
+      if (px > maxX) maxX = px
+      if (py < minY) minY = py
+      if (py > maxY) maxY = py
+    }
+    return { x: el.x + minX, y: el.y + minY, w: maxX - minX, h: maxY - minY }
+  }
+  const x = el.width < 0 ? el.x + el.width : el.x
+  const y = el.height < 0 ? el.y + el.height : el.y
+  return { x, y, w: Math.abs(el.width), h: Math.abs(el.height) }
+}
+
+function boxesOverlap(a: ViewBox, b: ViewBox, margin = 0): boolean {
+  return a.x < b.x + b.w + margin && a.x + a.w + margin > b.x && a.y < b.y + b.h + margin && a.y + a.h + margin > b.y
+}
+
 async function snapshot(
   api: Api,
   withImage: boolean,
   hidden?: HiddenMap,
-  selectionOnly = false
+  selectionOnly = false,
+  onlyIds?: ReadonlySet<string>
 ): Promise<{ sceneJson: string; pngBase64: string | null; view: ViewBox | null; selectedIds: string[] }> {
   const raw = api.getSceneElements()
   let elements = hidden ? unmaskElements(raw, hidden) : raw
   const appState = api.getAppState()
-  const selected = new Set(Object.entries(appState.selectedElementIds).filter(([, yes]) => yes).map(([id]) => id))
-  const selectedIds = selectionOnly ? [...selected] : []
-  if (selectionOnly && selected.size) {
+  const baseSelected = onlyIds
+    ? new Set(onlyIds)
+    : new Set(Object.entries(appState.selectedElementIds).filter(([, yes]) => yes).map(([id]) => id))
+  const selectedIds = selectionOnly ? [...baseSelected] : []
+  if (selectionOnly && baseSelected.size) {
+    const selected = new Set(baseSelected)
     for (const element of elements) {
       if (!selected.has(element.id)) continue
       const edge = element as Loose
       if (edge.startBinding) selected.add(edge.startBinding.elementId)
       if (edge.endBinding) selected.add(edge.endBinding.elementId)
+    }
+    // 用户在截图上画圈/加字后只框选了批注本身时，把压在底下的原图一并带上，保证像素换算和视觉上下文完整
+    if (!onlyIds) {
+      const selectedBoxes = elements.filter((el) => !el.isDeleted && selected.has(el.id)).map((el) => elementBox(el as Loose))
+      if (selectedBoxes.length) {
+        for (const el of elements) {
+          if (el.isDeleted || el.type !== 'image' || selected.has(el.id)) continue
+          const imgBox = elementBox(el as Loose)
+          if (selectedBoxes.some((sb) => boxesOverlap(sb, imgBox))) selected.add(el.id)
+        }
+      }
     }
     elements = elements.filter(element => selected.has(element.id) || ((element as Loose).containerId && selected.has((element as Loose).containerId!)))
   }
@@ -155,12 +204,87 @@ const PAPER_COLOR = '#fffbe6'
 const paperOr = (color: unknown): string =>
   typeof color === 'string' && color && color.toLowerCase() !== '#ffffff' ? color : PAPER_COLOR
 
-const USER_BUSY_WAIT_MS = 8000
+const USER_BUSY_WAIT_MS = 10_000
+const DEFERRED_NOTICE_MS = 400
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 // 用户是不是正在画一笔、拖东西或打字。这时候往画布里写东西会打断手上的动作。
+// 照图还原时交给模型的原图：长边超过这个尺寸或体积太大就等比缩小，坐标系用实际发出去的尺寸
+const TRACE_MAX_SIDE = 2048
+const TRACE_MAX_BYTES = 4.5 * 1024 * 1024
+
+/** 取出画布上一张图片的原图，必要时缩小并转成 PNG（兼容裁剪 crop、翻转 scale 与 5 MiB 体积上限）。 */
+async function originalImage(api: Api, elementId: string): Promise<{ base64: string; width: number; height: number }> {
+  const element = api.getSceneElements().find((el) => el.id === elementId)
+  if (!element || element.type !== 'image' || !element.fileId) throw new Error('没找到选中的图片')
+  const file = api.getFiles()[element.fileId]
+  if (!file?.dataURL) throw new Error('这张图片的数据还没载入，稍等再试')
+  const bitmap = new Image()
+  bitmap.src = file.dataURL
+  await bitmap.decode()
+  const imgEl = element as SceneEl & {
+    crop?: { x: number; y: number; width: number; height: number } | null
+    scale?: readonly [number, number]
+  }
+  const natW = bitmap.naturalWidth > 0 ? bitmap.naturalWidth : Math.max(1, Math.round(Math.abs(element.width)))
+  const natH = bitmap.naturalHeight > 0 ? bitmap.naturalHeight : Math.max(1, Math.round(Math.abs(element.height)))
+  const crop = imgEl.crop && imgEl.crop.width > 0 && imgEl.crop.height > 0 ? imgEl.crop : null
+  const flipX = Boolean(imgEl.scale && imgEl.scale[0] < 0)
+  const flipY = Boolean(imgEl.scale && imgEl.scale[1] < 0)
+  const srcW = crop ? crop.width : natW
+  const srcH = crop ? crop.height : natH
+  const comma = file.dataURL.indexOf(',')
+  const raw = comma >= 0 ? file.dataURL.slice(comma + 1) : ''
+  const longSide = Math.max(srcW, srcH)
+  if (
+    !crop &&
+    !flipX &&
+    !flipY &&
+    bitmap.naturalWidth > 0 &&
+    bitmap.naturalHeight > 0 &&
+    longSide <= TRACE_MAX_SIDE &&
+    raw.length * 0.75 <= TRACE_MAX_BYTES &&
+    /^data:image\/png;base64,/i.test(file.dataURL)
+  ) {
+    return { base64: raw, width: srcW, height: srcH }
+  }
+  // 其余情况统一重绘成 PNG：格式一致，尺寸与字节体积均受控
+  let scale = Math.min(1, TRACE_MAX_SIDE / Math.max(1, longSide))
+  const canvas = document.createElement('canvas')
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('无法处理这张图片')
+  for (let retry = 0; retry < 3; retry += 1) {
+    canvas.width = Math.max(1, Math.round(srcW * scale))
+    canvas.height = Math.max(1, Math.round(srcH * scale))
+    context.save()
+    context.clearRect(0, 0, canvas.width, canvas.height)
+    if (flipX || flipY) {
+      context.translate(flipX ? canvas.width : 0, flipY ? canvas.height : 0)
+      context.scale(flipX ? -1 : 1, flipY ? -1 : 1)
+    }
+    if (crop) {
+      context.drawImage(bitmap, crop.x, crop.y, crop.width, crop.height, 0, 0, canvas.width, canvas.height)
+    } else {
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+    }
+    context.restore()
+    const png = canvas.toDataURL('image/png')
+    const base64 = png.slice(png.indexOf(',') + 1)
+    const approxBytes = Math.ceil(base64.length * 0.75)
+    if (approxBytes <= TRACE_MAX_BYTES || retry === 2) {
+      return { base64, width: canvas.width, height: canvas.height }
+    }
+    const ratio = Math.sqrt((TRACE_MAX_BYTES * 0.88) / approxBytes)
+    scale = Math.max(0.15, scale * Math.min(0.85, ratio))
+  }
+  throw new Error('无法导出这张图片')
+}
+
 function userIsBusy(api: Api): boolean {
-  const s = api.getAppState()
+  const s = api.getAppState() as ReturnType<Api['getAppState']> & {
+    cursorButton?: string
+    croppingElementId?: string | null
+  }
   return Boolean(
     s.newElement ||
       s.multiElement ||
@@ -169,7 +293,9 @@ function userIsBusy(api: Api): boolean {
       s.selectionElement ||
       s.selectedElementsAreBeingDragged ||
       s.isResizing ||
-      s.isRotating
+      s.isRotating ||
+      s.cursorButton === 'down' ||
+      s.croppingElementId
   )
 }
 
@@ -182,10 +308,11 @@ const BANNER_HEIGHT = 190 // 确认横幅大约占画布顶部这么高（屏幕
 // 把视野移到一批元素上，不改缩放。belowBanner 为 true 时把内容往下让一让，别被顶部的横幅挡住。
 function showElements(api: Api, elements: readonly SceneEl[], belowBanner: boolean): void {
   if (!elements.length) return
-  const minX = Math.min(...elements.map((el) => Math.min(el.x, el.x + el.width)))
-  const maxX = Math.max(...elements.map((el) => Math.max(el.x, el.x + el.width)))
-  const minY = Math.min(...elements.map((el) => Math.min(el.y, el.y + el.height)))
-  const maxY = Math.max(...elements.map((el) => Math.max(el.y, el.y + el.height)))
+  const boxes = elements.map((el) => elementBox(el as Loose))
+  const minX = Math.min(...boxes.map((b) => b.x))
+  const maxX = Math.max(...boxes.map((b) => b.x + b.w))
+  const minY = Math.min(...boxes.map((b) => b.y))
+  const maxY = Math.max(...boxes.map((b) => b.y + b.h))
   const s = api.getAppState()
   const zoom = s.zoom.value
   // 新内容本来就全在用户眼前（而且没被横幅挡住）就别动视野：画面突然一跳比不动更打扰人
@@ -452,21 +579,34 @@ async function applyPlan(
   hidden: HiddenMap,
   filter: AuthorFilter,
   preferredAgent: string | null,
-  dynamicSeats: boolean
+  onDeferredChange?: (state: { agent: string | null; editingText: boolean } | null) => void
 ): Promise<{ sceneJson: string }> {
-  // 用户优先：等用户手上的动作做完（design.md 12.4）
-  const deadline = Date.now() + USER_BUSY_WAIT_MS
-  while (userIsBusy(api)) {
-    if (Date.now() > deadline) throw new Error('the user is in the middle of drawing; wait a moment and call canvas_draw again')
-    await sleep(100)
+  // 用户优先：等用户手上的动作做完（design.md 12.4）；超过 400ms 时显示非侵入式等待提示
+  const startedAt = Date.now()
+  const deadline = startedAt + USER_BUSY_WAIT_MS
+  let notified = false
+  try {
+    while (userIsBusy(api)) {
+      if (Date.now() > deadline) throw new Error('the user is in the middle of drawing; wait a moment and call canvas_draw again')
+      if (!notified && Date.now() - startedAt >= DEFERRED_NOTICE_MS) {
+        notified = true
+        onDeferredChange?.({ agent, editingText: Boolean(api.getAppState().editingTextElement) })
+      }
+      await sleep(100)
+    }
+  } finally {
+    if (notified) onDeferredChange?.(null)
   }
 
   const current = unmaskElements(api.getSceneElementsIncludingDeleted(), hidden)
   const alive = new Set(current.filter((el) => !el.isDeleted).map((el) => el.id))
-  for (const ref of plan.existingRefs) {
-    if (!alive.has(ref)) throw new Error('a node these ops refer to was just deleted by the user; call canvas_read and try again')
+  for (const ref of [...plan.existingRefs, ...(plan.stableRefs ?? [])]) {
+    if (!alive.has(ref)) throw new Error('an element these ops refer to was just deleted by the user; call canvas_read and try again')
   }
 
+  // 照图还原（trace_image）出来的元素带着原图的颜色、填充、字号，画的时候保留，不换成席位颜色
+  const lines = plan.lines ?? []
+  const bound = (l: (typeof lines)[number]) => Boolean(l.fromElementId || l.toElementId)
   const skeletons = [
     ...plan.nodes.map((n) => ({
       type: n.shape,
@@ -475,7 +615,26 @@ async function applyPlan(
       y: n.y,
       width: n.w,
       height: n.h,
-      ...(n.label ? { label: { text: n.label } } : {})
+      ...(n.color ? { strokeColor: n.color } : {}),
+      ...(n.fill ? (n.fill === 'transparent' ? { backgroundColor: 'transparent' } : { backgroundColor: n.fill, fillStyle: 'solid' as const }) : {}),
+      ...(n.label
+        ? { label: { text: n.label, ...(n.fontSize ? { fontSize: n.fontSize } : {}), ...(n.color ? { strokeColor: n.color } : {}) } }
+        : {})
+    })),
+    // 有箭头或要绑到方框上的画成箭头（只有箭头能绑定），其余画成普通折线
+    ...lines.map((l) => ({
+      type: l.startArrow || l.endArrow || bound(l) ? ('arrow' as const) : ('line' as const),
+      id: l.elementId,
+      x: l.x,
+      y: l.y,
+      width: Math.max(...l.points.map((p) => p[0])) - Math.min(...l.points.map((p) => p[0])),
+      height: Math.max(...l.points.map((p) => p[1])) - Math.min(...l.points.map((p) => p[1])),
+      points: l.points,
+      ...(l.startArrow || l.endArrow || bound(l)
+        ? { startArrowhead: l.startArrow ? ('arrow' as const) : null, endArrowhead: l.endArrow ? ('arrow' as const) : null }
+        : {}),
+      ...(l.color ? { strokeColor: l.color } : {}),
+      ...(l.dashed ? { strokeStyle: 'dashed' as const } : {})
     })),
     ...plan.edges.map((e) => ({
       type: 'arrow' as const,
@@ -490,7 +649,15 @@ async function applyPlan(
       endArrowhead: 'arrow' as const,
       ...(e.label ? { label: { text: e.label } } : {})
     })),
-    ...plan.texts.map((t) => ({ type: 'text' as const, id: t.elementId, x: t.x, y: t.y, text: t.text }))
+    ...plan.texts.map((t) => ({
+      type: 'text' as const,
+      id: t.elementId,
+      x: t.x,
+      y: t.y,
+      text: t.text,
+      ...(t.fontSize ? { fontSize: t.fontSize } : {}),
+      ...(t.color ? { strokeColor: t.color } : {})
+    }))
   ] as unknown as SkeletonList
   const created = skeletons.length ? convertToExcalidrawElements(skeletons, { regenerateIds: false }) : []
 
@@ -498,7 +665,10 @@ async function applyPlan(
   const edgeById = new Map(plan.edges.map((e) => [e.elementId, e]))
   const arrowsOn = new Map<string, { id: string; type: 'arrow' }[]>()
   const attach = (nodeId: string, arrowId: string) => {
-    arrowsOn.set(nodeId, [...(arrowsOn.get(nodeId) ?? []), { id: arrowId, type: 'arrow' }])
+    const existing = arrowsOn.get(nodeId) ?? []
+    if (!existing.some((item) => item.id === arrowId)) {
+      arrowsOn.set(nodeId, [...existing, { id: arrowId, type: 'arrow' }])
+    }
   }
   const strokeColor = color || AGENT_COLOR
   const look = proposalId
@@ -512,8 +682,28 @@ async function applyPlan(
   const mark = proposalId
     ? { author: 'agent', ...seatFields, layer: 'proposal', proposal: proposalId }
     : { author: 'agent', ...seatFields, layer: 'final' }
+  const traced = new Set([
+    ...plan.nodes.filter((n) => n.traced).map((n) => n.elementId),
+    ...plan.texts.filter((t) => t.traced).map((t) => t.elementId),
+    ...lines.map((l) => l.elementId)
+  ])
+  const lineById = new Map(lines.map((l) => [l.elementId, l]))
   const fresh = created.map((el) => {
-    const tagged = { ...el, ...look, customData: { ...el.customData, flyingdraws: mark } }
+    // 照图还原的元素（含方框里的文字）保留自己的颜色；提议时照样是虚线半透明，接受后虚线框线恢复成原样
+    const isTraced = traced.has(el.id) || (el.type === 'text' && el.containerId !== null && traced.has(el.containerId ?? ''))
+    const line = lineById.get(el.id)
+    const ownLook = isTraced ? (proposalId ? { opacity: PROPOSAL_OPACITY, strokeStyle: 'dashed' as const } : {}) : look
+    const ownMark = isTraced ? { ...mark, traced: true, ...(line?.dashed ? { dashed: true } : {}) } : mark
+    const tagged = { ...el, ...ownLook, customData: { ...el.customData, flyingdraws: ownMark } }
+    if (line && el.type === 'arrow' && (line.fromElementId || line.toElementId)) {
+      if (line.fromElementId) attach(line.fromElementId, el.id)
+      if (line.toElementId) attach(line.toElementId, el.id)
+      return {
+        ...tagged,
+        ...(line.fromElementId ? { startBinding: { elementId: line.fromElementId, focus: 0, gap: 4 } } : {}),
+        ...(line.toElementId ? { endBinding: { elementId: line.toElementId, focus: 0, gap: 4 } } : {})
+      }
+    }
     const edge = edgeById.get(el.id)
     if (!edge || el.type !== 'arrow') return tagged
     attach(edge.fromElementId, el.id)
@@ -561,7 +751,7 @@ async function applyPlan(
     elements: nextAll,
     captureUpdate: CaptureUpdateAction.IMMEDIATELY // 用户可以用撤销去掉 agent 画的这一批
   })
-  if (filter !== 'all') applyAuthorFilter(api, filter, hidden, preferredAgent, dynamicSeats || seat || Boolean(agent))
+  if (filter !== 'all') applyAuthorFilter(api, filter, hidden, preferredAgent, isDynamicSeats(extractSeats(nextAll)))
   showElements(api, [...fresh, ...markerElements], Boolean(proposalId))
   return { sceneJson: (await snapshot(api, false, hidden)).sceneJson }
 }
@@ -602,7 +792,8 @@ function resolveProposal(api: Api, proposalId: string, accept: boolean, pending:
       const prevMark = el.customData?.flyingdraws
       return newElementWith(el, {
         opacity: 100,
-        strokeStyle: 'solid',
+        // 照图还原时本来就是虚线的线条，接受后仍是虚线
+        strokeStyle: prevMark?.dashed ? 'dashed' : 'solid',
         customData: {
           ...el.customData,
           flyingdraws: {
@@ -610,6 +801,8 @@ function resolveProposal(api: Api, proposalId: string, accept: boolean, pending:
             ...(typeof prevMark?.agent === 'string' && prevMark.agent ? { agent: prevMark.agent } : {}),
             ...(prevMark?.seat ? { seat: true } : {}),
             ...(typeof prevMark?.color === 'string' && prevMark.color ? { color: prevMark.color } : {}),
+            ...(prevMark?.traced ? { traced: true } : {}),
+            ...(prevMark?.dashed ? { dashed: true } : {}),
             layer: 'final'
           }
         }
@@ -633,6 +826,13 @@ type Status =
 
 export default function App() {
   const [agentOpen, setAgentOpen] = useState(false)
+  const [selectedImage, setSelectedImage] = useState<string | null>(null)
+  const selectedImageRef = useRef<string | null>(null)
+  const [selectedCount, setSelectedCount] = useState(0)
+  const selectedCountRef = useRef(0)
+  const [deferredDraw, setDeferredDraw] = useState<{ agent: string | null; editingText: boolean } | null>(null)
+  const prevElementsRef = useRef<unknown>(null)
+  const prevSelectedIdsRef = useRef<unknown>(null)
   const [api, setApi] = useState<Api | null>(null)
   const [status, setStatus] = useState<Status>({ kind: 'loading' })
   const [boardInfo, setBoardInfo] = useState<{ board: string; title: string | null }>({ board: 'default', title: null })
@@ -644,10 +844,13 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null)
   const [filter, setFilter] = useState<AuthorFilter>('all')
   const [seatInfo, setSeatInfo] = useState<{ seats: SeatEntry[]; hasAnonAgent: boolean }>({ seats: [], hasAnonAgent: false })
+  const [placedResultIds, setPlacedResultIds] = useState<ReadonlySet<string>>(() => new Set())
   const filterRef = useRef<AuthorFilter>('all')
   const hiddenStateRef = useRef<HiddenMap>(new Map())
   const primaryAgentRef = useRef<string | null>(null)
   const lastSeatsKeyRef = useRef<string>('')
+  const lastPlacedKeyRef = useRef<string>('')
+  const insertQueueRef = useRef<Promise<void>>(Promise.resolve())
   const seatInfoRef = useRef(seatInfo)
   seatInfoRef.current = seatInfo
   const hubRef = useRef(hub)
@@ -689,17 +892,29 @@ export default function App() {
   }, [])
   const [sendTo, setSendTo] = useState<string | null>(null) // 「发给 agent」时点选的席位，null 是所有 agent
   const [initialData] = useState(() =>
-    window.flyingdraws.loadBoard().then((res) => {
-      boardIdRef.current = res.board
-      setBoardInfo({ board: res.board, title: res.title })
-      setBoards(res.boards)
-      setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
-      const scene = res.json ? (JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }) : {}
-      const info = extractSeats(scene.elements ?? [])
-      lastSeatsKeyRef.current = seatsKeyOf(info)
-      setSeatInfo(info)
-      return { ...scene, appState: { ...scene.appState, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
-    })
+    window.flyingdraws
+      .loadBoard()
+      .then((res) => {
+        boardIdRef.current = res.board
+        setBoardInfo({ board: res.board, title: res.title })
+        setBoards(res.boards)
+        setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
+        const scene = res.json ? (JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }) : {}
+        const initTheme = scene.appState?.theme === 'dark' ? 'dark' : 'light'
+        document.documentElement.dataset.fdTheme = initTheme
+        window.flyingdraws.setTheme(initTheme)
+        const info = extractSeats(scene.elements ?? [])
+        lastSeatsKeyRef.current = seatsKeyOf(info)
+        setSeatInfo(info)
+        const initPlaced = extractPlacedResults(scene.elements ?? [])
+        lastPlacedKeyRef.current = initPlaced.join('|')
+        setPlacedResultIds(new Set(initPlaced))
+        return { ...scene, appState: { ...scene.appState, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
+      })
+      .catch((err) => {
+        setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
+        return { elements: [], appState: { viewBackgroundColor: PAPER_COLOR } }
+      })
   )
 
   const latest = useRef<SceneArgs | null>(null)
@@ -740,6 +955,9 @@ export default function App() {
       const nextSeatInfo = extractSeats(nextElements)
       lastSeatsKeyRef.current = seatsKeyOf(nextSeatInfo)
       setSeatInfo(nextSeatInfo)
+      const nextPlaced = extractPlacedResults(nextElements)
+      lastPlacedKeyRef.current = nextPlaced.join('|')
+      setPlacedResultIds(new Set(nextPlaced))
       currentApi.resetScene()
       if (parsed?.files && Object.keys(parsed.files).length > 0) {
         currentApi.addFiles(Object.values(parsed.files) as Parameters<Api['addFiles']>[0])
@@ -806,11 +1024,38 @@ export default function App() {
         window.flyingdraws.setTheme(appState.theme === 'dark' ? 'dark' : 'light')
       }
       latest.current = [elements, appState, files]
+      const elementsChanged = elements !== prevElementsRef.current
+      const selectionChanged = appState.selectedElementIds !== prevSelectedIdsRef.current
+      prevElementsRef.current = elements
+      prevSelectedIdsRef.current = appState.selectedElementIds
+
+      // 选区或元素引用变了才重算选中数与选中图片（平移、缩放、悬停移动直接跳过）
+      if (elementsChanged || selectionChanged) {
+        const picked = Object.keys(appState.selectedElementIds).filter((id) => appState.selectedElementIds[id])
+        if (picked.length !== selectedCountRef.current) {
+          selectedCountRef.current = picked.length
+          setSelectedCount(picked.length)
+        }
+        const pickedImage =
+          picked.length === 1 ? (elements.find((el) => el.id === picked[0] && el.type === 'image' && !el.isDeleted)?.id ?? null) : null
+        if (pickedImage !== selectedImageRef.current) {
+          selectedImageRef.current = pickedImage
+          setSelectedImage(pickedImage)
+        }
+      }
+      if (!elementsChanged) return
+
       const nextSeatInfo = extractSeats(elements)
       const nextSeatsKey = seatsKeyOf(nextSeatInfo)
       if (nextSeatsKey !== lastSeatsKeyRef.current) {
         lastSeatsKeyRef.current = nextSeatsKey
         setSeatInfo(nextSeatInfo)
+      }
+      const nextPlaced = extractPlacedResults(elements)
+      const nextPlacedKey = nextPlaced.join('|')
+      if (nextPlacedKey !== lastPlacedKeyRef.current) {
+        lastPlacedKeyRef.current = nextPlacedKey
+        setPlacedResultIds(new Set(nextPlaced))
       }
       const version = elementsVersion(elements)
       if (lastSavedVersion.current === null) {
@@ -850,7 +1095,8 @@ export default function App() {
         if (!current) throw new Error('canvas is not ready')
         if (method === 'snapshot') {
           const withImage = Boolean((params as { image?: boolean })?.image)
-          window.flyingdraws.rpcReply(id, await snapshot(current, withImage, hiddenStateRef.current))
+          const snap = await snapshot(current, withImage, hiddenStateRef.current)
+          window.flyingdraws.rpcReply(id, { ...snap, board: boardIdRef.current ?? undefined })
         } else if (method === 'applyPlan') {
           const { plan, proposalId, agent, seat, color } = params as {
             plan: DrawPlan
@@ -873,7 +1119,7 @@ export default function App() {
               hiddenStateRef.current,
               filterRef.current,
               primaryAgentRef.current,
-              isDynamicSeats(seatInfoRef.current)
+              setDeferredDraw
             )
           )
         } else if (method === 'loadScene') {
@@ -981,10 +1227,11 @@ export default function App() {
   const submit = useCallback(
     async (requestId: string | null, note: string, to: string | null = null) => {
       if (!apiRef.current) return
+      const targetBoard = boardIdRef.current ?? undefined
       const snap = await snapshot(apiRef.current, true, hiddenStateRef.current)
       // 有 agent 正等着（或者这是在回应它的请求）时，画会直接交到它手上；否则先放进收件箱，
       // 主进程同时把一句取画的话放进剪贴板
-      const res = await window.flyingdraws.submit({ requestId, note, to, ...snap })
+      const res = await window.flyingdraws.submit({ board: targetBoard, requestId, note, to, ...snap })
       if (res.delivered) setToast(`${to ?? 'agent'} 已经收到你的画`)
       else if (res.hint) setToast(`已复制一句话，去${to ? `「${to}」的` : ''}聊天里粘贴，它就会来取`)
       lastSavedVersion.current = elementsVersion(apiRef.current.getSceneElements())
@@ -997,12 +1244,13 @@ export default function App() {
   const decide = useCallback(async (requestId: string, proposalId: string, accept: boolean, note: string, pending?: unknown) => {
     const current = apiRef.current
     if (!current) return
+    const targetBoard = boardIdRef.current ?? undefined
     const skipped = resolveProposal(current, proposalId, accept, (pending as PendingChanges | null | undefined) ?? null, hiddenStateRef.current)
     if (filterRef.current !== 'all') {
       applyAuthorFilter(current, filterRef.current, hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(seatInfoRef.current))
     }
     const snap = await snapshot(current, true, hiddenStateRef.current)
-    await window.flyingdraws.submit({ requestId, note, decision: accept ? 'accepted' : 'rejected', skipped, ...snap })
+    await window.flyingdraws.submit({ board: targetBoard, requestId, note, decision: accept ? 'accepted' : 'rejected', skipped, ...snap })
     lastSavedVersion.current = elementsVersion(current.getSceneElements())
   }, [])
 
@@ -1179,7 +1427,7 @@ export default function App() {
         </div>
       </div>
       <div className="fd-workspace">
-      <div className={`fd-canvas${request || composing || hub.agentWaiting || hub.handoff || hub.inbox > 0 ? ' fd-has-notice' : ''}`}>
+      <div className={`fd-canvas${request || composing || hub.agentWaiting || hub.handoff || hub.inbox > 0 || deferredDraw ? ' fd-has-notice' : ''}`}>
       <Excalidraw
         excalidrawAPI={setApi}
         initialData={initialData}
@@ -1206,72 +1454,10 @@ export default function App() {
           <MainMenu.DefaultItems.ChangeCanvasBackground />
         </MainMenu>
       </Excalidraw>
-      </div>
-      <AgentPanel open={agentOpen} board={boardInfo.board} onClose={() => setAgentOpen(false)} insertImage={async (image, dataURL) => {
-        const current = apiRef.current
-        const targetBoard = boardIdRef.current
-        if (!current) throw new Error('画布还没准备好')
-        if (userIsBusy(current)) throw new Error('请先完成当前绘制或编辑')
-        const bitmap = new Image()
-        bitmap.src = dataURL
-        await bitmap.decode()
-        if (apiRef.current !== current || boardIdRef.current !== targetBoard) throw new Error('画板已切换，请回到原画板再放入图片')
-        const scale = Math.min(1, 700 / bitmap.naturalWidth, 500 / bitmap.naturalHeight)
-        const elements = unmaskElements(current.getSceneElementsIncludingDeleted(), hiddenStateRef.current)
-        const view = visibleArea(current.getAppState())
-        const x = (view?.x ?? 0) + 20
-        const y = elements.filter(el => !el.isDeleted).reduce((bottom, el) => Math.max(bottom, el.y + el.height), view?.y ?? 0) + 40
-        type ImageEl = Extract<SceneEl, { type: 'image' }>
-        const fileId = image.id as NonNullable<ImageEl['fileId']>
-        current.addFiles([{ id: fileId, dataURL: dataURL as Parameters<Api['addFiles']>[0][number]['dataURL'], mimeType: image.mediaType, created: Date.now() }])
-        const added = convertToExcalidrawElements([{ type: 'image', fileId, x, y, width: bitmap.naturalWidth * scale, height: bitmap.naturalHeight * scale,
-          customData: { flyingdraws: { author: 'agent', agent: AGENT_SEAT, seat: true, layer: 'final', result: image.id } } }])
-        current.updateScene({ elements: [...elements, ...added], captureUpdate: CaptureUpdateAction.IMMEDIATELY })
-        if (filterRef.current !== 'all') applyAuthorFilter(current, filterRef.current, hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(seatInfoRef.current))
-        const visibleAdded = current.getSceneElements().filter(el => added.some(added => added.id === el.id) && el.opacity > 0)
-        showElements(current, visibleAdded, false)
-      }} capture={async () => {
-        const current = apiRef.current
-        if (!current) throw new Error('画布还没准备好')
-        const snap = await snapshot(current, true, hiddenStateRef.current, true)
-        return { sceneJson: snap.sceneJson, pngBase64: snap.pngBase64, selectedIds: snap.selectedIds }
-      }} />
-      </div>
-      {api ? <StrokeWidthSlider api={api} /> : null}
-      {creating ? (
-        <BoardNameModal
-          modeTitle="新建画板"
-          submitLabel="创建"
-          busyLabel="创建中…"
-          defaultName={nextBoardName()}
-          onSubmit={handleCreateBoard}
-          onClose={() => setCreating(false)}
-        />
-      ) : null}
-      {renaming ? (
-        <BoardNameModal
-          modeTitle="重命名画板"
-          submitLabel="保存"
-          busyLabel="保存中…"
-          defaultName={boardInfo.title ?? boardInfo.board}
-          onSubmit={handleRenameBoard}
-          onClose={() => setRenaming(false)}
-        />
-      ) : null}
-      {confirmDelete ? (
-        <ConfirmModal
-          title="删除画板"
-          message={`确定要删除画板「${boardInfo.title ? `${boardInfo.title} (${boardInfo.board})` : boardInfo.board}」吗？文件会从磁盘移除，无法恢复。`}
-          confirmLabel="确认删除"
-          busyLabel="删除中…"
-          onConfirm={handleDeleteBoard}
-          onClose={() => setConfirmDelete(false)}
-        />
-      ) : null}
       {request && request.kind === 'proposal' && request.proposalId ? (
         <Banner
           key={request.id}
-          title="agent 画了它的理解（蓝色虚线部分），可以直接在上面改："
+          title="agent 画了它的理解（虚线半透明部分），可以直接在上面改："
           prompt={request.prompt}
           queued={queued}
           onSend={(note) => decide(request.id, request.proposalId!, true, note, request.pending)}
@@ -1347,6 +1533,11 @@ export default function App() {
           </button>
         </div>
       ) : null}
+      {deferredDraw ? (
+        <div className="fd-waiting fd-waiting-live fd-deferred-draw" role="status" aria-live="polite">
+          {deferredDraw.agent ?? 'Agent'} 有内容要画，{deferredDraw.editingText ? '结束文字编辑' : '松笔'}后更新
+        </div>
+      ) : null}
       {toast ? (
         <button type="button" className="fd-toast" role="status" title="点一下收起" onClick={() => setToast(null)}>
           {toast}
@@ -1408,6 +1599,262 @@ export default function App() {
           ))
         )}
       </div>
+      </div>
+      <AgentPanel
+        open={agentOpen}
+        board={boardInfo.board}
+        onClose={() => setAgentOpen(false)}
+        selectedCount={selectedCount}
+        placedImageIds={placedResultIds}
+        onClearSelection={() => {
+          const current = apiRef.current
+          if (!current) return
+          current.updateScene({ appState: { selectedElementIds: {} }, captureUpdate: CaptureUpdateAction.NEVER })
+        }}
+        insertImage={(image, dataURL, opts) => {
+          const runInsert = async () => {
+            const current = apiRef.current
+            const targetBoard = boardIdRef.current
+            if (!current) {
+              if (opts?.auto) return
+              throw new Error('画布还没准备好')
+            }
+            if (opts?.auto) {
+              const startedAt = Date.now()
+              const deadline = startedAt + USER_BUSY_WAIT_MS
+              let notified = false
+              try {
+                while (userIsBusy(current)) {
+                  if (apiRef.current !== current || boardIdRef.current !== targetBoard) return
+                  if (Date.now() > deadline) {
+                    setToast('结果图片已就绪，可在侧栏点击「放到画布」加入演进链')
+                    return
+                  }
+                  if (!notified && Date.now() - startedAt >= DEFERRED_NOTICE_MS) {
+                    notified = true
+                    setDeferredDraw({ agent: AGENT_SEAT, editingText: Boolean(current.getAppState().editingTextElement) })
+                  }
+                  await sleep(100)
+                }
+              } finally {
+                if (notified) setDeferredDraw(null)
+              }
+            } else if (userIsBusy(current)) {
+              throw new Error('请先完成当前绘制或编辑')
+            }
+
+            const bitmap = new Image()
+            bitmap.src = dataURL
+            await bitmap.decode()
+            if (apiRef.current !== current || boardIdRef.current !== targetBoard) {
+              if (opts?.auto) return
+              throw new Error('画板已切换，请回到原画板再放入图片')
+            }
+
+            const natW = bitmap.naturalWidth > 0 ? bitmap.naturalWidth : (image.meta?.naturalWidth || 640)
+            const natH = bitmap.naturalHeight > 0 ? bitmap.naturalHeight : (image.meta?.naturalHeight || 480)
+            const { w, h } = displaySizeForImage(natW, natH)
+            const elements = unmaskElements(current.getSceneElementsIncludingDeleted(), hiddenStateRef.current)
+            const view = visibleArea(current.getAppState())
+            const plan = planImageLineage({
+              elements: elements as unknown as LineageCanvasElement[],
+              image,
+              size: { w, h },
+              naturalSize: { w: natW, h: natH },
+              view
+            })
+
+            if (plan.alreadyPlaced) {
+              if (!opts?.auto && plan.existingElementId) {
+                const targetEl = current.getSceneElements().find((el) => el.id === plan.existingElementId && el.opacity > 0)
+                if (targetEl) showElements(current, [targetEl], false)
+                setToast('该结果图片已在画布演进链中')
+              }
+              return
+            }
+
+            type ImageEl = Extract<SceneEl, { type: 'image' }>
+            const fileId = image.id as NonNullable<ImageEl['fileId']>
+            current.addFiles([{ id: fileId, dataURL: dataURL as Parameters<Api['addFiles']>[0][number]['dataURL'], mimeType: image.mediaType, created: Date.now() }])
+
+            const skeletons: Record<string, unknown>[] = [
+              {
+                type: 'image',
+                id: plan.imageId,
+                fileId,
+                x: plan.x,
+                y: plan.y,
+                width: plan.w,
+                height: plan.h
+              }
+            ]
+            if (plan.edge) {
+              skeletons.push({
+                type: 'arrow',
+                id: plan.edge.id,
+                x: plan.edge.x,
+                y: plan.edge.y,
+                width: Math.abs(plan.edge.points[1][0]),
+                height: Math.abs(plan.edge.points[1][1]),
+                points: plan.edge.points,
+                endArrowhead: 'arrow',
+                label: { text: plan.edge.label, fontSize: 14 }
+              })
+            }
+            if (plan.caption) {
+              skeletons.push({
+                type: 'text',
+                id: plan.caption.id,
+                x: plan.caption.x,
+                y: plan.caption.y,
+                text: plan.caption.text,
+                fontSize: plan.caption.fontSize
+              })
+            }
+
+            const baseMark = {
+              author: 'agent',
+              agent: AGENT_SEAT,
+              seat: true,
+              layer: 'final'
+            }
+            const created = convertToExcalidrawElements(skeletons as unknown as SkeletonList, { regenerateIds: false })
+            const added = created.map((el) => {
+              if (el.type === 'image') {
+                const bound = plan.edge
+                  ? [...(el.boundElements ?? []), { id: plan.edge.id, type: 'arrow' as const }]
+                  : el.boundElements
+                return {
+                  ...el,
+                  ...(bound ? { boundElements: bound } : {}),
+                  customData: {
+                    ...el.customData,
+                    flyingdraws: {
+                      ...baseMark,
+                      result: image.id,
+                      lineageVersion: plan.versionNumber,
+                      imageMeta: {
+                        ...image.meta,
+                        naturalWidth: natW,
+                        naturalHeight: natH
+                      }
+                    }
+                  }
+                } as SceneEl
+              }
+              if (el.type === 'arrow' && plan.edge && el.id === plan.edge.id) {
+                return {
+                  ...el,
+                  strokeColor: AGENT_COLOR,
+                  startBinding: { elementId: plan.edge.fromId, focus: 0, gap: 8 },
+                  endBinding: { elementId: plan.edge.toId, focus: 0, gap: 8 },
+                  customData: {
+                    ...el.customData,
+                    flyingdraws: {
+                      ...baseMark,
+                      lineageRole: 'edge'
+                    }
+                  }
+                } as SceneEl
+              }
+              return {
+                ...el,
+                strokeColor: AGENT_COLOR,
+                customData: {
+                  ...el.customData,
+                  flyingdraws: {
+                    ...baseMark,
+                    lineageRole: (el as Loose).containerId ? 'edge-label' : 'caption'
+                  }
+                }
+              } as SceneEl
+            })
+
+            const updatedExisting =
+              plan.parentId && plan.edge
+                ? elements.map((el) => {
+                    if (el.id !== plan.parentId) return el
+                    const prevBound = el.boundElements ?? []
+                    if (prevBound.some((b) => b.id === plan.edge!.id)) return el
+                    return newElementWith(el, {
+                      boundElements: [...prevBound, { id: plan.edge!.id, type: 'arrow' }]
+                    })
+                  })
+                : elements
+
+            const nextAll = [...updatedExisting, ...added]
+            current.updateScene({ elements: nextAll, captureUpdate: CaptureUpdateAction.IMMEDIATELY })
+            const nextPlaced = extractPlacedResults(nextAll)
+            lastPlacedKeyRef.current = nextPlaced.join('|')
+            setPlacedResultIds(new Set(nextPlaced))
+            if (filterRef.current !== 'all') {
+              applyAuthorFilter(current, filterRef.current, hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(extractSeats(nextAll)))
+            }
+            const addedIds = new Set(added.map((a) => a.id))
+            const visibleAdded = current.getSceneElements().filter((el) => addedIds.has(el.id) && el.opacity > 0)
+            showElements(current, visibleAdded, false)
+            setToast(
+              plan.parentId
+                ? `已连入视觉演进链（v${plan.versionNumber}），可继续圈选批注`
+                : '结果图片已放到画布，可直接圈选批注'
+            )
+          }
+          const next = insertQueueRef.current.then(runInsert, runInsert)
+          insertQueueRef.current = next.catch(() => undefined)
+          return next
+        }}
+        capture={async () => {
+          const current = apiRef.current
+          if (!current) throw new Error('画布还没准备好')
+          const snap = await snapshot(current, true, hiddenStateRef.current, true)
+          return { sceneJson: snap.sceneJson, pngBase64: snap.pngBase64, selectedIds: snap.selectedIds }
+        }}
+        selectedImage={selectedImage}
+        traceCapture={async () => {
+          const current = apiRef.current
+          const targetBoard = boardIdRef.current
+          const imageId = selectedImageRef.current
+          if (!current) throw new Error('画布还没准备好')
+          if (!imageId) throw new Error('先在画布上选中一张图片')
+          // 交给模型的是原图本身，不是缩在画布上的截图；坐标系用实际发出去的那张图的尺寸
+          const source = await originalImage(current, imageId)
+          if (apiRef.current !== current || boardIdRef.current !== targetBoard) throw new Error('画板已切换，请重新选择图片')
+          const snap = await snapshot(current, false, hiddenStateRef.current, true, new Set([imageId]))
+          return { imageId, width: source.width, height: source.height, capture: { sceneJson: snap.sceneJson, pngBase64: source.base64, selectedIds: [imageId] } }
+        }}
+      />
+      </div>
+      {api ? <StrokeWidthSlider api={api} /> : null}
+      {creating ? (
+        <BoardNameModal
+          modeTitle="新建画板"
+          submitLabel="创建"
+          busyLabel="创建中…"
+          defaultName={nextBoardName()}
+          onSubmit={handleCreateBoard}
+          onClose={() => setCreating(false)}
+        />
+      ) : null}
+      {renaming ? (
+        <BoardNameModal
+          modeTitle="重命名画板"
+          submitLabel="保存"
+          busyLabel="保存中…"
+          defaultName={boardInfo.title ?? boardInfo.board}
+          onSubmit={handleRenameBoard}
+          onClose={() => setRenaming(false)}
+        />
+      ) : null}
+      {confirmDelete ? (
+        <ConfirmModal
+          title="删除画板"
+          message={`确定要删除画板「${boardInfo.title ? `${boardInfo.title} (${boardInfo.board})` : boardInfo.board}」吗？文件会从磁盘移除，无法恢复。`}
+          confirmLabel="确认删除"
+          busyLabel="删除中…"
+          onConfirm={handleDeleteBoard}
+          onClose={() => setConfirmDelete(false)}
+        />
+      ) : null}
     </>
   )
 }
@@ -1449,6 +1896,7 @@ function BoardNameModal(props: {
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => {
             e.stopPropagation()
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return
             if (e.key === 'Enter' && !busy) void submit()
             if (e.key === 'Escape' && !busy) props.onClose()
           }}
@@ -1564,6 +2012,7 @@ function Banner(props: {
         onChange={(e) => setNote(e.target.value)}
         onKeyDown={(e) => {
           e.stopPropagation() // 别让 Excalidraw 把输入当成快捷键
+          if (e.nativeEvent.isComposing || e.keyCode === 229) return
           if (e.key === 'Enter' && !sending) void send()
           // 上面拦住了冒泡，横幅外层收不到这次按键，Esc 要在这里自己处理
           else if (e.key === 'Escape' && props.keyboard && !sending) void run(props.onCancel)

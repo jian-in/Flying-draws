@@ -2,7 +2,7 @@
 // 连接信息（端口和 token）写在 ~/.flyingdraws/daemon.json。
 import http from 'node:http'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 export type Handler = (body: Record<string, unknown>) => Promise<unknown>
@@ -28,16 +28,20 @@ function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
+    let failed = false
     req.on('data', (c: Buffer) => {
+      if (failed) return
       size += c.length
       if (size > MAX_BODY) {
+        failed = true
+        req.resume()
         reject(new HttpError(413, 'body too large'))
-        req.destroy()
         return
       }
       chunks.push(c)
     })
     req.on('end', () => {
+      if (failed) return
       if (!chunks.length) return resolve({})
       try {
         const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
@@ -46,7 +50,9 @@ function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
         reject(new HttpError(400, 'invalid JSON'))
       }
     })
-    req.on('error', reject)
+    req.on('error', (err) => {
+      if (!failed) reject(err)
+    })
   })
 }
 
@@ -63,8 +69,12 @@ export async function startDaemon(
   const token = randomBytes(24).toString('hex')
 
   const server = http.createServer(async (req, res) => {
-    const send = (status: number, payload: unknown) => {
-      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+    const send = (status: number, payload: unknown, closeConn = false) => {
+      if (res.headersSent) return
+      res.writeHead(status, {
+        'content-type': 'application/json; charset=utf-8',
+        ...(closeConn ? { connection: 'close' } : {})
+      })
       res.end(JSON.stringify(payload))
     }
     try {
@@ -81,7 +91,8 @@ export async function startDaemon(
       send(200, await handler(body))
     } catch (err) {
       const status = err instanceof HttpError ? err.status : 500
-      send(status, { error: err instanceof Error ? err.message : String(err) })
+      if (status === 413) res.once('finish', () => req.destroy())
+      send(status, { error: err instanceof Error ? err.message : String(err) }, status === 413)
     }
   })
   // 长轮询最多挂 60 秒，关掉 Node 默认的请求超时
@@ -95,7 +106,9 @@ export async function startDaemon(
   const port = (server.address() as { port: number }).port
   const info: DaemonInfo = { port, token, pid: process.pid, startedAt: new Date().toISOString() }
   await mkdir(dirname(infoPath), { recursive: true })
-  await writeFile(infoPath, JSON.stringify(info, null, 2), { encoding: 'utf8', mode: 0o600 })
+  const tmpInfoPath = `${infoPath}.${process.pid}.tmp`
+  await writeFile(tmpInfoPath, JSON.stringify(info, null, 2), { encoding: 'utf8', mode: 0o600 })
+  await rename(tmpInfoPath, infoPath)
 
   const close = async () => {
     server.closeAllConnections()

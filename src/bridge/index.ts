@@ -1,26 +1,65 @@
 #!/usr/bin/env node
-// flying-draws-mcp：agent 通过 stdio 启动的轻量桥接进程。
-// 只负责把 MCP 工具调用转发给桌面应用的本地服务；应用没开时自动拉起来。
+// flying-draws / flying-draws-mcp：
+// - 无参数或 --mcp：通过 stdio 启动轻量 MCP 桥接进程（stdout 严格只输出 MCP 协议帧）
+// - setup / config / doctor / --help / --version：零门槛 CLI 配置向导与本地环境自检
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import http from 'node:http'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 
 // FLYINGDRAWS_HOME 和桌面应用用的是同一个变量；桥接拉起应用时环境变量会传下去
 const OVERRIDE_HOME = process.env.FLYINGDRAWS_HOME ? resolve(process.env.FLYINGDRAWS_HOME) : null
-const DAEMON_INFO = join(OVERRIDE_HOME || join(homedir(), '.flyingdraws'), 'daemon.json')
+const HOME_DIR = OVERRIDE_HOME || join(homedir(), '.flyingdraws')
+const DAEMON_INFO = join(HOME_DIR, 'daemon.json')
 const APP_ROOT = resolve(__dirname, '..', '..')
+const BRIDGE_ENTRY = resolve(__dirname, 'index.js')
 const LAUNCH_TIMEOUT_MS = 30_000
+const RELEASES_URL = 'https://github.com/jian-in/Flying-draws/releases'
+
+const MCP_TOOL_NAMES = [
+  'canvas_open',
+  'canvas_list',
+  'canvas_rename',
+  'canvas_delete',
+  'canvas_read',
+  'canvas_request',
+  'canvas_wait',
+  'canvas_pass',
+  'canvas_propose',
+  'canvas_draw'
+] as const
+
+function readPackageVersion(): string {
+  try {
+    const raw = JSON.parse(readFileSync(join(APP_ROOT, 'package.json'), 'utf8')) as { version?: unknown }
+    if (typeof raw.version === 'string' && raw.version.trim()) return raw.version.trim()
+  } catch {}
+  return '0.1.0'
+}
+
+const PKG_VERSION = readPackageVersion()
 
 interface DaemonInfo {
   port: number
   token: string
 }
+
+interface DesktopLaunchTarget {
+  command: string
+  args: string[]
+  source: 'env' | 'bundled-sibling' | 'repo-dist' | 'localappdata' | 'electron-dev'
+  label: string
+  windowsHide: boolean
+}
+
+type DesktopResolution =
+  | { ok: true; target: DesktopLaunchTarget; notes: string[] }
+  | { ok: false; error: string; notes: string[] }
 
 const log = (...args: unknown[]) => console.error('[flying-draws-mcp]', ...args) // stdout 留给 MCP 协议
 
@@ -78,30 +117,394 @@ async function healthy(info: DaemonInfo | null): Promise<boolean> {
   }
 }
 
+function tryResolveElectron(): string | null {
+  try {
+    // 在 Node 里加载 electron 包拿到的是 Electron 可执行文件的路径
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const electronPath = require('electron') as unknown
+    if (typeof electronPath === 'string' && electronPath && existsSync(electronPath)) {
+      return electronPath
+    }
+  } catch {}
+  return null
+}
+
+function resolveDesktopLaunch(): DesktopResolution {
+  const notes: string[] = []
+
+  // 1) 环境变量 FLYINGDRAWS_APP 指定的桌面端可执行文件
+  const envAppRaw = process.env.FLYINGDRAWS_APP?.trim()
+  if (envAppRaw) {
+    const envApp = resolve(envAppRaw)
+    if (existsSync(envApp)) {
+      return {
+        ok: true,
+        notes,
+        target: {
+          command: envApp,
+          args: [],
+          source: 'env',
+          label: `FLYINGDRAWS_APP (${envApp})`,
+          windowsHide: true
+        }
+      }
+    }
+    return {
+      ok: false,
+      notes,
+      error:
+        `FLYINGDRAWS_APP points to a missing executable: ${envApp}. ` +
+        `Update FLYINGDRAWS_APP to a valid "Flying draws.exe" path or unset it.`
+    }
+  }
+
+  // 2) 独立目录包同级 ../../Flying draws.exe（自带 Electron，不依赖开发环境的 electron 包）
+  const bundledSibling = resolve(APP_ROOT, '..', '..', 'Flying draws.exe')
+  if (existsSync(bundledSibling)) {
+    return {
+      ok: true,
+      notes,
+      target: {
+        command: bundledSibling,
+        args: [],
+        source: 'bundled-sibling',
+        label: `bundled executable (${bundledSibling})`,
+        windowsHide: true
+      }
+    }
+  }
+
+  const outMain = join(APP_ROOT, 'out', 'main', 'index.js')
+  const outMainExists = existsSync(outMain)
+  const devElectron = tryResolveElectron()
+  const isIsolatedDebug = Boolean(process.env.FLYINGDRAWS_DEBUG_PORT)
+
+  // 3) 仓库 dist/Flying-draws-win32-x64/Flying draws.exe 或 %LOCALAPPDATA%/Flying draws/Flying draws.exe
+  const distCandidates = Array.from(
+    new Set([
+      join(APP_ROOT, 'dist', 'Flying-draws-win32-x64', 'Flying draws.exe'),
+      join(APP_ROOT, 'dist', `Flying-draws-${process.platform}-${process.arch}`, 'Flying draws.exe')
+    ])
+  )
+  for (const distExe of distCandidates) {
+    if (!existsSync(distExe)) continue
+    const distMain = join(dirname(distExe), 'resources', 'app', 'out', 'main', 'index.js')
+    const staleInDevRepo =
+      Boolean(devElectron) &&
+      outMainExists &&
+      (isIsolatedDebug || (existsSync(distMain) && statSync(distMain).mtimeMs + 1000 < statSync(outMain).mtimeMs))
+    if (staleInDevRepo) {
+      notes.push(`Skipped older dist bundle (${distExe}) in favor of fresher out/main/index.js`)
+      continue
+    }
+    return {
+      ok: true,
+      notes,
+      target: {
+        command: distExe,
+        args: [],
+        source: 'repo-dist',
+        label: `repo dist bundle (${distExe})`,
+        windowsHide: true
+      }
+    }
+  }
+
+  const localAppData =
+    process.env.LOCALAPPDATA?.trim() || (process.platform === 'win32' ? join(homedir(), 'AppData', 'Local') : '')
+  if (localAppData && !isIsolatedDebug) {
+    const localAppExe = join(localAppData, 'Flying draws', 'Flying draws.exe')
+    if (existsSync(localAppExe)) {
+      return {
+        ok: true,
+        notes,
+        target: {
+          command: localAppExe,
+          args: [],
+          source: 'localappdata',
+          label: `%LOCALAPPDATA% bundle (${localAppExe})`,
+          windowsHide: true
+        }
+      }
+    }
+  }
+
+  // 4) 开发环境 electron 包 + 构建产物 out/main/index.js
+  if (!devElectron) {
+    return {
+      ok: false,
+      notes,
+      error:
+        `Flying draws desktop executable not found (and local "electron" package is not installed).\n` +
+        `How to fix:\n` +
+        `  1. Download Flying-draws-win32-x64.zip from GitHub Releases (${RELEASES_URL}), unpack it, and set FLYINGDRAWS_APP="<path>\\Flying draws.exe" (or place it in %LOCALAPPDATA%\\Flying draws\\Flying draws.exe); OR\n` +
+        `  2. In the repository (${APP_ROOT}), run "npm install && npm run build".`
+    }
+  }
+
+  if (!outMainExists) {
+    return {
+      ok: false,
+      notes,
+      error: `Flying draws is not built yet. Run "npm run build" in ${APP_ROOT} first, or set FLYINGDRAWS_APP to a packaged "Flying draws.exe".`
+    }
+  }
+
+  return {
+    ok: true,
+    notes,
+    target: {
+      command: devElectron,
+      args: [APP_ROOT],
+      source: 'electron-dev',
+      label: `development Electron (${devElectron})`,
+      windowsHide: false
+    }
+  }
+}
+
 function launchApp(): void {
-  if (!existsSync(join(APP_ROOT, 'out', 'main', 'index.js'))) {
-    throw new Error(`Flying draws is not built yet. Run "npm run build" in ${APP_ROOT} first.`)
+  const resolved = resolveDesktopLaunch()
+  if (!resolved.ok) {
+    throw new Error(resolved.error)
   }
-  // 独立目录包已经自带 Electron，不依赖开发环境的 electron npm 包。
-  const bundled = process.platform === 'win32' ? resolve(APP_ROOT, '..', '..', 'Flying draws.exe') : null
-  if (bundled && existsSync(bundled)) {
-    const env = { ...process.env }
-    if (OVERRIDE_HOME) env.FLYINGDRAWS_HOME = OVERRIDE_HOME
-    delete env.ELECTRON_RUN_AS_NODE
-    const child = spawn(bundled, [], { detached: true, stdio: 'ignore', windowsHide: true, env })
-    child.on('error', () => log('Could not start the packaged Flying draws application.'))
-    child.unref()
-    return
-  }
-  // 在 Node 里 require('electron') 拿到的是 Electron 可执行文件的路径
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const electronPath = require('electron') as string
+  const { target } = resolved
   const env = { ...process.env }
   if (OVERRIDE_HOME) env.FLYINGDRAWS_HOME = OVERRIDE_HOME
   delete env.ELECTRON_RUN_AS_NODE
-  const child = spawn(electronPath, [APP_ROOT], { detached: true, stdio: 'ignore', env, windowsHide: false })
+  const child = spawn(target.command, target.args, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: target.windowsHide,
+    env
+  })
+  child.on('error', (err) => log(`Could not start Flying draws (${target.source}):`, err.message))
   child.unref()
-  log('launched canvas app, pid', child.pid)
+  log('launched canvas app via', target.source, 'pid', child.pid)
+}
+
+function resolveFuxiBinary(desktopResolution: DesktopResolution): string | null {
+  const fuxiName = process.platform === 'win32' ? 'fuxi.exe' : 'fuxi'
+  const override = process.env.FLYINGDRAWS_FUXI_BIN?.trim()
+  if (override) {
+    const resolvedOverride = resolve(override)
+    return existsSync(resolvedOverride) ? resolvedOverride : null
+  }
+  const candidates = [
+    resolve(APP_ROOT, '..', 'fuxi', fuxiName),
+    join(APP_ROOT, 'resources', 'fuxi', fuxiName)
+  ]
+  if (desktopResolution.ok && desktopResolution.target.source !== 'electron-dev') {
+    candidates.unshift(join(dirname(desktopResolution.target.command), 'resources', 'fuxi', fuxiName))
+  }
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+type SetupClient = 'claude' | 'cursor' | 'codex' | 'antigravity'
+
+function formatSetupOutput(target: SetupClient | 'all', jsonOnly: boolean): string {
+  const bridgePath = BRIDGE_ENTRY.replace(/\\/g, '/')
+  const envApp = process.env.FLYINGDRAWS_APP?.trim()
+  const envBlock = envApp ? { FLYINGDRAWS_APP: resolve(envApp).replace(/\\/g, '/') } : undefined
+  const mcpServerEntry: Record<string, unknown> = {
+    command: 'node',
+    args: [bridgePath],
+    ...(envBlock ? { env: envBlock } : {})
+  }
+  const jsonConfig = JSON.stringify({ mcpServers: { 'flying-draws': mcpServerEntry } }, null, 2)
+  if (jsonOnly) return jsonConfig
+
+  const sections: Record<SetupClient, string> = {
+    claude: [
+      '=== Claude Code ===',
+      `# 一行命令直接注册（推荐）：`,
+      envBlock
+        ? `claude mcp add --scope user -e FLYINGDRAWS_APP="${envBlock.FLYINGDRAWS_APP}" flying-draws -- node "${bridgePath}"`
+        : `claude mcp add --scope user flying-draws -- node "${bridgePath}"`,
+      '',
+      '# 或写入项目根目录 .mcp.json：',
+      jsonConfig
+    ].join('\n'),
+    cursor: [
+      '=== Cursor ===',
+      '# 写入 ~/.cursor/mcp.json 或项目 .cursor/mcp.json：',
+      jsonConfig
+    ].join('\n'),
+    codex: [
+      '=== Codex ===',
+      '# 一行命令直接注册：',
+      `codex mcp add flying-draws -- node "${bridgePath}"`,
+      '',
+      '# 或写入 ~/.codex/config.toml：',
+      '[mcp_servers.flying-draws]',
+      'command = "node"',
+      `args = ["${bridgePath}"]`,
+      ...(envBlock ? ['[mcp_servers.flying-draws.env]', `FLYINGDRAWS_APP = "${envBlock.FLYINGDRAWS_APP}"`] : [])
+    ].join('\n'),
+    antigravity: [
+      '=== Antigravity ===',
+      '# 写入 mcp_config.json：',
+      jsonConfig
+    ].join('\n')
+  }
+
+  if (target !== 'all') {
+    return sections[target]
+  }
+
+  return [
+    `Flying draws v${PKG_VERSION} — MCP 30 秒零门槛接入配置`,
+    `Bridge path: ${bridgePath}`,
+    '',
+    sections.claude,
+    '',
+    sections.cursor,
+    '',
+    sections.codex,
+    '',
+    sections.antigravity,
+    '',
+    `自检命令：node "${bridgePath}" doctor`
+  ].join('\n')
+}
+
+function parseNodeVersionOk(ver: string): boolean {
+  const [major = 0, minor = 0] = ver.split('.').map((n) => Number.parseInt(n, 10))
+  return major > 20 || (major === 20 && minor >= 19)
+}
+
+async function runDoctor(): Promise<string> {
+  const lines: string[] = [`Flying draws v${PKG_VERSION} — 环境自检 (doctor)`, '']
+
+  // 1. Node.js 版本
+  const nodeVer = process.versions.node
+  const nodeOk = parseNodeVersionOk(nodeVer)
+  lines.push(
+    nodeOk
+      ? `[OK]   Node.js: v${nodeVer} (满足 >= 20.19.0)`
+      : `[WARN] Node.js: v${nodeVer} (建议使用 Node.js >= 20.19.0)`
+  )
+
+  // 2. 构建产物检测
+  const outMain = join(APP_ROOT, 'out', 'main', 'index.js')
+  const outRenderer = join(APP_ROOT, 'out', 'renderer', 'index.html')
+  const hasBuild = existsSync(outMain) && existsSync(outRenderer)
+  lines.push(
+    hasBuild
+      ? `[OK]   构建产物: 已就绪 (${outMain})`
+      : `[INFO] 构建产物: 未检测到完整本地构建 (${outMain})；若使用独立桌面包可忽略，源码运行请执行 npm run build`
+  )
+
+  // 3. 画布桌面端可执行文件寻址
+  const desktop = resolveDesktopLaunch()
+  if (desktop.ok) {
+    lines.push(`[OK]   桌面画布端: ${desktop.target.label}`)
+  } else {
+    lines.push(`[WARN] 桌面画布端: 未找到可用启动路径 — ${desktop.error.replace(/\n+/g, ' ')}`)
+  }
+  for (const note of desktop.notes) {
+    lines.push(`       └─ ${note}`)
+  }
+
+  // 4. ~/.flyingdraws/daemon.json 在线状态
+  const info = readInfo()
+  const isOnline = await healthy(info)
+  if (isOnline && info) {
+    lines.push(`[OK]   本地画布服务: 在线 (127.0.0.1:${info.port}, ${DAEMON_INFO})`)
+  } else {
+    lines.push(`[INFO] 本地画布服务: 当前未运行 (${DAEMON_INFO}) — 首次调用 MCP 工具时将自动拉起画布窗口`)
+  }
+
+  // 5. 内置 Fuxi 内核检测（可选）
+  const fuxiPath = resolveFuxiBinary(desktop)
+  if (fuxiPath) {
+    lines.push(`[OK]   内置 Fuxi 内核: 已安装 (${fuxiPath})`)
+  } else {
+    lines.push(
+      `[INFO] 内置 Fuxi 内核: 未安装（提示：未安装 Fuxi 时外部 MCP 画布全部 ${MCP_TOOL_NAMES.length} 个工具仍 100% 可用！）`
+    )
+  }
+
+  lines.push('')
+  lines.push(`外部 MCP 工具 (${MCP_TOOL_NAMES.length} 个): ${MCP_TOOL_NAMES.join(', ')}`)
+  return lines.join('\n')
+}
+
+function formatHelp(): string {
+  const bridgePath = BRIDGE_ENTRY.replace(/\\/g, '/')
+  return [
+    `Flying draws v${PKG_VERSION} — Spatial memory, visual diff & live proposal pad for coding agents`,
+    '',
+    'Usage:',
+    '  flying-draws [--mcp]                              Start stdio MCP server (default when no args are given)',
+    '  flying-draws setup [claude|cursor|codex|antigravity] [--json]',
+    '                                                    Print copy-paste MCP registration command / JSON config',
+    '  flying-draws config [client]                      Alias for "setup"',
+    '  flying-draws doctor                               Inspect Node, build artifacts, desktop app, daemon & Fuxi status',
+    '  flying-draws --version, -v                        Print version',
+    '  flying-draws --help, -h                           Show this help message',
+    '',
+    'Environment variables:',
+    '  FLYINGDRAWS_APP    Path to standalone "Flying draws.exe" (highest launch priority)',
+    '  FLYINGDRAWS_HOME   Custom state & boards directory (default: ~/.flyingdraws)',
+    '  FLYINGDRAWS_SEAT   Default collaborative agent seat name',
+    '',
+    `Quick start: node "${bridgePath}" setup`
+  ].join('\n')
+}
+
+function isCliMode(args: readonly string[]): boolean {
+  if (args.length === 0) return false
+  if (args.length === 1 && args[0] === '--mcp') return false
+  return true
+}
+
+async function runCli(args: readonly string[]): Promise<never> {
+  const cmd = args[0]
+  if (cmd === '--version' || cmd === '-v' || cmd === 'version') {
+    process.stdout.write(`flying-draws ${PKG_VERSION}\n`)
+    process.exit(0)
+  }
+  if (cmd === '--help' || cmd === '-h' || cmd === 'help') {
+    process.stdout.write(`${formatHelp()}\n`)
+    process.exit(0)
+  }
+  if (cmd === 'setup' || cmd === 'config') {
+    const rest = args.slice(1)
+    const jsonOnly = rest.includes('--json')
+    const positional = rest.filter((a) => !a.startsWith('-'))
+    const rawTarget = (positional[0] ?? 'all').toLowerCase()
+    const normalizedTarget: SetupClient | 'all' | null =
+      rawTarget === 'all'
+        ? 'all'
+        : rawTarget === 'claude' || rawTarget === 'claude-code'
+          ? 'claude'
+          : rawTarget === 'cursor'
+            ? 'cursor'
+            : rawTarget === 'codex'
+              ? 'codex'
+              : rawTarget === 'antigravity'
+                ? 'antigravity'
+                : null
+    if (!normalizedTarget) {
+      process.stderr.write(
+        `Unknown client "${positional[0]}". Supported clients: claude, cursor, codex, antigravity.\n`
+      )
+      process.exit(1)
+    }
+    process.stdout.write(`${formatSetupOutput(normalizedTarget, jsonOnly)}\n`)
+    process.exit(0)
+  }
+  if (cmd === 'doctor') {
+    const report = await runDoctor()
+    process.stdout.write(`${report}\n`)
+    process.exit(0)
+  }
+  process.stderr.write(`Unknown command "${cmd}". Run with --help for usage.\n`)
+  process.exit(1)
 }
 
 let launching: Promise<DaemonInfo> | null = null
@@ -193,7 +596,7 @@ const rememberSeat = (as: string | undefined): string | undefined => {
   return sessionSeat
 }
 
-const server = new McpServer({ name: 'flying-draws', version: '0.1.0' })
+const server = new McpServer({ name: 'flying-draws', version: PKG_VERSION })
 const clientAgentName = (): string | undefined => server.server.getClientVersion()?.name?.trim() || undefined
 
 // 桌面应用开着时主动报个到，不自动拉起应用；退出时通知主进程撤下在线席位
@@ -493,7 +896,51 @@ const addOps = [
   })
 ] as const
 
-const drawOpSchema = z.discriminatedUnion('op', [...addOps, ...modifyOps])
+// 照图还原：坐标都在 space 坐标系里（通常就是原图像素），画布负责换算，不用算画布坐标
+const tracePoint = z.tuple([z.number(), z.number()])
+const traceElement = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('box'),
+    id: z.string().min(1).optional().describe('Name this box so lines can attach to it with from/to.'),
+    x: z.number().describe('Left edge in the image coordinate space.'),
+    y: z.number().describe('Top edge.'),
+    w: z.number().positive(),
+    h: z.number().positive(),
+    shape: z.enum(['rectangle', 'ellipse', 'diamond']).optional(),
+    label: z.string().optional().describe('Text inside the box, exactly as written in the image.'),
+    color: z.string().optional().describe('Border and text color as hex, e.g. "#1971c2".'),
+    fill: z.string().optional().describe('Fill color as hex, or "transparent".'),
+    font_size: z.number().positive().optional().describe('Text height in the image coordinate space.')
+  }),
+  z.object({
+    kind: z.literal('text'),
+    x: z.number().describe('Left edge of the text.'),
+    y: z.number().describe('Top edge of the text.'),
+    text: z.string().min(1),
+    color: z.string().optional(),
+    font_size: z.number().positive().optional()
+  }),
+  z.object({
+    kind: z.literal('line'),
+    points: z.array(tracePoint).min(2).max(200).describe('The polyline in the image coordinate space: [[x, y], [x, y], ...].'),
+    arrow: z.enum(['none', 'end', 'start', 'both']).optional().describe('Arrowheads; default none.'),
+    color: z.string().optional(),
+    dashed: z.boolean().optional(),
+    from: z.string().optional().describe('Id of the box where the line starts, so it stays attached when the box moves.'),
+    to: z.string().optional().describe('Id of the box where the line ends.')
+  })
+])
+const traceOp = z.object({
+  op: z.literal('trace_image'),
+  image: z.string().min(1).describe('Image id from canvas_read (like "I1"), or the image\'s stable element id.'),
+  space: z
+    .object({ w: z.number().positive().max(20000), h: z.number().positive().max(20000) })
+    .describe('The coordinate space of all x/y/w/h/points below, usually the image\'s pixel size. The canvas scales it onto the image.'),
+  place: z.enum(['beside', 'over']).optional().describe('"beside" (default): a same-size copy next to the image; "over": on top of the image.'),
+  elements: z.array(traceElement).min(1).max(500).describe('Every box, text and line you see in the image, with positions, colors and text as in the image.')
+})
+
+const drawOpSchema = z.discriminatedUnion('op', [...addOps, ...modifyOps, traceOp])
 
 const directionSchema = z
   .enum(['right', 'down'])
@@ -580,6 +1027,7 @@ server.registerTool(
       'update_node, delete_node, update_edge, delete_edge, update_text (T1), delete_text (T1), delete_strokes (S1), set_style. ' +
       'To refer to elements already on the canvas (N1, T1, S1), pass the version from the read where you saw them as base_version; ' +
       'it still works if unrelated parts of the canvas changed since, unless an element you modify was changed by someone else. ' +
+      'To turn a diagram image on the canvas (I1) into editable shapes, use trace_image: describe its boxes, texts and lines in the image\'s own pixel coordinates; the canvas scales them and keeps their colors. ' +
       'Returns the updated canvas description. Things you drew are tagged with your agent name in later reads.',
     inputSchema: {
       board: boardSchema,
@@ -594,7 +1042,7 @@ server.registerTool(
     const failure = drawFailure(res, base_version)
     if (failure) return failure
     if (res.status !== 'drawn') return text(JSON.stringify(res))
-    const added = res.added as { nodes: number; edges: number; texts: number }
+    const added = res.added as { nodes: number; edges: number; texts: number; lines?: number }
     const changed = (res.changed ?? { updated: 0, styled: 0, deleted: 0 }) as {
       updated: number
       styled?: number
@@ -607,7 +1055,7 @@ server.registerTool(
     ].filter(Boolean)
     const ids = newNodeIds(res)
     const header =
-      `Drawn: ${added.nodes} node(s), ${added.edges} arrow(s), ${added.texts} text(s).` +
+      `Drawn: ${added.nodes} node(s), ${added.edges} arrow(s), ${added.texts} text(s)${added.lines ? `, ${added.lines} line(s)` : ''}.` +
       (changeParts.length ? ` Changed: ${changeParts.join(', ')}.` : '') +
       ` The canvas is now at version ${res.version}.` +
       (ids ? ` Your new nodes: ${ids}.` : '')
@@ -641,7 +1089,15 @@ async function main(): Promise<void> {
   log('ready')
 }
 
-main().catch((err) => {
-  log('fatal', err)
-  process.exit(1)
-})
+const cliArgs = process.argv.slice(2)
+if (isCliMode(cliArgs)) {
+  runCli(cliArgs).catch((err) => {
+    process.stderr.write(`flying-draws CLI error: ${err instanceof Error ? err.message : String(err)}\n`)
+    process.exit(1)
+  })
+} else {
+  main().catch((err) => {
+    log('fatal', err)
+    process.exit(1)
+  })
+}

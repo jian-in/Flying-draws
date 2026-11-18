@@ -59,7 +59,12 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
     if (input.board !== board()) throw new Error('画板已切换，请重新发送')
     return service.submit(input)
   })
-  ipcMain.handle('agent:execute', (_event, text: string) => service.execute(text))
+  ipcMain.handle('agent:execute', (_event, text: string) => {
+    const active = service.snapshot()
+    const item = active.items.find(i => i.id === active.activeItemId && !i.archived)
+    if (item && item.board !== board()) throw new Error('画板已切换，请切回原画板或重新拟定计划')
+    return service.execute(text)
+  })
   ipcMain.handle('agent:cancel', () => service.cancel())
   ipcMain.handle('agent:approve', (_event, requestId: string, approved: boolean) => service.approve(requestId, approved))
   ipcMain.handle('agent:image', (_event, id: string) => service.image(id))

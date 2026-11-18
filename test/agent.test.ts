@@ -132,3 +132,48 @@ test('内置 Agent 在画布上用统一的席位名', () => {
   assert.ok(prompt.includes(`as=${JSON.stringify(AGENT_SEAT)}`))
   assert.equal(AGENT_SEAT, 'Fuxi')
 })
+
+test('工具返回截图时记录原图尺寸、页面 URL、视口和轮次元数据', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-img-meta-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  await mkdir(join(home, 'agent'))
+  const item: AgentWorkItem = {
+    id: 'work1',
+    board: 'default',
+    cwd: home,
+    sessionId: 's1',
+    title: '改登录页',
+    runs: [
+      { id: 'r1', mode: 'direct', status: 'completed', goal: '首轮', startedAt: '2026-11-18', reply: 'ok', draft: '', tools: [], approvals: [] },
+      { id: 'r2', taskId: 't2', mode: 'direct', status: 'running', goal: '二轮', startedAt: '2026-11-18', reply: '', draft: '', tools: [{ id: 'tc1', name: 'browser_page', input: '{}', status: 'running' }], approvals: [] }
+    ]
+  }
+  await writeFile(join(home, 'agent', 'work-items.json'), JSON.stringify({ version: 1, items: [item] }))
+  const service = new AgentService({ home, executable: () => '', mcpServers: {} })
+  const png = Buffer.alloc(32)
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52]).copy(png, 0)
+  png.writeUInt32BE(1280, 16)
+  png.writeUInt32BE(720, 20)
+  ;(service as unknown as { onEvent(e: unknown): void }).onEvent({
+    type: 'event',
+    seq: 2,
+    run_id: 'r2',
+    req: 1,
+    event: 'tool_done',
+    data: {
+      id: 'tc1',
+      name: 'browser_page',
+      is_error: false,
+      content: JSON.stringify({ untrusted_page_observation: { url: 'http://127.0.0.1:5173/' }, width: 1280, height: 720 }),
+      image: { media_type: 'image/png', dimensions: [1280, 720], data: png.toString('base64') }
+    }
+  })
+  await service.close()
+  const saved = JSON.parse(await readFile(join(home, 'agent', 'work-items.json'), 'utf8')).items[0].runs[1]
+  assert.equal(saved.images.length, 1)
+  assert.equal(saved.images[0].meta.naturalWidth, 1280)
+  assert.equal(saved.images[0].meta.naturalHeight, 720)
+  assert.equal(saved.images[0].meta.url, 'http://127.0.0.1:5173/')
+  assert.deepEqual(saved.images[0].meta.viewport, { w: 1280, h: 720 })
+  assert.equal(saved.images[0].meta.round, 2)
+})

@@ -4,8 +4,18 @@ import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
-import { bboxOf, buildGraph, summarize, type SceneElement } from './semantic'
-import { OpsError, planOps, rebaseOps, toProposalPlan, type DrawOp, type DrawPlan, type PendingChanges } from './ops'
+import { bboxOf, buildGraph, summarize, type SceneElement, type SceneFile } from './semantic'
+import {
+  OpsError,
+  elementFingerprints,
+  planOps,
+  rebaseOps,
+  toProposalPlan,
+  type DrawOp,
+  type DrawPlan,
+  type FingerprintElement,
+  type PendingChanges
+} from './ops'
 import { pickupHint, RequestHub, type HubState, type Submission, type WaitResult } from './requests'
 import { PendingStore } from './pending'
 import { SEAT_COLORS, nextSeatColor, SeatRegistry } from './seats'
@@ -15,16 +25,20 @@ import { createDaemonLifecycle, startDaemon } from './daemon'
 import { WindowDock, type DockState } from './dock'
 import { registerAgent } from './agentIpc'
 import { trayIconPixels } from './trayIcon'
+import { freshApprovals, hasPendingApprovals, trayTooltip } from './agentNotice'
+import { AGENT_SEAT, type AgentState } from '../shared/agent'
 import {
   BOARD_EXT,
   DEFAULT_BOARD_ID,
   boardFilePath,
   emptyBoardScene,
   isValidBoardId,
+  matchExistingBoardId,
   normalizeBoardId,
   normalizeBoardTitle,
   parseBoardMeta,
   pickFallbackBoard,
+  sameBoardOnDisk,
   updateBoardSceneTitle,
   validateBoardId,
   type BoardMeta
@@ -61,10 +75,10 @@ let backgroundHintShown = false
 // 开机自启时带着 --background，第一次只建窗口不显示
 let launchHidden = process.argv.includes(BACKGROUND_ARG)
 
-function trayImage(): Electron.NativeImage {
+function trayImage(alert = false): Electron.NativeImage {
   const image = nativeImage.createEmpty()
   for (const [size, scaleFactor] of [[16, 1], [24, 1.5], [32, 2]] as const) {
-    image.addRepresentation({ width: size, height: size, scaleFactor, buffer: trayIconPixels(size) })
+    image.addRepresentation({ width: size, height: size, scaleFactor, buffer: trayIconPixels(size, alert) })
   }
   return image
 }
@@ -99,10 +113,28 @@ function createTray(): void {
   tray = new Tray(trayImage())
   tray.setToolTip('Flying draws')
   tray.on('click', () => bringToFront())
+  tray.on('balloon-click', () => bringToFront())
   refreshTrayMenu()
-  // 托盘提示跟着内置 Agent 的状态走：藏在后台时也看得出它是不是还在干活
-  agent.on('state', (state: { busy: boolean }) => {
-    tray?.setToolTip(state.busy ? 'Flying draws · Agent 正在工作' : 'Flying draws')
+  // 托盘提示跟着内置 Agent 的状态走：藏在后台时也看得出它是在干活还是在等你确认。
+  // 等审批时窗口不在眼前（藏着、最小化或在别的窗口后面），弹一条提醒，免得任务无声地挂着。
+  const notified = new Set<string>()
+  let alerting = false
+  agent.on('state', (state: AgentState) => {
+    tray?.setToolTip(trayTooltip(state))
+    // 托盘图标的红点不依赖系统通知：通知被关掉时也看得见
+    const alert = hasPendingApprovals(state)
+    if (tray && alert !== alerting) {
+      alerting = alert
+      tray.setImage(trayImage(alert))
+    }
+    const fresh = freshApprovals(state, notified)
+    const away = !win || win.isDestroyed() || !win.isVisible() || win.isMinimized() || !win.isFocused()
+    if (!fresh.length || !away || !tray || process.platform !== 'win32') return
+    tray.displayBalloon({
+      iconType: 'info',
+      title: `${AGENT_SEAT} 等你确认`,
+      content: `${fresh.join('、')}：点这里打开 Flying draws 处理。确认前任务会一直等着。`
+    })
   })
 }
 
@@ -192,6 +224,7 @@ function getSession(id: string): BoardSession {
       if (session.id === currentBoardId) pushHubState()
       persistPending()
     })
+    hub.onEvict((requestId) => requestBoard.delete(requestId))
     sessions.set(id, session)
     s = session
   }
@@ -302,27 +335,43 @@ async function acceptScene(json: string, id = currentBoardId): Promise<number> {
   return session.version
 }
 
-async function listBoards(): Promise<BoardInfo[]> {
-  const items: BoardInfo[] = []
+async function listDiskBoardIds(): Promise<string[]> {
   let entries: string[] = []
   try {
     entries = await readdir(BOARDS_DIR)
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
   }
-  const seen = new Set<string>()
+  const out: string[] = []
   for (const name of entries) {
     if (!name.endsWith(BOARD_EXT)) continue
     const id = name.slice(0, -BOARD_EXT.length)
-    if (!isValidBoardId(id)) continue
+    if (isValidBoardId(id)) out.push(id)
+  }
+  return out
+}
+
+async function resolveExistingBoardId(id: string): Promise<string | null> {
+  const diskIds = await listDiskBoardIds()
+  const candidates = diskIds.some((x) => sameBoardOnDisk(x, currentBoardId)) ? diskIds : [...diskIds, currentBoardId]
+  return matchExistingBoardId(id, candidates)
+}
+
+async function listBoards(): Promise<BoardInfo[]> {
+  const items: BoardInfo[] = []
+  const diskIds = await listDiskBoardIds()
+  const seen = new Set<string>()
+  for (const id of diskIds) {
     seen.add(id)
+    const active = sameBoardOnDisk(id, currentBoardId)
+    if (active && id !== currentBoardId) currentBoardId = id
     const file = boardFilePath(BOARDS_DIR, id)
     try {
       const [json, st] = await Promise.all([readFile(file, 'utf8'), stat(file)])
       items.push({ ...parseBoardMeta(id, json, st.mtime.toISOString()), active: id === currentBoardId })
     } catch {}
   }
-  if (!seen.has(currentBoardId)) {
+  if (![...seen].some((id) => sameBoardOnDisk(id, currentBoardId))) {
     const s = getSession(currentBoardId)
     items.push({
       board: currentBoardId,
@@ -371,12 +420,14 @@ async function switchBoard(
   boards: BoardInfo[]
   hubState: HubState
 }> {
-  const targetId = opts.requireExisting ? validateBoardId(targetRaw) : normalizeBoardId(targetRaw)
+  const parsedId = opts.requireExisting ? validateBoardId(targetRaw) : normalizeBoardId(targetRaw)
+  const matchedExisting = await resolveExistingBoardId(parsedId)
+  const targetId = matchedExisting ?? parsedId
   const targetPath = boardFilePath(BOARDS_DIR, targetId)
   const exists = existsSync(targetPath)
-  if (opts.createOnly && exists) throw new Error(`画板「${targetId}」已存在`)
+  if (opts.createOnly && (exists || matchedExisting)) throw new Error(`画板「${targetId}」已存在`)
   if (opts.requireExisting && !exists && targetId !== currentBoardId) {
-    throw new Error(`Board "${targetId}" does not exist. Call canvas_open with board "${targetId}" to create it first.`)
+    throw new Error(`Board "${parsedId}" does not exist. Call canvas_open with board "${parsedId}" to create it first.`)
   }
 
   const prevBoardId = currentBoardId
@@ -433,8 +484,10 @@ async function renameBoard(
   boards: BoardInfo[]
   hubState: HubState
 }> {
-  const fromId = rawFrom?.trim() ? validateBoardId(rawFrom) : currentBoardId
+  const rawFromId = rawFrom?.trim() ? validateBoardId(rawFrom) : currentBoardId
+  const fromId = (await resolveExistingBoardId(rawFromId)) ?? rawFromId
   const toId = normalizeBoardId(rawTo)
+  const existingCollision = !sameBoardOnDisk(fromId, toId) ? await resolveExistingBoardId(toId) : null
   return agent.withBoardChange(fromId, async () => {
   const fromPath = boardFilePath(BOARDS_DIR, fromId)
   const toPath = boardFilePath(BOARDS_DIR, toId)
@@ -442,17 +495,25 @@ async function renameBoard(
   if (fromId === currentBoardId) await flushOutgoingScene(fromId, opts)
   const fromExists = existsSync(fromPath)
   if (!fromExists && fromId !== currentBoardId) {
-    throw new Error(`画板「${fromId}」不存在`)
+    throw new Error(`画板「${rawFromId}」不存在`)
   }
-  if (toId !== fromId && existsSync(toPath)) {
-    throw new Error(`画板「${toId}」已存在`)
+  if (!sameBoardOnDisk(fromId, toId) && (existingCollision || existsSync(toPath))) {
+    throw new Error(`画板「${existingCollision ?? toId}」已存在`)
   }
 
   const rawJson = fromExists ? await readFile(fromPath, 'utf8') : JSON.stringify(emptyBoardScene())
   const nextTitle = opts.title !== undefined ? normalizeBoardTitle(opts.title) : null
   const updatedScene = JSON.parse(updateBoardSceneTitle(rawJson, nextTitle)) as Record<string, unknown>
-  await atomicWriteJson(toPath, updatedScene)
-  if (toId !== fromId && fromExists) await unlink(fromPath)
+  if (fromId !== toId && sameBoardOnDisk(fromId, toId) && fromExists) {
+    // 大小写不敏感文件系统上的纯大小写改名：先写临时文件，删旧名，再改名到新大小写
+    const caseTmp = `${toPath}.case.${process.pid}.tmp`
+    await atomicWriteJson(caseTmp, updatedScene)
+    await unlink(fromPath)
+    await rename(caseTmp, toPath)
+  } else {
+    await atomicWriteJson(toPath, updatedScene)
+    if (toId !== fromId && fromExists) await unlink(fromPath)
+  }
 
   const oldSession = sessions.get(fromId)
   if (toId !== fromId && oldSession) {
@@ -515,11 +576,12 @@ async function deleteBoard(
   boards: BoardInfo[]
   hubState: HubState
 }> {
-  const targetId = rawBoard?.trim() ? validateBoardId(rawBoard) : currentBoardId
+  const rawTargetId = rawBoard?.trim() ? validateBoardId(rawBoard) : currentBoardId
+  const targetId = (await resolveExistingBoardId(rawTargetId)) ?? rawTargetId
   return agent.withBoardChange(targetId, async () => {
   const all = await listBoards()
   if (!all.some((b) => b.board === targetId)) {
-    throw new Error(`画板「${targetId}」不存在`)
+    throw new Error(`画板「${rawTargetId}」不存在`)
   }
   const remaining = all.filter((b) => b.board !== targetId)
   if (!remaining.length) {
@@ -604,7 +666,17 @@ ipcMain.on('rpc:reply', (_e, msg: { id: number; result?: unknown; error?: string
   else p.resolve(msg.result)
 })
 
+function rejectPendingRpcs(reason: string): void {
+  const err = new Error(reason)
+  for (const [, p] of rpcPending) {
+    clearTimeout(p.timer)
+    p.reject(err)
+  }
+  rpcPending.clear()
+}
+
 interface Snapshot {
+  board?: string
   sceneJson: string
   pngBase64: string | null
   view?: { x: number; y: number; w: number; h: number } | null // 用户当前看得见的那块画布
@@ -622,7 +694,9 @@ function bringToFront(): void {
   // Windows 会拦截后台程序抢焦点，短暂置顶再取消，保证窗口能跳到前面
   win.setAlwaysOnTop(true)
   win.focus()
-  setTimeout(() => win?.setAlwaysOnTop(false), 300)
+  setTimeout(() => {
+    if (win && !win.isDestroyed()) win.setAlwaysOnTop(false)
+  }, 300)
 }
 
 let windowReady: Promise<void> = Promise.resolve()
@@ -647,10 +721,12 @@ function createWindow(): void {
     }
   })
   const overlayTarget = win
-  // 窗口吸附：拖到别的窗口旁边松手就贴上去，状态变了告诉页面
-  dock = new WindowDock(win, (state) => {
-    if (!overlayTarget.isDestroyed()) overlayTarget.webContents.send('dock:state', state)
-  })
+  // 窗口吸附：拖到别的窗口旁边松手就贴上去，状态变了告诉页面（隔离测试实例不启用系统级吸附）
+  dock = TEST_INSTANCE
+    ? null
+    : new WindowDock(win, (state) => {
+        if (!overlayTarget.isDestroyed()) overlayTarget.webContents.send('dock:state', state)
+      })
   ipcMain.removeAllListeners('window:theme')
   ipcMain.on('window:theme', (_e, theme: unknown) => {
     if (overlayTarget.isDestroyed()) return
@@ -659,15 +735,23 @@ function createWindow(): void {
     if (process.platform !== 'darwin') overlayTarget.setTitleBarOverlay({ ...colors, height: TITLEBAR_HEIGHT })
     overlayTarget.setBackgroundColor(colors.color)
   })
+  const armWindowReady = () => {
+    ipcMain.removeAllListeners('renderer:ready')
+    windowReady = new Promise((resolve) => ipcMain.once('renderer:ready', () => resolve()))
+  }
+  armWindowReady()
   ipcMain.removeAllListeners('window:reload')
   ipcMain.on('window:reload', () => {
-    if (!overlayTarget.isDestroyed()) overlayTarget.webContents.reload()
+    if (!overlayTarget.isDestroyed()) {
+      rejectPendingRpcs('canvas window reloaded')
+      armWindowReady()
+      overlayTarget.webContents.reload()
+    }
   })
   ipcMain.removeAllListeners('window:devtools')
   ipcMain.on('window:devtools', () => {
     if (!overlayTarget.isDestroyed()) overlayTarget.webContents.toggleDevTools()
   })
-  windowReady = new Promise((resolve) => ipcMain.once('renderer:ready', () => resolve()))
   updateWindowTitle()
 
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -675,6 +759,7 @@ function createWindow(): void {
     return { action: 'deny' }
   })
   win.on('closed', () => {
+    rejectPendingRpcs('canvas window closed')
     win = null
   })
   if (launchHidden) {
@@ -729,18 +814,7 @@ type ImageMode = 'auto' | 'always' | 'never'
 // agent 之后带着 base_version 来画时，用它把旧编号换算成现在的元素，并判断它要改的东西有没有被别人动过。
 // 只放在内存里：应用重启后查不到旧版本，agent 会被要求重新读一次。
 
-type VersionedElement = SceneElement & { version?: number }
-
-// 元素的指纹：它自己的 version 加上绑在它上面的文字的 version。任何一个变了，说明这个元素被动过。
-function fingerprints(elements: readonly VersionedElement[]): Map<string, string> {
-  const textVersion = new Map<string, number>()
-  for (const el of elements) {
-    if (!el.isDeleted && el.type === 'text' && el.containerId) textVersion.set(el.containerId, el.version ?? 0)
-  }
-  const out = new Map<string, string>()
-  for (const el of elements) if (!el.isDeleted) out.set(el.id, `${el.version ?? 0}:${textVersion.get(el.id) ?? ''}`)
-  return out
-}
+type VersionedElement = FingerprintElement
 
 function remember(boardId: string, ver: number, elements: readonly VersionedElement[], graph: ReturnType<typeof buildGraph>): void {
   const history = getSession(boardId).history
@@ -749,9 +823,10 @@ function remember(boardId: string, ver: number, elements: readonly VersionedElem
     ...graph.nodes.map(({ id, ref, label }) => ({ id, ref, label })),
     ...graph.notes.map(({ id, ref, text }) => ({ id, ref, label: text })),
     ...graph.strokeGroups.filter((g) => g.refs.length > 0).map((g) => ({ id: g.id, ref: g.refs[0], label: null })),
-    ...graph.strokes.map((s) => ({ id: s.id, ref: s.ref, label: null }))
+    ...graph.strokes.map((s) => ({ id: s.id, ref: s.ref, label: null })),
+    ...graph.images.map((img) => ({ id: img.id, ref: img.ref, label: null }))
   ]
-  history.set(ver, { nodes: items, fingerprints: fingerprints(elements) })
+  history.set(ver, { nodes: items, fingerprints: elementFingerprints(elements) })
   while (history.size > HISTORY_LIMIT) history.delete(history.keys().next().value as number)
 }
 
@@ -763,8 +838,8 @@ function describe(
   boardId = currentBoardId,
   viewer: string | null = null
 ) {
-  const scene = JSON.parse(sceneJson)
-  const graph = buildGraph((scene.elements ?? []) as SceneElement[])
+  const scene = JSON.parse(sceneJson) as { elements?: VersionedElement[]; files?: Record<string, SceneFile> }
+  const graph = buildGraph((scene.elements ?? []) as SceneElement[], scene.files ?? null)
   remember(boardId, ver, (scene.elements ?? []) as VersionedElement[], graph)
   let summary = summarize(graph, { board: boardId, version: ver, viewer })
   const wantImage = opts.image === 'always' || (opts.image === 'auto' && graph.needsImage)
@@ -806,12 +881,13 @@ const newElementId = (): string => `sl_${randomBytes(8).toString('hex')}`
 // 请求指定了 board 且不是当前画板时，先切换过去（要求已存在）
 async function ensureBoard(rawBoard: unknown): Promise<string> {
   if (typeof rawBoard !== 'string' || !rawBoard.trim()) return currentBoardId
-  const targetId = validateBoardId(rawBoard)
+  const parsed = validateBoardId(rawBoard)
+  const targetId = (await resolveExistingBoardId(parsed)) ?? parsed
   if (targetId === currentBoardId) return currentBoardId
   if (!win || win.isDestroyed()) bringToFront()
   await windowReady
   await switchBoard(targetId, { requireExisting: true, updateRenderer: true })
-  return targetId
+  return currentBoardId
 }
 
 const viewerOf = (body: Record<string, unknown>): string | null =>
@@ -849,10 +925,11 @@ async function drawOps(
   // 先拿页面上的最新状态，版本号以它为准（用户刚画的几笔可能还没落盘）
   const snap = await takeSnapshot(false)
   const ver = await acceptScene(snap.sceneJson, boardId)
-  const elements = (JSON.parse(snap.sceneJson).elements ?? []) as VersionedElement[]
+  const parsedSnap = JSON.parse(snap.sceneJson) as { elements?: VersionedElement[]; files?: Record<string, SceneFile> }
+  const elements = (parsedSnap.elements ?? []) as VersionedElement[]
   const actor = resolveActor(boardId, body, elements)
   const viewer = actor.agent
-  const graph = buildGraph(elements)
+  const graph = buildGraph(elements, parsedSnap.files ?? null)
   const current = () => describe(snap.sceneJson, ver, { format: 'summary', image: 'never' }, null, boardId, viewer)
   const fail = (status: 'invalid' | 'conflict', message: string) => ({ ok: false, boardId, result: { status, error: message, ...current() } })
 
@@ -893,7 +970,7 @@ async function drawOps(
       )
     }
     // 引用的节点只要还在就行；但要改动或删除的元素，从那个版本到现在不能被别人动过（design.md 12.3）
-    const now = fingerprints(elements)
+    const now = elementFingerprints(elements)
     const touched = plan.modifiedRefs.filter((ref) => record.fingerprints.get(ref) !== now.get(ref))
     if (touched.length) {
       const names = [
@@ -901,6 +978,8 @@ async function drawOps(
           touched.map((ref) => {
             const node = graph.nodes.find((n) => n.ref === ref)
             if (node) return `${node.id}${node.label ? ` ("${node.label}")` : ''}`
+            const edge = graph.edges.find((e) => e.ref === ref)
+            if (edge) return `arrow ${edge.from ?? '?'}→${edge.to ?? '?'}${edge.label ? ` ("${edge.label}")` : ''}`
             const note = graph.notes.find((n) => n.ref === ref)
             if (note) return `${note.id} ("${note.text}")`
             const sg = graph.strokeGroups.find((g) => g.refs.includes(ref))
@@ -944,12 +1023,13 @@ async function drawOps(
   const applied = await rpc<{ sceneJson: string }>(
     'applyPlan',
     { plan, proposalId, agent: actor.agent, seat: actor.seat, color: actor.color },
-    12_000
+    14_000
   )
   const newVer = await acceptScene(applied.sceneJson, boardId)
   const after = buildGraph((JSON.parse(applied.sceneJson).elements ?? []) as SceneElement[])
   const nodeIds: Record<string, string> = {}
   for (const n of plan.nodes) {
+    if (n.traced) continue // 照图还原出来的方框没有 agent 起的名字
     const node = after.nodes.find((x) => x.ref === n.elementId)
     if (node) nodeIds[n.key] = node.id
   }
@@ -959,7 +1039,7 @@ async function drawOps(
     sceneJson: applied.sceneJson,
     pending,
     result: {
-      added: { nodes: plan.nodes.length, edges: plan.edges.length, texts: plan.texts.length },
+      added: { nodes: plan.nodes.length, edges: plan.edges.length, texts: plan.texts.length, lines: plan.lines?.length ?? 0 },
       changed: {
         updated: plan.updates.filter((u) => !u.relayout).length + plan.textEdits.length,
         styled: plan.styles.length,
@@ -1052,31 +1132,33 @@ const routes = {
     })
   },
 
-  '/read': async (body: Record<string, unknown>) => {
+  '/read': (body: Record<string, unknown>) => {
     touchSeat(body)
-    const image = imageMode(body.image)
-    const viewer = actorOf(body)
-    if (!win) {
-      bringToFront()
-    }
-    const boardId =
-      typeof body.board === 'string' && body.board.trim()
-        ? await serialized(() => ensureBoard(body.board))
-        : currentBoardId
-    // 先不要图，算完语义发现需要时再要，省一次导出
-    let snap = await takeSnapshot(image === 'always')
-    const ver = await acceptScene(snap.sceneJson, boardId)
-    let res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId, viewer)
-    if (image === 'auto' && res.needs_image && !snap.pngBase64) {
-      snap = await takeSnapshot(true)
-      res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId, viewer)
-    }
-    const hub = getSession(boardId).hub
-    // 用户之前点过"发给 agent"但还没人来取的，这次读取就算取走了：把附言带上
-    const sent = hub.takeInbox(viewer).map((s) => ({ note: s.note, at: s.at }))
-    // 其他席位递过来的画笔一并交给这个席位
-    const handoffs = hub.takeHandoffs(viewer).map((h) => ({ from: h.from, to: h.to, note: h.note, at: h.at }))
-    return { ...res, sent, handoffs }
+    return serialized(async () => {
+      const image = imageMode(body.image)
+      const viewer = actorOf(body)
+      if (!win || win.isDestroyed()) {
+        bringToFront()
+      }
+      const boardId =
+        typeof body.board === 'string' && body.board.trim()
+          ? await ensureBoard(body.board)
+          : currentBoardId
+      // 先不要图，算完语义发现需要时再要，省一次导出；全程处于 serialized() 内避免并发切画板串写
+      let snap = await takeSnapshot(image === 'always')
+      const ver = await acceptScene(snap.sceneJson, boardId)
+      let res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId, viewer)
+      if (image === 'auto' && res.needs_image && !snap.pngBase64) {
+        snap = await takeSnapshot(true)
+        res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId, viewer)
+      }
+      const hub = getSession(boardId).hub
+      // 用户之前点过"发给 agent"但还没人来取的，这次读取就算取走了：把附言带上
+      const sent = hub.takeInbox(viewer).map((s) => ({ note: s.note, at: s.at }))
+      // 其他席位递过来的画笔一并交给这个席位
+      const handoffs = hub.takeHandoffs(viewer).map((h) => ({ from: h.from, to: h.to, note: h.note, at: h.at }))
+      return { ...res, sent, handoffs }
+    })
   },
 
   '/draw': (body: Record<string, unknown>) => {
@@ -1155,7 +1237,7 @@ const routes = {
     const boardId = requestId
       ? (requestBoard.get(requestId) ?? currentBoardId)
       : typeof body.board === 'string' && body.board.trim()
-        ? validateBoardId(body.board)
+        ? ((await resolveExistingBoardId(validateBoardId(body.board))) ?? validateBoardId(body.board))
         : currentBoardId
     const result: WaitResult = await getSession(boardId).hub.wait(requestId ? { requestId } : { inbox: true, agent: viewer }, seconds * 1000)
     touchSeat(body)
@@ -1195,17 +1277,20 @@ ipcMain.handle('board:load', async () => {
 ipcMain.handle('board:list', async () => ({ current: currentBoardId, boards: await listBoards() }))
 // 页面带上这份内容属于哪块画板：自动保存是延时触发的，可能在 agent 切换、重命名或删除画板之后才到，
 // 只按「当前画板」存的话，上一块画板的内容会盖到新切过去的画板上。
-ipcMain.handle('board:save', async (_e, json: unknown, board?: unknown) => {
-  if (typeof json !== 'string') throw new Error('board:save expects a JSON string')
-  const boardId = typeof board === 'string' && isValidBoardId(board) ? board : currentBoardId
-  const path = boardFilePath(BOARDS_DIR, boardId)
-  if (boardId !== currentBoardId && !existsSync(path)) {
-    // 那块画板已经被改名或删除：不存，让页面自己决定要不要按新名字重存
-    return { board: boardId, path, saveCount, version: 0, savedAt: new Date().toISOString(), skipped: true }
-  }
-  const ver = await acceptScene(json, boardId)
-  return { board: boardId, path, saveCount, version: ver, savedAt: new Date().toISOString(), skipped: false }
-})
+ipcMain.handle('board:save', (_e, json: unknown, board?: unknown) =>
+  serialized(async () => {
+    if (typeof json !== 'string') throw new Error('board:save expects a JSON string')
+    const rawBoard = typeof board === 'string' && isValidBoardId(board) ? board : currentBoardId
+    const boardId = (await resolveExistingBoardId(rawBoard)) ?? rawBoard
+    const path = boardFilePath(BOARDS_DIR, boardId)
+    if (boardId !== currentBoardId && !existsSync(path)) {
+      // 那块画板已经被改名或删除：不存，让页面自己决定要不要按新名字重存
+      return { board: boardId, path, saveCount, version: 0, savedAt: new Date().toISOString(), skipped: true }
+    }
+    const ver = await acceptScene(json, boardId)
+    return { board: boardId, path, saveCount, version: ver, savedAt: new Date().toISOString(), skipped: false }
+  })
+)
 ipcMain.handle('board:create', (_e, payload: { name: string; title?: string; currentSceneJson?: string }) =>
   serialized(() =>
     switchBoard(payload.name, {
@@ -1248,6 +1333,7 @@ ipcMain.handle('hub:state', () => buildHubState(currentBoardId))
 ipcMain.handle('dock:state', (): DockState => dock?.state() ?? { docked: false, side: null, title: null })
 ipcMain.on('dock:release', () => dock?.release())
 type SubmitPayload = {
+  board?: string
   requestId: string | null
   note: string
   sceneJson: string
@@ -1257,39 +1343,51 @@ type SubmitPayload = {
   to?: string | null // 主动发送时点选的目标席位
 }
 // 隔离的测试实例（TEST_INSTANCE）不碰系统剪贴板，免得跑测试时冲掉用户正在用的内容
-ipcMain.handle('hub:submit', async (_e, payload: SubmitPayload) => {
-  const boardId = currentBoardId
-  const hub = getSession(boardId).hub
-  const ver = await acceptScene(payload.sceneJson, boardId)
-  const decision = payload.decision === 'accepted' || payload.decision === 'rejected' ? payload.decision : null
-  // 回应提议时，比出用户在提议上改了什么。拒绝时提议已经被删掉，只看用户自己加了什么没有意义，不比。
-  const req = payload.requestId ? hub.get(payload.requestId) : undefined
-  let changes: string[] | null = null
-  if (decision === 'accepted' && req?.kind === 'proposal') {
-    const diff = req.baseline ? diffProposal(req.baseline as ProposalBaseline, (JSON.parse(payload.sceneJson).elements ?? []) as DiffElement[]) : []
-    const skipped = Array.isArray(payload.skipped) ? payload.skipped.filter((s): s is string => typeof s === 'string' && Boolean(s)) : []
-    changes = [...skipped, ...diff]
-  }
-  const sub: Submission = {
-    requestId: payload.requestId,
-    decision,
-    changes,
-    note: String(payload.note ?? '').trim(),
-    sceneJson: payload.sceneJson,
-    pngBase64: payload.pngBase64,
-    version: ver,
-    at: new Date().toISOString(),
-    to: !payload.requestId && typeof payload.to === 'string' && payload.to.trim() ? payload.to.trim() : null
-  }
-  const delivered = hub.submit(sub)
-  // 没有 agent 接到：把一句取画的话放进剪贴板，用户粘贴到那个 agent 的聊天里它就会来取
-  let hint: string | null = null
-  if (!delivered) {
-    hint = pickupHint({ board: boardId, title: getSession(boardId).title, version: ver, to: sub.to })
-    if (!TEST_INSTANCE) clipboard.writeText(hint)
-  }
-  return { version: ver, delivered, hint }
-})
+ipcMain.handle('hub:submit', (_e, payload: SubmitPayload) =>
+  serialized(async () => {
+    const requestedBoard =
+      payload.requestId && requestBoard.has(payload.requestId)
+        ? requestBoard.get(payload.requestId)!
+        : typeof payload.board === 'string' && isValidBoardId(payload.board)
+          ? ((await resolveExistingBoardId(payload.board)) ?? payload.board)
+          : currentBoardId
+    const targetPath = boardFilePath(BOARDS_DIR, requestedBoard)
+    if (requestedBoard !== currentBoardId && !existsSync(targetPath)) {
+      throw new Error('该画板已被删除或重命名，请重新确认后再发送')
+    }
+    const boardId = requestedBoard
+    const hub = getSession(boardId).hub
+    const ver = await acceptScene(payload.sceneJson, boardId)
+    const decision = payload.decision === 'accepted' || payload.decision === 'rejected' ? payload.decision : null
+    // 回应提议时，比出用户在提议上改了什么。拒绝时提议已经被删掉，只看用户自己加了什么没有意义，不比。
+    const req = payload.requestId ? hub.get(payload.requestId) : undefined
+    let changes: string[] | null = null
+    if (decision === 'accepted' && req?.kind === 'proposal') {
+      const diff = req.baseline ? diffProposal(req.baseline as ProposalBaseline, (JSON.parse(payload.sceneJson).elements ?? []) as DiffElement[]) : []
+      const skipped = Array.isArray(payload.skipped) ? payload.skipped.filter((s): s is string => typeof s === 'string' && Boolean(s)) : []
+      changes = [...skipped, ...diff]
+    }
+    const sub: Submission = {
+      requestId: payload.requestId,
+      decision,
+      changes,
+      note: String(payload.note ?? '').trim(),
+      sceneJson: payload.sceneJson,
+      pngBase64: payload.pngBase64,
+      version: ver,
+      at: new Date().toISOString(),
+      to: !payload.requestId && typeof payload.to === 'string' && payload.to.trim() ? payload.to.trim() : null
+    }
+    const delivered = hub.submit(sub)
+    // 没有 agent 接到：把一句取画的话放进剪贴板，用户粘贴到那个 agent 的聊天里它就会来取
+    let hint: string | null = null
+    if (!delivered) {
+      hint = pickupHint({ board: boardId, title: getSession(boardId).title, version: ver, to: sub.to })
+      if (!TEST_INSTANCE) clipboard.writeText(hint)
+    }
+    return { version: ver, delivered, hint }
+  })
+)
 // 收件箱里还有没被取走的画时，用户可以再要一次那句取画的话（比如剪贴板已经被别的内容盖掉了）
 ipcMain.handle('hub:hint', () => {
   const boardId = currentBoardId

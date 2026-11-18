@@ -24,8 +24,39 @@ export interface AgentTool {
   status: 'running' | 'completed' | 'failed'
   result?: string
 }
+export interface ImageSourceMeta {
+  naturalWidth: number
+  naturalHeight: number
+  url?: string
+  sourcePath?: string
+  viewport?: { w: number; h: number }
+  workItemId?: string
+  taskId?: string
+  runId?: string
+  round?: number
+  tool?: string
+  sourceImageRef?: string
+  changedFiles?: string[]
+  capturedAt?: string
+}
+export interface ImageRegionAnnotation {
+  imageId: string
+  imageRef: string
+  resultImageId?: string
+  pixelBbox: { x: number; y: number; w: number; h: number }
+  naturalSize: { w: number; h: number }
+  kind: 'loop' | 'box' | 'arrow' | 'stroke_group' | 'text'
+  annotatorId: string
+  note?: string | null
+  url?: string
+}
 export interface AgentApproval { requestId: string; name: string; description: string; answered: boolean }
-export interface AgentResultImage { id: string; mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'; name: string }
+export interface AgentResultImage {
+  id: string
+  mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+  name: string
+  meta?: ImageSourceMeta
+}
 export type RunStatus = 'running' | 'planned' | 'completed' | 'unverified' | 'cancelled' | 'failed' | 'interrupted'
 export interface AgentRun {
   id: string
@@ -46,6 +77,9 @@ export interface AgentRun {
   tools: AgentTool[]
   approvals: AgentApproval[]
   images?: AgentResultImage[]
+  annotations?: ImageRegionAnnotation[]
+  sourceImageRef?: string
+  changedFiles?: string[]
 }
 export interface AgentWorkItem {
   id: string
@@ -79,6 +113,8 @@ export interface AgentSubmission {
   capture: AgentCapture
   mode: 'direct' | 'plan'
   resume?: boolean
+  /** 任务记录里显示的目标；不给就显示 goal。固定指令（如转成可编辑图）用它显示一句短的。 */
+  display?: string
 }
 export interface AgentApi {
   state(): Promise<AgentState>
@@ -101,7 +137,7 @@ const TOOL_NAMES: Record<string, string> = {
   grep: '搜索内容', glob: '查找文件', pwsh: '运行命令', bash: '运行命令', shell: '运行命令',
   read_image: '查看图片', web_fetch: '获取网页', run_tests: '运行测试', related_tests: '查找相关测试',
   git: 'Git', diff: '查看改动', repo_map: '仓库概览', inspect_project: '检查项目', todo: '待办清单',
-  deliver_task: '交付结果', verify_artifact: '核对产物', render_page: '渲染页面',
+  deliver_task: '交付结果', verify_artifact: '核对产物', render_page: '渲染页面', browser_page: '打开网页',
   canvas_read: '读取画布', canvas_list: '列出画板', canvas_open: '打开画板', canvas_draw: '在画布上画',
   canvas_propose: '提议画布修改', canvas_request: '请你画', canvas_wait: '等待画布', canvas_pass: '递画笔',
   canvas_rename: '重命名画板', canvas_delete: '删除画板'
@@ -119,4 +155,52 @@ export function toolDisplayName(name: string, labels?: Record<string, string>): 
   if (label) return label
   const mcp = /^mcp_(.+)_(?:\d+|resources)$/.exec(name)
   return mcp ? `${mcp[1].replace(/_/g, '-')} 的外部工具` : name
+}
+
+const CANVAS_SELF_TOOLS = new Set([
+  'canvas_read',
+  'canvas_list',
+  'canvas_open',
+  'canvas_draw',
+  'canvas_propose',
+  'canvas_request',
+  'canvas_wait',
+  'canvas_pass',
+  'canvas_rename',
+  'canvas_delete'
+])
+
+/**
+ * 判断某张结果图片是否属于「页面/产物渲染图」（如 `render_page`、`browser_page` 等非画布自读工具产物）。
+ * `canvas_read` 等画布自身工具返回的是画布截图，严禁自动插回画布以免造成画中画死循环。
+ */
+export function shouldAutoPlaceResultImage(image: AgentResultImage, labels?: Record<string, string>): boolean {
+  if (!image?.id) return false
+  const rawTool = (image.meta?.tool ?? '').trim()
+  if (!rawTool) return false
+  const label = labels?.[rawTool] ?? ''
+  const remote = (label ? label.slice(label.lastIndexOf('/') + 1) : rawTool.slice(rawTool.lastIndexOf('/') + 1)).toLowerCase()
+  if (CANVAS_SELF_TOOLS.has(remote) || remote.startsWith('canvas_')) return false
+  if (/^mcp_flying[_-]draws(?:_|$)/i.test(rawTool) || /^flying[_-]draws\//i.test(rawTool) || /^flying[_-]draws\//i.test(label)) {
+    return false
+  }
+  const combined = `${rawTool} ${label} ${image.name ?? ''}`.toLowerCase()
+  if (/(?:^|[^a-z0-9])canvas_(?:read|list|open|draw|propose|request|wait|pass|rename|delete)(?:[^a-z0-9]|$)/.test(combined)) {
+    return false
+  }
+  return true
+}
+
+/**
+ * 「转成可编辑图」交给 Agent 的目标。图片用稳定 id 引用（不随画板版本错位），
+ * 坐标系就是随任务附上的那张图的像素尺寸。
+ */
+export function traceImageGoal(imageId: string, width: number, height: number): string {
+  return [
+    `把画布上选中的这张图片转成可编辑的画布元素。附图就是这张图的原图，像素 ${width}×${height}。`,
+    `调用一次 canvas_propose，ops 里放一条 trace_image：image 填 ${JSON.stringify(imageId)}，space 填 {"w": ${width}, "h": ${height}}，坐标全部按附图像素来。`,
+    '逐一写出图里的每个方框（位置、大小、形状、里面的文字、边框色、填充色、字号）、独立的文字，以及每条线和箭头（经过的点、箭头方向、是否虚线；连着方框的用 from/to 绑定到方框的 id）。',
+    '文字照原样抄写，不翻译不改写；颜色用十六进制。看不清的地方照大概画，不要编造内容。不要改动或删除原图。',
+    'question 写「这样转换对吗？可以直接在画布上调整」。提交后不用等待用户回答，简短说明转了哪些内容、哪里没把握，就结束。'
+  ].join('\n')
 }

@@ -21,3 +21,32 @@ test('托盘图标：圆角外透明，描边是墨色，纸面是应用主色',
   }
   assert.throws(() => trayIconPixels(4), /尺寸无效/)
 })
+
+test('后台提醒：只对新出现的审批提醒一次，托盘提示随状态变化', async () => {
+  const { freshApprovals, trayTooltip } = await import('../src/main/agentNotice.ts')
+  const approval = (requestId: string, answered = false) => ({ requestId, name: 'mcp_flying_draws_1', description: '', answered })
+  const state = (approvals: ReturnType<typeof approval>[], busy = true) => ({
+    connection: 'ready' as const, error: null, busy, setupNeeded: false, vision: true, provider: 'p', model: 'm', choices: [],
+    toolLabels: { mcp_flying_draws_1: 'flying_draws/canvas_draw' }, workspace: '', activeItemId: 'w',
+    items: [{ id: 'w', board: 'default', cwd: '.', sessionId: 's', title: '', runs: [{ id: 'r', mode: 'direct' as const, status: 'running' as const, goal: '', startedAt: '', reply: '', draft: '', tools: [], approvals }] }]
+  })
+  const seen = new Set<string>()
+  assert.deepEqual(freshApprovals(state([approval('a')]), seen), ['在画布上画'])
+  assert.deepEqual(freshApprovals(state([approval('a')]), seen), [], '同一项不重复提醒')
+  assert.equal(trayTooltip(state([approval('a')])), 'Flying draws · Fuxi 等你确认')
+  assert.deepEqual(freshApprovals(state([approval('a', true)]), seen), [])
+  assert.equal(seen.size, 0, '答复过的不再占着')
+  assert.equal(trayTooltip(state([])), 'Flying draws · Fuxi 正在工作')
+  assert.equal(trayTooltip(state([], false)), 'Flying draws')
+})
+
+test('托盘图标提醒版：右上角是红点，其余和普通图标一致', () => {
+  for (const size of [16, 32]) {
+    const plain = trayIconPixels(size)
+    const alert = trayIconPixels(size, true)
+    const dot = pixel(alert, size, Math.round(size * 0.76), Math.round(size * 0.24))
+    assert.deepEqual([dot.r, dot.g, dot.b, dot.a], [0xe0, 0x31, 0x31, 255], `${size}px 红点`)
+    const corner = Math.round(size * 0.2)
+    assert.deepEqual(pixel(alert, size, corner, size - corner - 1), pixel(plain, size, corner, size - corner - 1), `${size}px 左下不受影响`)
+  }
+})

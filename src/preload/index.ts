@@ -46,6 +46,7 @@ contextBridge.exposeInMainWorld('flyingdraws', {
     return () => ipcRenderer.removeListener('hub:state', listener)
   },
   submit: (payload: {
+    board?: string
     requestId: string | null
     note: string
     sceneJson: string

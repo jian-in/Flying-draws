@@ -1,11 +1,27 @@
 // 语义层 v1：把 Excalidraw 场景翻译成 agent 好读的结构和文字描述。
 // 纯函数，不依赖 Electron，可以直接用 node --test 测试。
+import { parseImageHeaderSize } from './imageSize.ts'
+import type { ImageSourceMeta } from '../shared/agent.ts'
 
 export interface Bbox {
   x: number
   y: number
   w: number
   h: number
+}
+
+export interface SceneFile {
+  mimeType?: string
+  dataURL?: string
+}
+
+export interface ImageCrop {
+  x: number
+  y: number
+  width: number
+  height: number
+  naturalWidth?: number
+  naturalHeight?: number
 }
 
 // 只列出语义层用到的字段，Excalidraw 元素的其他字段原样忽略
@@ -19,6 +35,9 @@ export interface SceneElement {
   angle?: number
   isDeleted?: boolean
   text?: string
+  fileId?: string | null
+  scale?: readonly [number, number]
+  crop?: ImageCrop | null
   containerId?: string | null
   startBinding?: { elementId: string } | null
   endBinding?: { elementId: string } | null
@@ -28,7 +47,18 @@ export interface SceneElement {
   groupIds?: readonly string[]
   frameId?: string | null
   name?: string | null
-  customData?: { flyingdraws?: { author?: string; layer?: string; agent?: string; seat?: boolean; color?: string; role?: string } } | null
+  customData?: {
+    flyingdraws?: {
+      author?: string
+      layer?: string
+      agent?: string
+      seat?: boolean
+      color?: string
+      role?: string
+      result?: string
+      imageMeta?: ImageSourceMeta
+    }
+  } | null
 }
 
 export type Author = 'user' | 'agent'
@@ -94,8 +124,9 @@ export interface SemanticStroke {
   ref: string
   shape: 'loop' | 'straight' | 'curve'
   bbox: Bbox
-  encloses: string[] // 被圈住的节点短编号或旁注文字
+  encloses: string[] // 被圈住的节点、文字、手绘分组或图片短编号
   near: { id: string; position: string } | null
+  imageRegion?: { imageId: string; canvasBbox: Bbox; pixelBbox?: Bbox } | null
 }
 
 // 挨得近的几笔手绘合成一组（手写字、多笔涂鸦）。语义层不猜内容，只说在哪、有几笔，内容交给截图。
@@ -108,6 +139,29 @@ export interface SemanticStrokeGroup {
   region: string | null // 没有节点可参照时，在整张画里的大致方位，如"右上角"
 }
 
+export interface SemanticImageAnnotation {
+  kind: 'loop' | 'box' | 'arrow' | 'stroke_group' | 'text'
+  by: string // S1 / N1 / T1 / 连线 ref
+  canvasBbox: Bbox
+  pixelBbox?: Bbox
+  pixelPoint?: { x: number; y: number }
+  note?: string | null
+}
+
+// 图片按出现顺序编号 I1、I2……，agent 用它把图里的内容转成可编辑元素（trace_image）或读取圈选的原图像素坐标
+export interface SemanticImage {
+  id: string
+  ref: string
+  bbox: Bbox
+  naturalSize?: { w: number; h: number } | null
+  meta?: ImageSourceMeta | null
+  resultImageId?: string | null
+  author: Author
+  agent: string | null
+  proposed: boolean
+  annotations: SemanticImageAnnotation[]
+}
+
 export interface SemanticGraph {
   nodes: SemanticNode[]
   edges: SemanticEdge[]
@@ -115,7 +169,7 @@ export interface SemanticGraph {
   strokes: SemanticStroke[] // 只含没被分组的单笔
   strokeGroups: SemanticStrokeGroup[]
   containment: { parent: string; child: string }[]
-  images: { ref: string; bbox: Bbox }[]
+  images: SemanticImage[]
   lines: { ref: string; bbox: Bbox }[]
   needsImage: boolean // 有语义层看不懂的内容，建议 agent 看图
 }
@@ -145,10 +199,79 @@ const GROUP_GAP_MAX = 150
 const GROUP_SAMPLE_POINTS = 24 // 算两笔之间的距离时，每笔最多取这么多个点
 
 export function bboxOf(el: SceneElement): Bbox {
-  // 线条和箭头的宽高可能是负的，统一成左上角加正宽高
+  // Excalidraw 的 freedraw / line / arrow 以起点为 (x, y)，往左或往上画时 points 含负坐标，而 width/height 仍为正数
+  if (Array.isArray(el.points) && el.points.length >= 2) {
+    let minX = Infinity
+    let maxX = -Infinity
+    let minY = Infinity
+    let maxY = -Infinity
+    for (const [px, py] of el.points) {
+      if (px < minX) minX = px
+      if (px > maxX) maxX = px
+      if (py < minY) minY = py
+      if (py > maxY) maxY = py
+    }
+    return { x: el.x + minX, y: el.y + minY, w: maxX - minX, h: maxY - minY }
+  }
   const x = el.width < 0 ? el.x + el.width : el.x
   const y = el.height < 0 ? el.y + el.height : el.y
   return { x, y, w: Math.abs(el.width), h: Math.abs(el.height) }
+}
+
+/**
+ * 把画布上的矩形区域换算成图片原始像素坐标系下的区域（兼容缩放、裁剪 crop 与翻转 scale）。
+ * 若目标区域与图片不相交，返回 null。
+ */
+export function canvasRectToImagePixels(
+  target: Bbox,
+  imgBbox: Bbox,
+  src: Bbox,
+  scale?: readonly [number, number]
+): Bbox | null {
+  if (imgBbox.w <= 0 || imgBbox.h <= 0 || src.w <= 0 || src.h <= 0) return null
+  const ix0 = Math.max(target.x, imgBbox.x)
+  const iy0 = Math.max(target.y, imgBbox.y)
+  const ix1 = Math.min(target.x + target.w, imgBbox.x + imgBbox.w)
+  const iy1 = Math.min(target.y + target.h, imgBbox.y + imgBbox.h)
+  if (ix1 <= ix0 || iy1 <= iy0) return null
+  let u0 = (ix0 - imgBbox.x) / imgBbox.w
+  let u1 = (ix1 - imgBbox.x) / imgBbox.w
+  let v0 = (iy0 - imgBbox.y) / imgBbox.h
+  let v1 = (iy1 - imgBbox.y) / imgBbox.h
+  if (scale && scale[0] < 0) [u0, u1] = [1 - u1, 1 - u0]
+  if (scale && scale[1] < 0) [v0, v1] = [1 - v1, 1 - v0]
+  const x0 = Math.round(src.x + u0 * src.w)
+  const y0 = Math.round(src.y + v0 * src.h)
+  const x1 = Math.round(src.x + u1 * src.w)
+  const y1 = Math.round(src.y + v1 * src.h)
+  return { x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) }
+}
+
+export function canvasPointToImagePixels(
+  px: number,
+  py: number,
+  imgBbox: Bbox,
+  src: Bbox,
+  scale?: readonly [number, number]
+): { x: number; y: number } | null {
+  if (imgBbox.w <= 0 || imgBbox.h <= 0 || src.w <= 0 || src.h <= 0) return null
+  if (px < imgBbox.x || px > imgBbox.x + imgBbox.w || py < imgBbox.y || py > imgBbox.y + imgBbox.h) return null
+  let u = (px - imgBbox.x) / imgBbox.w
+  let v = (py - imgBbox.y) / imgBbox.h
+  if (scale && scale[0] < 0) u = 1 - u
+  if (scale && scale[1] < 0) v = 1 - v
+  return {
+    x: Math.min(src.x + src.w, Math.max(src.x, Math.round(src.x + u * src.w))),
+    y: Math.min(src.y + src.h, Math.max(src.y, Math.round(src.y + v * src.h)))
+  }
+}
+
+function intersectBbox(a: Bbox, b: Bbox): Bbox | null {
+  const x0 = Math.max(a.x, b.x)
+  const y0 = Math.max(a.y, b.y)
+  const x1 = Math.min(a.x + a.w, b.x + b.w)
+  const y1 = Math.min(a.y + a.h, b.y + b.h)
+  return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null
 }
 
 function center(b: Bbox): [number, number] {
@@ -306,7 +429,32 @@ function bboxToPolyline(b: Bbox, samples: [number, number][]): { d: number; at: 
   return { d, at }
 }
 
-export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph {
+function resolveImageMeta(
+  el: SceneElement,
+  files?: Readonly<Record<string, SceneFile>> | null
+): { naturalSize: { w: number; h: number } | null; meta: ImageSourceMeta | null; src: Bbox | null } {
+  const meta = el.customData?.flyingdraws?.imageMeta ?? null
+  let naturalSize: { w: number; h: number } | null = null
+  if (meta && meta.naturalWidth > 0 && meta.naturalHeight > 0) {
+    naturalSize = { w: Math.round(meta.naturalWidth), h: Math.round(meta.naturalHeight) }
+  } else if (el.crop && el.crop.naturalWidth && el.crop.naturalHeight && el.crop.naturalWidth > 0 && el.crop.naturalHeight > 0) {
+    naturalSize = { w: Math.round(el.crop.naturalWidth), h: Math.round(el.crop.naturalHeight) }
+  } else if (el.fileId && files?.[el.fileId]?.dataURL) {
+    naturalSize = parseImageHeaderSize(files[el.fileId]!.dataURL!)
+  }
+  const src: Bbox | null =
+    el.crop && el.crop.width > 0 && el.crop.height > 0
+      ? { x: el.crop.x, y: el.crop.y, w: el.crop.width, h: el.crop.height }
+      : naturalSize
+        ? { x: 0, y: 0, w: naturalSize.w, h: naturalSize.h }
+        : null
+  return { naturalSize, meta, src }
+}
+
+export function buildGraph(
+  rawElements: readonly SceneElement[],
+  files?: Readonly<Record<string, SceneFile>> | null
+): SemanticGraph {
   const elements = rawElements.filter((el) => !el.isDeleted && !isMarker(el))
   const byId = new Map(elements.map((el) => [el.id, el]))
 
@@ -425,6 +573,26 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     })
   }
 
+  const imageInfos = elements
+    .filter((el) => el.type === 'image')
+    .map((el, i) => {
+      const bbox = bboxOf(el)
+      const { naturalSize, meta, src } = resolveImageMeta(el, files)
+      const image: SemanticImage = {
+        id: `I${i + 1}`,
+        ref: el.id,
+        bbox,
+        naturalSize,
+        meta,
+        resultImageId: el.customData?.flyingdraws?.result ?? null,
+        ...provenance(el),
+        annotations: []
+      }
+      return { el, image, src }
+    })
+  const images = imageInfos.map((x) => x.image)
+  const lines = elements.filter((el) => el.type === 'line').map((el) => ({ ref: el.id, bbox: bboxOf(el) }))
+
   // 手绘笔画
   const nearestTo = (b: Bbox, skip: string[] = []): { id: string; position: string } | null => {
     let near: { id: string; position: string } | null = null
@@ -447,21 +615,43 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
       const b = bboxOf(el)
       const diag = Math.hypot(b.w, b.h)
       const shape = classifyStroke(el)
-      const encloses: string[] = []
-      if (shape === 'loop') {
-        for (const n of nodes) if (contains(b, n.bbox, 8)) encloses.push(n.id)
-        for (const note of notes) if (contains(b, note.bbox, 8)) encloses.push(`"${note.text}"`)
-      }
-      return { el, b, diag, shape, encloses, samples: strokeSamples(el) }
+      return { el, b, diag, shape, samples: strokeSamples(el) }
     })
 
-  // 挨得近的笔画并成一组（并查集）。圈住了节点或文字的圈是标注，不参与分组。
+  // 预判「标注圈」：圈住了节点、独立文字、整张图片，或圈住了更小的手绘笔画（如圈住一组手写字）。
+  // 标注圈不参与手写分组，避免被并进里面的手写字变成一团涂鸦。
+  const isAnnotationLoop = raw.map((s, idx) => {
+    if (s.shape !== 'loop' || s.diag < 24) return false
+    if (nodes.some((n) => contains(s.b, n.bbox, 8))) return true
+    if (notes.some((n) => contains(s.b, n.bbox, 8))) return true
+    if (images.some((img) => contains(s.b, img.bbox, 8))) return true
+    if (
+      raw.some(
+        (other, j) =>
+          j !== idx &&
+          other.diag >= MIN_STROKE_SIZE &&
+          other.diag < s.diag * 0.85 &&
+          contains(s.b, other.b, 8)
+      )
+    ) {
+      return true
+    }
+    return false
+  })
+
+  // 挨得近的笔画并成一组（并查集）。标注圈不参与分组；大圈也不并进旁边尺寸悬殊的小笔画。
   const parent = raw.map((_, i) => i)
   const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])))
   for (let i = 0; i < raw.length; i++) {
-    if (raw[i].encloses.length) continue
+    if (isAnnotationLoop[i]) continue
     for (let j = i + 1; j < raw.length; j++) {
-      if (raw[j].encloses.length) continue
+      if (isAnnotationLoop[j]) continue
+      if (
+        (raw[i].shape === 'loop' && raw[i].diag >= 60 && raw[i].diag > raw[j].diag * 2.5) ||
+        (raw[j].shape === 'loop' && raw[j].diag >= 60 && raw[j].diag > raw[i].diag * 2.5)
+      ) {
+        continue
+      }
       const gap = Math.min(GROUP_GAP_MAX, Math.max(GROUP_GAP_MIN, Math.min(raw[i].diag, raw[j].diag)))
       if (bboxDistance(raw[i].b, raw[j].b) > gap) continue
       if (minPointDistance(raw[i].samples, raw[j].samples) <= gap) parent[find(i)] = find(j)
@@ -474,14 +664,14 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     clusters.get(root)!.push(s)
   })
 
-  const strokes: Omit<SemanticStroke, 'id'>[] = []
+  const strokeDrafts: { ref: string; shape: SemanticStroke['shape']; bbox: Bbox }[] = []
   const groupDrafts: { refs: string[]; bbox: Bbox }[] = []
   for (const members of clusters.values()) {
     // 整簇都是误点大小的，忽略
     if (members.every((s) => s.diag < MIN_STROKE_SIZE)) continue
     if (members.length === 1) {
       const s = members[0]
-      strokes.push({ ref: s.el.id, shape: s.shape, bbox: s.b, encloses: s.encloses, near: nearestTo(s.b, s.encloses) })
+      strokeDrafts.push({ ref: s.el.id, shape: s.shape, bbox: s.b })
     } else {
       groupDrafts.push({ refs: members.map((s) => s.el.id), bbox: unionBbox(members.map((s) => s.b)) })
     }
@@ -506,14 +696,11 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     if (parent) containment.push({ parent: parent.id, child: child.id })
   }
 
-  const images = elements.filter((el) => el.type === 'image').map((el) => ({ ref: el.id, bbox: bboxOf(el) }))
-  const lines = elements.filter((el) => el.type === 'line').map((el) => ({ ref: el.id, bbox: bboxOf(el) }))
-
   // 手绘分组的方位：有节点就说在哪个节点旁边，没有节点就说在整张画的哪个位置
   const allBoxes = [
     ...nodes.map((n) => n.bbox),
     ...notes.map((n) => n.bbox),
-    ...strokes.map((s) => s.bbox),
+    ...strokeDrafts.map((s) => s.bbox),
     ...groupDrafts.map((g) => g.bbox),
     ...images.map((i) => i.bbox),
     ...lines.map((l) => l.bbox)
@@ -531,15 +718,143 @@ export function buildGraph(rawElements: readonly SceneElement[]): SemanticGraph 
     }
   })
 
+  // 单笔接着分组往下编号；现在分组和图片都已定好，计算圈住了谁（含节点、文字、手写组、单笔、图片）
+  const numbered: SemanticStroke[] = strokeDrafts.map((s, i) => ({
+    id: `S${strokeGroups.length + i + 1}`,
+    ref: s.ref,
+    shape: s.shape,
+    bbox: s.bbox,
+    encloses: [],
+    near: null
+  }))
+
+  const nearestFreeNote = (target: Bbox, maxDist = 140): SemanticNote | null => {
+    let best: SemanticNote | null = null
+    let bestD = maxDist
+    for (const note of notes) {
+      if (note.author !== 'user') continue
+      const d = bboxDistance(target, note.bbox)
+      if (d < bestD) {
+        bestD = d
+        best = note
+      }
+    }
+    return best
+  }
+
+  for (const s of numbered) {
+    if (s.shape === 'loop') {
+      for (const n of nodes) if (contains(s.bbox, n.bbox, 8)) s.encloses.push(n.id)
+      for (const note of notes) if (contains(s.bbox, note.bbox, 8)) s.encloses.push(note.id)
+      for (const g of strokeGroups) if (contains(s.bbox, g.bbox, 8)) s.encloses.push(g.id)
+      for (const other of numbered) {
+        if (other !== s && other.shape !== 'loop' && contains(s.bbox, other.bbox, 8)) s.encloses.push(other.id)
+      }
+      for (const { el: imgEl, image: img, src } of imageInfos) {
+        if (contains(s.bbox, img.bbox, 8)) {
+          s.encloses.push(img.id)
+          continue
+        }
+        const inter = intersectBbox(s.bbox, img.bbox)
+        if (!inter) continue
+        const sArea = Math.max(1, s.bbox.w * s.bbox.h)
+        const imgArea = Math.max(1, img.bbox.w * img.bbox.h)
+        const interArea = inter.w * inter.h
+        if (interArea >= 0.2 * Math.min(sArea, imgArea) && sArea < imgArea * 1.15) {
+          const pixelBbox = src ? (canvasRectToImagePixels(s.bbox, img.bbox, src, imgEl.scale) ?? undefined) : undefined
+          s.imageRegion = { imageId: img.id, canvasBbox: inter, pixelBbox }
+          const nearNote = nearestFreeNote(s.bbox)
+          img.annotations.push({
+            kind: 'loop',
+            by: s.id,
+            canvasBbox: inter,
+            pixelBbox,
+            note: nearNote ? nearNote.text : null
+          })
+        }
+      }
+    }
+    s.near = nearestTo(s.bbox, s.encloses)
+  }
+
+  // 识别落在图片内部的其他用户批注（矩形/椭圆框选、箭头指向、图上文字、图上手写组）并换算原图像素坐标
+  for (const { el: imgEl, image: img, src } of imageInfos) {
+    const imgArea = Math.max(1, img.bbox.w * img.bbox.h)
+    for (const n of nodes) {
+      if (n.author !== 'user' || !['rectangle', 'ellipse', 'diamond'].includes(n.kind)) continue
+      const inter = intersectBbox(n.bbox, img.bbox)
+      if (!inter) continue
+      const nArea = Math.max(1, n.bbox.w * n.bbox.h)
+      if (nArea < imgArea * 0.95 && inter.w * inter.h >= 0.5 * nArea) {
+        const pixelBbox = src ? (canvasRectToImagePixels(n.bbox, img.bbox, src, imgEl.scale) ?? undefined) : undefined
+        const nearNote = !n.label ? nearestFreeNote(n.bbox) : null
+        img.annotations.push({
+          kind: 'box',
+          by: n.id,
+          canvasBbox: inter,
+          pixelBbox,
+          note: n.label ?? (nearNote ? nearNote.text : null)
+        })
+      }
+    }
+    for (const e of edges) {
+      if (e.author !== 'user') continue
+      const arrowEl = byId.get(e.ref)
+      if (!arrowEl) continue
+      const pts = absPoints(arrowEl)
+      if (!pts.length) continue
+      const startHead = Boolean(arrowEl.startArrowhead)
+      const endHead = Boolean(arrowEl.endArrowhead)
+      const tip = startHead && !endHead ? pts[0] : pts[pts.length - 1]
+      const tail = startHead && !endHead ? pts[pts.length - 1] : pts[0]
+      if (tip[0] >= img.bbox.x && tip[0] <= img.bbox.x + img.bbox.w && tip[1] >= img.bbox.y && tip[1] <= img.bbox.y + img.bbox.h) {
+        const pixelPoint = src ? (canvasPointToImagePixels(tip[0], tip[1], img.bbox, src, imgEl.scale) ?? undefined) : undefined
+        const tailNote = !e.label ? nearestFreeNote({ x: tail[0] - 4, y: tail[1] - 4, w: 8, h: 8 }, 80) : null
+        img.annotations.push({
+          kind: 'arrow',
+          by: e.ref,
+          canvasBbox: { x: tip[0], y: tip[1], w: 1, h: 1 },
+          pixelPoint,
+          note: e.label ?? (tailNote ? tailNote.text : null)
+        })
+      }
+    }
+    for (const note of notes) {
+      if (note.author !== 'user') continue
+      if (contains(img.bbox, note.bbox, 8)) {
+        const alreadyAttached = img.annotations.some((a) => a.note === note.text)
+        if (!alreadyAttached) {
+          const pixelBbox = src ? (canvasRectToImagePixels(note.bbox, img.bbox, src, imgEl.scale) ?? undefined) : undefined
+          img.annotations.push({
+            kind: 'text',
+            by: note.id,
+            canvasBbox: note.bbox,
+            pixelBbox,
+            note: note.text
+          })
+        }
+      }
+    }
+    for (const g of strokeGroups) {
+      if (contains(img.bbox, g.bbox, 8)) {
+        const pixelBbox = src ? (canvasRectToImagePixels(g.bbox, img.bbox, src, imgEl.scale) ?? undefined) : undefined
+        img.annotations.push({
+          kind: 'stroke_group',
+          by: g.id,
+          canvasBbox: g.bbox,
+          pixelBbox
+        })
+      }
+    }
+  }
+
   const needsImage =
     images.length > 0 ||
     lines.length > 0 ||
     strokeGroups.length > 0 ||
-    strokes.length > MAX_LISTED_STROKES ||
-    strokes.some((s) => s.shape === 'curve')
+    numbered.length > MAX_LISTED_STROKES ||
+    numbered.some((s) => s.shape === 'curve')
 
-  // 单笔接着分组往下编号
-  const numbered: SemanticStroke[] = strokes.map((s, i) => ({ id: `S${strokeGroups.length + i + 1}`, ...s }))
   return { nodes, edges, notes, strokes: numbered, strokeGroups, containment, images, lines, needsImage }
 }
 
@@ -609,6 +924,23 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
     }
   }
 
+  const notesById = new Map(graph.notes.map((n) => [n.id, n]))
+  const groupsById = new Map(graph.strokeGroups.map((g) => [g.id, g]))
+  const strokesById = new Map(graph.strokes.map((s) => [s.id, s]))
+  const imagesById = new Map(graph.images.map((i) => [i.id, i]))
+  const enclosedLabel = (id: string): string => {
+    if (nodes.has(id)) return nodeName(nodes, id)
+    const note = notesById.get(id)
+    if (note) return `${note.id}「${note.text}」`
+    const group = groupsById.get(id)
+    if (group) return `${group.id}（一组手写，${group.count} 笔）`
+    const stroke = strokesById.get(id)
+    if (stroke) return `${stroke.id}（一笔手绘）`
+    const img = imagesById.get(id)
+    if (img) return `${img.id}（图片）`
+    return id
+  }
+
   if (strokeTotal) {
     out.push('手绘：')
     for (const g of graph.strokeGroups) {
@@ -618,7 +950,15 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
     const shapeName = { loop: '一个圈', straight: '一条直线', curve: '一条曲线或涂鸦' }
     for (const s of graph.strokes.slice(0, MAX_LISTED_STROKES)) {
       const parts = [`${s.id} ${shapeName[s.shape]}`]
-      if (s.encloses.length) parts.push(`圈住了 ${s.encloses.map((id) => (nodes.has(id) ? nodeName(nodes, id) : id)).join('、')}`)
+      if (s.encloses.length) parts.push(`圈住了 ${s.encloses.map(enclosedLabel).join('、')}`)
+      if (s.imageRegion) {
+        const r = s.imageRegion
+        if (r.pixelBbox) {
+          parts.push(`圈选了图片 ${r.imageId} 的原图像素区域 (${r.pixelBbox.x}, ${r.pixelBbox.y}, ${r.pixelBbox.w}×${r.pixelBbox.h})`)
+        } else {
+          parts.push(`圈选了图片 ${r.imageId} 的局部区域`)
+        }
+      }
       if (s.near) parts.push(`在 ${nodeName(nodes, s.near.id)} ${s.near.position}`)
       out.push(`  ${parts.join('，')}`)
     }
@@ -626,7 +966,43 @@ export function summarize(graph: SemanticGraph, meta: { board: string; version: 
     if (rest > 0) out.push(`  ……另有 ${rest} 笔，请看附图`)
   }
 
-  if (graph.images.length) out.push(`图片：${graph.images.length} 张（内容请看附图）`)
+  if (graph.images.length) {
+    out.push(`图片：${graph.images.length} 张（内容请看附图；可用 trace_image 把图里的内容转成可编辑元素）`)
+    for (const img of graph.images) {
+      const metaBits: string[] = []
+      if (img.naturalSize) metaBits.push(`原图 ${img.naturalSize.w}×${img.naturalSize.h} px`)
+      if (img.meta?.url) metaBits.push(`来源 ${img.meta.url}`)
+      else if (img.meta?.sourcePath) metaBits.push(`来源 ${img.meta.sourcePath}`)
+      if (img.meta?.viewport) metaBits.push(`视口 ${img.meta.viewport.w}×${img.meta.viewport.h}`)
+      if (img.meta?.round) metaBits.push(`第 ${img.meta.round} 轮结果`)
+      const extra = metaBits.length ? `，${metaBits.join('，')}` : ''
+      out.push(
+        `  ${img.id} 左上角 (${Math.round(img.bbox.x)}, ${Math.round(img.bbox.y)})，画布上 ${Math.round(img.bbox.w)}×${Math.round(img.bbox.h)}${extra}${byAgent(img)}`
+      )
+      for (const ann of img.annotations) {
+        const notePart = ann.note ? `，批注「${ann.note}」` : ''
+        if (ann.kind === 'arrow') {
+          const where = ann.pixelPoint
+            ? `原图像素点 (${ann.pixelPoint.x}, ${ann.pixelPoint.y})`
+            : `画布点 (${Math.round(ann.canvasBbox.x)}, ${Math.round(ann.canvasBbox.y)})`
+          out.push(`    标注：箭头指向 ${where}${notePart}`)
+        } else {
+          const kindLabel =
+            ann.kind === 'loop'
+              ? `${ann.by}（手绘圈）圈选`
+              : ann.kind === 'box'
+                ? `${ann.by}（框选）框住`
+                : ann.kind === 'stroke_group'
+                  ? `${ann.by}（手写批注）落在`
+                  : `${ann.by}（文字批注）落在`
+          const where = ann.pixelBbox
+            ? `原图像素区域 x=${ann.pixelBbox.x}, y=${ann.pixelBbox.y}, w=${ann.pixelBbox.w}, h=${ann.pixelBbox.h}`
+            : `画布区域 (${Math.round(ann.canvasBbox.x)}, ${Math.round(ann.canvasBbox.y)}, ${Math.round(ann.canvasBbox.w)}×${Math.round(ann.canvasBbox.h)})`
+          out.push(`    标注：${kindLabel}${where}${notePart}`)
+        }
+      }
+    }
+  }
   if (graph.lines.length) out.push(`线条：${graph.lines.length} 条没有箭头的折线（形状请看附图）`)
   return out.join('\n')
 }

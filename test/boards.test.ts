@@ -5,10 +5,12 @@ import {
   boardFilePath,
   emptyBoardScene,
   isValidBoardId,
+  matchExistingBoardId,
   normalizeBoardId,
   normalizeBoardTitle,
   parseBoardMeta,
   pickFallbackBoard,
+  sameBoardOnDisk,
   suggestBoardId,
   updateBoardSceneTitle,
   validateBoardId
@@ -106,4 +108,15 @@ test('pickFallbackBoard 优先回退到 default，否则选第一块剩余画板
   assert.equal(pickFallbackBoard([{ board: 'a' }, { board: 'default' }]), 'default')
   assert.equal(pickFallbackBoard([{ board: 'a' }, { board: 'b' }]), 'a')
   assert.equal(pickFallbackBoard([]), null)
+})
+
+test('拒绝 Windows 保留设备名，并在大小写不敏感磁盘上对齐已有画板名', () => {
+  for (const reserved of ['con', 'CON', 'prn', 'aux', 'nul', 'com1', 'LPT9']) {
+    assert.equal(isValidBoardId(reserved), false)
+    assert.throws(() => validateBoardId(reserved))
+  }
+  if (process.platform === 'win32' || process.platform === 'darwin') {
+    assert.equal(sameBoardOnDisk('Default', 'default'), true)
+    assert.equal(matchExistingBoardId('Default', ['default', 'login']), 'default')
+  }
 })

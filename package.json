@@ -1,13 +1,35 @@
 {
   "name": "flying-draws",
-  "version": "0.0.1",
-  "private": true,
-  "description": "A local canvas that lets any agent read what you draw",
+  "version": "0.1.0",
+  "description": "Spatial memory, visual diff & live proposal pad for coding agents",
   "license": "MIT",
   "main": "./out/main/index.js",
   "bin": {
+    "flying-draws": "out/bridge/index.js",
     "flying-draws-mcp": "out/bridge/index.js"
   },
+  "files": [
+    "out/bridge/",
+    "out/main/",
+    "out/preload/",
+    "out/renderer/",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "keywords": [
+    "mcp",
+    "excalidraw",
+    "canvas",
+    "coding-agent",
+    "claude-code",
+    "codex",
+    "cursor",
+    "visual-diff"
+  ],
   "scripts": {
     "postinstall": "node node_modules/electron/install.js && node scripts/copy-fonts.mjs",
     "dev": "electron-vite dev",
@@ -15,6 +37,7 @@
     "build:bridge": "tsc -p tsconfig.bridge.json",
     "build:fuxi": "node scripts/build-fuxi.mjs",
     "package:desktop": "node scripts/package-desktop.mjs",
+    "package:canvas": "node scripts/package-desktop.mjs --without-fuxi",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --test \"test/*.test.ts\"",

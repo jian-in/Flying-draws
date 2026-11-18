@@ -85,7 +85,11 @@ export class AgentClient extends EventEmitter {
   }
   private receive(frame: Record<string, unknown>): void {
     if (frame.type === 'fatal') {
-      if (this.child) this.fail(new Error(typeof frame.message === 'string' ? frame.message : '内核启动失败'), this.child)
+      const child = this.child
+      if (child) {
+        this.fail(new Error(typeof frame.message === 'string' ? frame.message : '内核启动失败'), child)
+        child.kill()
+      }
       return
     }
     if (frame.type === 'event') {

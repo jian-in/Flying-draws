@@ -49,20 +49,31 @@ export function StrokeWidthSlider({ api }: { api: Api }) {
     }
     sync()
     const observer = new MutationObserver(sync)
-    observer.observe(document.body, { childList: true, subtree: true })
+    observer.observe(document.querySelector('.fd-canvas') ?? document.body, { childList: true, subtree: true })
     return () => observer.disconnect()
   }, [])
 
   // 画布上的选中或默认宽度变了，滑杆跟着走；用户正拖着滑杆时不跟，免得和手上的动作打架
-  useEffect(
-    () =>
-      api.onChange(() => {
-        if (dragging.current) return
-        const next = strokeWidthToSlider(currentWidth(api))
-        setValue((prev) => (prev === next ? prev : next))
-      }),
-    [api]
-  )
+  useEffect(() => {
+    let prevElements: unknown = null
+    let prevSelected: unknown = null
+    let prevDefaultWidth: number | null = null
+    return api.onChange((elements, appState) => {
+      if (dragging.current) return
+      if (
+        elements === prevElements &&
+        appState.selectedElementIds === prevSelected &&
+        appState.currentItemStrokeWidth === prevDefaultWidth
+      ) {
+        return
+      }
+      prevElements = elements
+      prevSelected = appState.selectedElementIds
+      prevDefaultWidth = appState.currentItemStrokeWidth
+      const next = strokeWidthToSlider(currentWidth(api))
+      setValue((prev) => (prev === next ? prev : next))
+    })
+  }, [api])
 
   // 数字跟着滑块走，滑块左边那段轨道着色（和 Excalidraw 自己的透明度滑杆一个样子）
   useEffect(() => {

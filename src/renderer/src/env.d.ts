@@ -73,6 +73,7 @@ declare global {
       getHubState: () => Promise<HubState>
       onHubState: (fn: (state: HubState) => void) => () => void
       submit: (payload: {
+        board?: string
         requestId: string | null
         note: string
         sceneJson: string

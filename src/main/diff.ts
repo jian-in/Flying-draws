@@ -19,7 +19,7 @@ export interface DiffElement {
 
 interface BaselineItem {
   id: string
-  kind: 'node' | 'edge' | 'text'
+  kind: 'node' | 'edge' | 'line' | 'text'
   label: string | null // 节点里或连线上的文字；独立文字就是它自己的内容
   x: number
   y: number
@@ -66,7 +66,8 @@ export function captureBaseline(elements: readonly DiffElement[], proposalId: st
     if (el.customData?.flyingdraws?.proposal !== proposalId) continue
     if (el.customData?.flyingdraws?.role === 'marker') continue // 标记框是改动预览，不算提议里的新元素
     if (el.type === 'text' && el.containerId) continue // 绑在容器上的文字算容器的标签，不单独记
-    const kind: BaselineItem['kind'] = el.type === 'arrow' ? 'edge' : el.type === 'text' ? 'text' : 'node'
+    const kind: BaselineItem['kind'] =
+      el.type === 'arrow' ? 'edge' : el.type === 'line' ? 'line' : el.type === 'text' ? 'text' : 'node'
     const from = el.startBinding?.elementId ?? null
     const to = el.endBinding?.elementId ?? null
     for (const end of [from, to]) if (end) names[end] = describeName(byId.get(end), labels)
@@ -134,6 +135,14 @@ export function diffProposal(baseline: ProposalBaseline, elementsNow: readonly D
       if (label !== item.label) {
         out.push(label ? `把连线 ${was} 上的文字${item.label ? `「${item.label}」` : ''}改成了「${label}」` : `去掉了连线 ${was} 上的文字「${item.label}」`)
       }
+    } else if (item.kind === 'line') {
+      if (!el) {
+        out.push('删掉了线条')
+        continue
+      }
+      const dx = el.x - item.x
+      const dy = el.y - item.y
+      if (Math.hypot(dx, dy) >= MOVE_THRESHOLD) out.push(`把线条${moveWords(dx, dy)}`)
     } else {
       const was = `「${item.label}」`
       if (!el) {

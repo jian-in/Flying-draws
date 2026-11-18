@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGraph, summarize, type SceneElement } from '../src/main/semantic.ts'
-import { detourPoint, estimateTextWidth, exitPoint, OpsError, placeBlock, planOps, rebaseOps, toProposalPlan, type DrawOp } from '../src/main/ops.ts'
+import { detourPath, detourPoint, elementFingerprints, estimateTextWidth, exitPoint, OpsError, placeBlock, planOps, rebaseOps, toProposalPlan, type DrawOp, type FingerprintElement } from '../src/main/ops.ts'
 
 const ids = () => {
   let n = 0
@@ -590,4 +590,56 @@ test('planOps：两个已有节点之间隔着别的节点时，新连线带一�
 
   const direct = planOps([{ op: 'add_edge', from: id('ra'), to: id('rm') }], graph, ids())
   assert.equal(direct.edges[0].points.length, 2, '相邻的两个节点之间还是直线')
+})
+
+test('detourPath：两处错开障碍挡死单拐点时，退回双拐点平行走廊绕行', () => {
+  const a: [number, number] = [0, 0]
+  const b: [number, number] = [600, 0]
+  // 左右两堵高墙靠近端点，单拐点斜线会擦到墙角，双拐点走廊从上方或下方平直绕过
+  const walls = [box(90, -120, 120, 240), box(390, -120, 120, 240)]
+  const path = detourPath(a, b, walls)
+  assert.ok(path.length >= 1)
+  for (const [, py] of path) assert.ok(py > 120 || py < -120)
+})
+
+test('elementFingerprints：拖动节点连带拉伸绑定箭头时不误报箭头冲突，真改箭头文字或挪节点本身仍报冲突', () => {
+  const before: FingerprintElement[] = [
+    { id: 'n1', type: 'rectangle', x: 0, y: 0, width: 100, height: 60, version: 2 },
+    { id: 'n2', type: 'rectangle', x: 300, y: 0, width: 100, height: 60, version: 3 },
+    {
+      id: 'e1',
+      type: 'arrow',
+      x: 108,
+      y: 30,
+      width: 184,
+      height: 0,
+      points: [[0, 0], [184, 0]],
+      startBinding: { elementId: 'n1' },
+      endBinding: { elementId: 'n2' },
+      endArrowhead: 'arrow',
+      strokeColor: '#1e1e1e',
+      version: 4
+    },
+    { id: 'e1t', type: 'text', x: 180, y: 20, width: 40, height: 20, containerId: 'e1', text: '通过', version: 1 }
+  ]
+  // 用户把 n2 往右拖了 80px：n2.version 变了，e1 和 e1t 的坐标与 version 也跟着递增，但箭头语义没变
+  const draggedNode: FingerprintElement[] = [
+    before[0],
+    { ...before[1], x: 380, version: 9 },
+    { ...before[2], width: 264, points: [[0, 0], [264, 0]], version: 11 },
+    { ...before[3], x: 220, version: 6 }
+  ]
+  const fp0 = elementFingerprints(before)
+  const fpDragged = elementFingerprints(draggedNode)
+  assert.notEqual(fp0.get('n2'), fpDragged.get('n2'), '被拖动的节点本身指纹变化，防覆盖用户位置改动')
+  assert.equal(fp0.get('e1'), fpDragged.get('e1'), '仅因端点跟随拉伸的绑定箭头指纹不变，不误判冲突')
+
+  // 用户真改了箭头上的文字或样式：指纹变化
+  const editedArrowLabel: FingerprintElement[] = [
+    before[0],
+    before[1],
+    before[2],
+    { ...before[3], text: '拒绝', version: 2 }
+  ]
+  assert.notEqual(fp0.get('e1'), elementFingerprints(editedArrowLabel).get('e1'))
 })

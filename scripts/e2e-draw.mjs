@@ -50,13 +50,19 @@ async function connectPage() {
       pending.set(i, res)
       ws.send(JSON.stringify({ id: i, method, params }))
     })
-  const js = async (e) => (await cdp('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true })).result?.result?.value
+  const js = async (e) => {
+    const reply = await cdp('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true })
+    if (reply.result?.exceptionDetails) {
+      throw new Error(reply.result.exceptionDetails.exception?.description || 'CDP Runtime.evaluate exception')
+    }
+    return reply.result?.result?.value
+  }
   const waitFor = async (fn, ms = 10000) => {
     const end = Date.now() + ms
     while (Date.now() < end) {
       const v = await fn()
       if (v) return v
-      await sleep(200)
+      await sleep(100)
     }
     return null
   }
@@ -65,7 +71,13 @@ async function connectPage() {
     waitForBanner: () => waitFor(() => js(`document.querySelector('.fd-banner')?.innerText ?? null`)),
     waitForNoBanner: () => waitFor(() => js(`!document.querySelector('.fd-banner')`)),
     click: (label) =>
-      js(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===${JSON.stringify(label)}); if(!b) return false; b.click(); return true })()`),
+      waitFor(
+        () =>
+          js(
+            `(() => { const b=[...document.querySelectorAll('button')].find(b=>!b.disabled&&b.textContent.trim()===${JSON.stringify(label)}); if(!b) return false; b.click(); return true })()`
+          ),
+        8000
+      ),
     typeNote: async (t) => {
       await js(`document.querySelector('.fd-banner-note')?.focus()`)
       await cdp('Input.insertText', { text: t })
@@ -96,7 +108,19 @@ const textOf = (res) => res.content.filter((c) => c.type === 'text').map((c) => 
 
 try {
   const tools = (await client.listTools()).tools.map((t) => t.name)
-  check(tools.includes('canvas_draw') && tools.includes('canvas_pass'), '工具列表里有 canvas_draw 和 canvas_pass')
+  const expectedTools = [
+    'canvas_open',
+    'canvas_list',
+    'canvas_rename',
+    'canvas_delete',
+    'canvas_read',
+    'canvas_request',
+    'canvas_wait',
+    'canvas_pass',
+    'canvas_propose',
+    'canvas_draw'
+  ]
+  check(expectedTools.every((n) => tools.includes(n)), `工具列表完整包含 10 个工具（实际 ${tools.length} 个）`)
 
   const first = textOf(await call('canvas_read', { image: 'never' }))
   check(/画板是空的/.test(first), '隔离的画板一开始是空的')
@@ -585,15 +609,20 @@ try {
 
   // 第七次：画板重命名与删除（UI 与 MCP）
   await call('canvas_open', { board: 'ui-board' })
-  await sleep(300)
-  // 重命名和删除收在「⋯」菜单里，先点开
+  await until(async () => (await user3.js(`document.querySelector('.fd-board-select')?.value`)) === 'ui-board')
+  // 重命名和删除收在「⋯」菜单里：轮询确保菜单真正挂出，避免窗口焦点/重排事件把菜单瞬间关掉
   const openMenu = async () => {
-    await user3.js(`void (document.querySelector('.fd-menu') || document.querySelector('.fd-more').click())`)
-    await sleep(150)
+    const opened = await until(async () => {
+      if (await user3.js(`Boolean(document.querySelector('.fd-menu'))`)) return true
+      await user3.js(`document.querySelector('.fd-more')?.click()`)
+      await sleep(100)
+      return Boolean(await user3.js(`Boolean(document.querySelector('.fd-menu'))`))
+    })
+    if (!opened) throw new Error('未能打开「⋯」菜单')
   }
   await openMenu()
   await user3.click('重命名')
-  await sleep(200)
+  await until(async () => Boolean(await user3.js(`Boolean(document.querySelector('.fd-modal input'))`)))
   await user3.js(`(() => {
     const input = document.querySelector('.fd-modal input')
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
@@ -601,34 +630,38 @@ try {
     input.dispatchEvent(new Event('input', { bubbles: true }))
   })()`)
   await user3.click('保存')
-  await sleep(400)
-  const selectAfterUiRename = await user3.js(`document.querySelector('.fd-board-select')?.value`)
-  check(
-    selectAfterUiRename === 'renamed-ui' &&
+  const uiRenameDone = await until(
+    async () =>
+      (await user3.js(`document.querySelector('.fd-board-select')?.value`)) === 'renamed-ui' &&
       !existsSync(join(HOME, 'boards', 'ui-board.excalidraw')) &&
       existsSync(join(HOME, 'boards', 'renamed-ui.excalidraw')),
-    'UI 重命名画板后切换编号并迁移磁盘文件'
+    10000
   )
+  check(uiRenameDone, 'UI 重命名画板后切换编号并迁移磁盘文件')
 
   const mcpRenamed = textOf(await call('canvas_rename', { board: 'renamed-ui', new_board: 'renamed-by-mcp', title: 'MCP 重命名' }))
-  await sleep(300)
-  const selectAfterMcpRename = await user3.js(`document.querySelector('.fd-board-select')?.value`)
+  const mcpRenameSynced = await until(
+    async () => (await user3.js(`document.querySelector('.fd-board-select')?.value`)) === 'renamed-by-mcp',
+    8000
+  )
   check(
-    /Renamed board "renamed-ui" to "renamed-by-mcp"/.test(mcpRenamed) && selectAfterMcpRename === 'renamed-by-mcp',
+    /Renamed board "renamed-ui" to "renamed-by-mcp"/.test(mcpRenamed) && mcpRenameSynced,
     'MCP canvas_rename 能重命名画板并同步更新页面下拉框'
   )
 
   await openMenu()
   await user3.click('删除')
-  await sleep(200)
+  await until(async () => Boolean(await user3.js(`Boolean(document.querySelector('.fd-modal'))`)))
   await user3.click('确认删除')
-  await sleep(400)
-  const selectAfterUiDelete = await user3.js(`document.querySelector('.fd-board-select')?.value`)
+  const uiDeleteDone = await until(
+    async () =>
+      (await user3.js(`document.querySelector('.fd-board-select')?.value`)) === 'default' &&
+      !existsSync(join(HOME, 'boards', 'renamed-by-mcp.excalidraw')),
+    10000
+  )
   const listedAfterUiDelete = textOf(await call('canvas_list'))
   check(
-    selectAfterUiDelete === 'default' &&
-      !existsSync(join(HOME, 'boards', 'renamed-by-mcp.excalidraw')) &&
-      !/renamed-by-mcp/.test(listedAfterUiDelete),
+    uiDeleteDone && !/renamed-by-mcp/.test(listedAfterUiDelete),
     'UI 删除当前画板后自动切回 default 并移除磁盘文件'
   )
 

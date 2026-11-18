@@ -224,6 +224,9 @@ export class WindowDock {
     win.on('moved', () => this.userMoved())
     win.on('will-resize', (_event, newBounds, details) => this.onWillResize(newBounds, details.edge))
     win.on('resized', () => this.onResized())
+    win.on('hide', () => {
+      if (this.target) this.undock()
+    })
     win.on('closed', () => this.stop())
   }
 
@@ -517,7 +520,7 @@ export class WindowDock {
   private apply(): void {
     const api = this.api!
     const t = this.target
-    if (!t || this.win.isDestroyed() || this.win.isMinimized()) return
+    if (!t || this.win.isDestroyed() || !this.win.isVisible() || this.win.isMinimized()) return
     const rect = api.frame(t.hwnd)
     if (!rect || api.minimized(t.hwnd)) return
     t.lastRect = rect

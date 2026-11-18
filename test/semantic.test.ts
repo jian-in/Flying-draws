@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { buildGraph, summarize, type SceneElement } from '../src/main/semantic.ts'
+import { bboxOf, buildGraph, canvasRectToImagePixels, summarize, type SceneElement } from '../src/main/semantic.ts'
 
 const fixture = (name: string): SceneElement[] =>
   JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')).elements
@@ -254,4 +254,94 @@ test('游离文字和手绘按 T/S 编号，标记框被忽略，多 agent 署�
   assert.match(s, /T1 「旁注」/)
   assert.match(s, /S1 一组手写或涂鸦/)
   assert.match(s, /S2 一条直线/)
+})
+
+test('往左上方画的手绘圈按实际点坐标算外接框，并能识别圈住了一组手写字', () => {
+  const words = handwrittenChar(200, 200)
+  // 从圈的右下角 (290, 290) 往左上画一圈回到起点：points 全是负偏移，width/height 为正
+  const reverseLoop: SceneElement = {
+    id: 'f-rev-loop',
+    type: 'freedraw',
+    x: 290,
+    y: 290,
+    width: 120,
+    height: 120,
+    points: Array.from({ length: 40 }, (_, i) => {
+      const t = (i / 39) * 2 * Math.PI
+      return [-60 + 60 * Math.cos(t), -60 + 60 * Math.sin(t)] as [number, number]
+    })
+  }
+  assert.deepEqual(
+    [Math.round(bboxOf(reverseLoop).x), Math.round(bboxOf(reverseLoop).y), Math.round(bboxOf(reverseLoop).w), Math.round(bboxOf(reverseLoop).h)],
+    [170, 170, 120, 120]
+  )
+  const g = buildGraph([...words, reverseLoop])
+  assert.equal(g.strokeGroups.length, 1, '里面的 5 笔手写正常聚成一组 S1')
+  assert.equal(g.strokes.length, 1, '外面的圈没有被吞进手写组，单独保留为 S2')
+  assert.deepEqual(g.strokes[0].encloses, ['S1'])
+  const textOut = summarize(g, { board: 't', version: 1 })
+  assert.match(textOut, /S2 一个圈，圈住了 S1（一组手写，5 笔）/)
+})
+
+test('图片带原图尺寸与来源元数据，图上的圈选/框选/箭头批注换算为原图像素坐标', () => {
+  // 原图 1600×900，在画布上缩放到 800×450 放在 (100, 100)
+  const screenshot: SceneElement = {
+    id: 'img_page',
+    type: 'image',
+    x: 100,
+    y: 100,
+    width: 800,
+    height: 450,
+    customData: {
+      flyingdraws: {
+        author: 'agent',
+        agent: 'Fuxi',
+        seat: true,
+        layer: 'final',
+        result: 'a'.repeat(64),
+        imageMeta: {
+          naturalWidth: 1600,
+          naturalHeight: 900,
+          url: 'http://127.0.0.1:5173/login',
+          viewport: { w: 1600, h: 900 },
+          round: 2
+        }
+      }
+    }
+  }
+  // 用户在画布 (500..650, 120..170) 画了一个圈（对应原图 x=800..1100, y=40..140）并写了旁注
+  const circleOnBtn: SceneElement = {
+    id: 'loop_btn',
+    type: 'freedraw',
+    x: 500,
+    y: 120,
+    width: 150,
+    height: 50,
+    points: Array.from({ length: 37 }, (_, i) => {
+      const t = (i / 36) * 2 * Math.PI
+      return [75 + 75 * Math.cos(t), 25 + 25 * Math.sin(t)] as [number, number]
+    })
+  }
+  const noteNearCircle = text(500, 180, '按钮改成主色')
+  const pointerArrow = arrow([50, 325], [300, 325]) // 箭头尖落在 (300, 325) -> 原图 (400, 450)
+  const g = buildGraph([screenshot, circleOnBtn, noteNearCircle, pointerArrow])
+  assert.deepEqual(g.images[0].naturalSize, { w: 1600, h: 900 })
+  const loopAnn = g.images[0].annotations.find((a) => a.kind === 'loop')
+  assert.ok(loopAnn)
+  assert.deepEqual(loopAnn!.pixelBbox, { x: 800, y: 40, w: 300, h: 100 })
+  assert.equal(loopAnn!.note, '按钮改成主色')
+  const arrowAnn = g.images[0].annotations.find((a) => a.kind === 'arrow')
+  assert.ok(arrowAnn)
+  assert.deepEqual(arrowAnn!.pixelPoint, { x: 400, y: 450 })
+
+  const out = summarize(g, { board: 'b', version: 2, viewer: 'Fuxi' })
+  assert.match(out, /原图 1600×900 px，来源 http:\/\/127\.0\.0\.1:5173\/login，视口 1600×900，第 2 轮结果/)
+  assert.match(out, /原图像素区域 x=800, y=40, w=300, h=100，批注「按钮改成主色」/)
+  assert.match(out, /箭头指向 原图像素点 \(400, 450\)/)
+
+  // 裁剪 + 水平翻转下的原图像素换算
+  assert.deepEqual(
+    canvasRectToImagePixels({ x: 100, y: 100, w: 100, h: 50 }, { x: 100, y: 100, w: 400, h: 200 }, { x: 200, y: 100, w: 800, h: 400 }, [-1, 1]),
+    { x: 800, y: 100, w: 200, h: 100 }
+  )
 })

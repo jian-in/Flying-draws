@@ -1,7 +1,7 @@
 // agent 的绘图指令（ops）→ 一份"绘图计划"：每个新元素的 id、位置、大小都在这里定好。
 // 纯函数，不依赖 Electron。页面拿到计划后只负责把它变成 Excalidraw 元素。
 //
-// 新增：add_node、add_edge、add_text。
+// 新增：add_node、add_edge、add_text；trace_image 把一张图里的内容照原样转成可编辑元素。
 // 改动：update_node、delete_node、update_edge、delete_edge、update_text、delete_text、delete_strokes、set_style。
 // 改动可以用在任何人画的东西上（用户的、别的 agent 的都行，design.md 12.4）；还在等用户确认的提议除外。
 // 排版：这一批里没指定坐标的新节点交给 dagre 排成一块，整块放在已有内容下方；
@@ -9,7 +9,66 @@
 import dagre from '@dagrejs/dagre'
 // 带 .ts 后缀：单元测试是用 node 直接跑这些文件的，node 不会自己补后缀
 import { exitPoint, type ShapeBox } from './geometry.ts'
-import type { Bbox, SemanticGraph } from './semantic'
+import type { Bbox, SceneElement, SemanticGraph } from './semantic.ts'
+
+export interface FingerprintElement extends SceneElement {
+  version?: number
+  strokeColor?: string
+  strokeStyle?: string
+  strokeWidth?: number
+  opacity?: number
+  fontSize?: number
+}
+
+/**
+ * 计算每个元素的冲突检测指纹。
+ * - 普通元素（节点、文字、手绘、图片、完全未绑定箭头）使用 version + 绑定文字 version；
+ * - 已绑定到节点的箭头（startBinding / endBinding）：拖动或缩放端点节点时 Excalidraw 会连带递增箭头及其文字坐标的 version，
+ *   但箭头的连接关系、折点数、文字内容与样式并未被改动，不应误判冲突；真改了连线文字、样式、方向、折点或自由端坐标时指纹仍会变化。
+ */
+export function elementFingerprints(elements: readonly FingerprintElement[]): Map<string, string> {
+  const boundTextByContainer = new Map<string, FingerprintElement>()
+  for (const el of elements) {
+    if (!el.isDeleted && el.type === 'text' && el.containerId) {
+      boundTextByContainer.set(el.containerId, el)
+    }
+  }
+  const out = new Map<string, string>()
+  for (const el of elements) {
+    if (el.isDeleted) continue
+    const bt = boundTextByContainer.get(el.id)
+    if (el.type === 'arrow' && (el.startBinding || el.endBinding)) {
+      const pts = el.points && el.points.length >= 2 ? el.points : ([[0, 0], [el.width, el.height]] as const)
+      const first = pts[0]
+      const last = pts[pts.length - 1]
+      const freeStart = el.startBinding ? '' : `${Math.round(el.x + first[0])},${Math.round(el.y + first[1])}`
+      const freeEnd = el.endBinding ? '' : `${Math.round(el.x + last[0])},${Math.round(el.y + last[1])}`
+      const labelSig = bt ? `${bt.text ?? ''}\0${bt.strokeColor ?? ''}\0${bt.fontSize ?? ''}` : ''
+      out.set(
+        el.id,
+        [
+          'bound-arrow',
+          el.startBinding?.elementId ?? '',
+          el.endBinding?.elementId ?? '',
+          el.startArrowhead ?? '',
+          el.endArrowhead ?? '',
+          pts.length,
+          freeStart,
+          freeEnd,
+          el.strokeColor ?? '',
+          el.strokeStyle ?? '',
+          el.strokeWidth ?? '',
+          el.opacity ?? '',
+          el.customData?.flyingdraws?.layer ?? '',
+          labelSig
+        ].join('|')
+      )
+    } else {
+      out.set(el.id, `${el.version ?? 0}:${bt?.version ?? ''}`)
+    }
+  }
+  return out
+}
 
 export type NodeShape = 'rectangle' | 'ellipse' | 'diamond'
 export type Direction = 'right' | 'down'
@@ -35,6 +94,22 @@ export type DrawOp =
   | { op: 'delete_text'; id: string }
   | { op: 'delete_strokes'; id: string } // 一组手写或一笔手绘（S1 这类编号）
   | ({ op: 'set_style'; id?: string; from?: string; to?: string } & StyleProps) // id 是节点、文字或手绘；from + to 指一条连线
+  | TraceImageOp
+
+// 照着画布上的一张图（I1 这类编号），把图里的方框、文字、线条转成可编辑元素。
+// 坐标都在 space 这个坐标系里（通常就是原图的像素尺寸），由这里按比例换算到画布上，agent 不用算画布坐标。
+export interface TraceImageOp {
+  op: 'trace_image'
+  image: string // I1 这类编号，或图片元素的稳定 id
+  space: { w: number; h: number }
+  place?: 'beside' | 'over' // beside（默认）：画在原图旁边的空位，大小和原图一样；over：直接叠在原图上
+  elements: TraceElement[]
+}
+
+export type TraceElement =
+  | { kind: 'box'; id?: string; x: number; y: number; w: number; h: number; shape?: NodeShape; label?: string; color?: string; fill?: string; font_size?: number }
+  | { kind: 'text'; x: number; y: number; text: string; color?: string; font_size?: number }
+  | { kind: 'line'; points: [number, number][]; arrow?: 'none' | 'end' | 'start' | 'both'; color?: string; dashed?: boolean; from?: string; to?: string }
 
 export const MODIFY_OPS = ['update_node', 'delete_node', 'update_edge', 'delete_edge', 'update_text', 'delete_text', 'delete_strokes', 'set_style']
 
@@ -47,6 +122,11 @@ export interface PlannedNode {
   y: number
   w: number
   h: number
+  // 下面几项只有照图还原（trace_image）的元素才有：保留原图的颜色和字号，不换成席位颜色
+  traced?: true
+  color?: string
+  fill?: string
+  fontSize?: number
 }
 
 export interface PlannedEdge {
@@ -64,12 +144,30 @@ export interface PlannedText {
   text: string
   x: number
   y: number
+  traced?: true
+  color?: string
+  fontSize?: number
+}
+
+// 照图还原出来的线条或箭头：不一定连着节点。from/to 给了就绑到对应的方框上，拖方框时线会跟着走。
+export interface PlannedLine {
+  elementId: string
+  x: number // 起点
+  y: number
+  points: [number, number][] // 相对起点，第一个点是 [0, 0]
+  startArrow: boolean
+  endArrow: boolean
+  color?: string
+  dashed: boolean
+  fromElementId?: string
+  toElementId?: string
 }
 
 export interface DrawPlan {
   nodes: PlannedNode[]
   edges: PlannedEdge[]
   texts: PlannedText[]
+  lines?: PlannedLine[] // 只有 trace_image 会产生
   // 换掉节点里或连线上的文字；textId 是新文字元素的 id。relayout 为 true 表示文字没变，只是节点改了形状或大小，要重新摆一下
   updates: { elementId: string; textId: string; label: string | null; relayout?: boolean }[]
   textEdits: { elementId: string; text: string }[] // 改独立文字的内容
@@ -78,6 +176,8 @@ export interface DrawPlan {
   markers: PlannedMarker[] // 只有提议里才有：改动先不执行，画一个标记框告诉用户"打算改这里"
   targetGroups: string[][] // 每条改动指令对应的元素。一组手写是好几个元素，要合在一起标记
   existingRefs: string[] // 这批指令引用到的已有元素（Excalidraw id），页面执行前要确认它们还在
+  // 用稳定 id（元素自己的 id）而不是 N1/I1 这类短编号引用的元素：不会随版本错位，不要求 base_version，但执行前同样要确认还在
+  stableRefs?: string[]
   modifiedRefs: string[] // 其中要被改动或删除的。这些元素在 agent 读过之后不能被别人动过
 }
 
@@ -129,6 +229,7 @@ export function rebaseOps(
   for (const n of graph.notes) nowOf.set(n.ref, n.id)
   for (const s of graph.strokes) nowOf.set(s.ref, s.id)
   for (const g of graph.strokeGroups) for (const ref of g.refs) nowOf.set(ref, g.id)
+  for (const img of graph.images) nowOf.set(img.ref, img.id)
   const gone = new Set<string>()
   const fix = <T>(id: T): T => {
     if (typeof id !== 'string' || fresh.has(id)) return id
@@ -157,6 +258,8 @@ export function rebaseOps(
         return { ...op, id: fix(op.id) }
       case 'set_style':
         return { ...op, id: fix(op.id), from: fix(op.from), to: fix(op.to) }
+      case 'trace_image':
+        return { ...op, image: fix(op.image) }
       default:
         return op
     }
@@ -321,6 +424,38 @@ export function detourPoint(a: [number, number], b: [number, number], obstacles:
   return null
 }
 
+/**
+ * 连线绕障路径：优先单拐点绕行；若密集多障碍导致单拐点无法同时避开两端障碍，
+ * 退而尝试双拐点平行走廊绕行（[p1, p2]），再绕不开才返回空数组画直线。
+ */
+export function detourPath(a: [number, number], b: [number, number], obstacles: readonly Bbox[]): [number, number][] {
+  const single = detourPoint(a, b, obstacles)
+  if (single) return [single]
+  const inside = (p: [number, number], o: Bbox) => p[0] >= o.x && p[0] <= o.x + o.w && p[1] >= o.y && p[1] <= o.y + o.h
+  const others = obstacles.filter((o) => !inside(a, o) && !inside(b, o))
+  const blocked = (p: [number, number], q: [number, number]) => others.some((o) => segmentHits(p, q, o, DETOUR_PAD))
+  if (!blocked(a, b)) return []
+  const dx = b[0] - a[0]
+  const dy = b[1] - a[1]
+  const len = Math.hypot(dx, dy)
+  if (len < 1) return []
+  const nx = -dy / len
+  const ny = dx / len
+  for (const [t1, t2] of [
+    [0.2, 0.8],
+    [0.05, 0.95]
+  ] as const) {
+    for (let d = DETOUR_STEP * 2; d <= 800; d += DETOUR_STEP) {
+      for (const sign of [1, -1]) {
+        const p1: [number, number] = [a[0] + dx * t1 + nx * d * sign, a[1] + dy * t1 + ny * d * sign]
+        const p2: [number, number] = [a[0] + dx * t2 + nx * d * sign, a[1] + dy * t2 + ny * d * sign]
+        if (!blocked(a, p1) && !blocked(p1, p2) && !blocked(p2, b)) return [p1, p2]
+      }
+    }
+  }
+  return []
+}
+
 function centerOf(b: Bbox): [number, number] {
   return [b.x + b.w / 2, b.y + b.h / 2]
 }
@@ -419,6 +554,7 @@ export function planOps(
     throw new OpsError(`${where}: unknown node "${key}". Use an id from an add_node in this call, or a node id (like N1) from your latest canvas_read`)
   }
   const edgeOps: { from: string; to: string; label: string | null }[] = []
+  const traceOps: { op: TraceImageOp; where: string }[] = []
   const textOps: { text: string; near: string | null; x: number | null; y: number | null }[] = []
 
   // 改动和删除：谁画的都能动（用户的、别的 agent 的），只有还在等用户确认的提议不行
@@ -556,9 +692,11 @@ export function planOps(
         x: placed ? op.x! : null,
         y: placed ? op.y! : null
       })
+    } else if (op.op === 'trace_image') {
+      traceOps.push({ op, where: `ops[${i}]` })
     } else if (op.op !== 'add_node') {
       throw new OpsError(
-        `ops[${i}]: unknown op "${String((op as { op?: unknown }).op)}". Supported: add_node, add_edge, add_text, ` +
+        `ops[${i}]: unknown op "${String((op as { op?: unknown }).op)}". Supported: add_node, add_edge, add_text, trace_image, ` +
           'update_node, delete_node, update_edge, delete_edge, update_text, delete_text, delete_strokes, set_style'
       )
     }
@@ -684,9 +822,8 @@ export function planOps(
     const to = boxOf(e.to)
     let mid = bends.get(i) ?? []
     if (!mid.length) {
-      // 直线会压到别的东西时加一个拐点绕过去
-      const via = detourPoint(centerOf(from.box), centerOf(to.box), edgeObstacles)
-      if (via) mid = [via]
+      // 直线会压到别的东西时加拐点绕过去（单拐点优先，密集多障碍时双拐点走廊绕行）
+      mid = detourPath(centerOf(from.box), centerOf(to.box), edgeObstacles)
     }
     const [sx, sy] = exitPoint(from.box, ...(mid[0] ?? centerOf(to.box)), EDGE_GAP)
     const [ex, ey] = exitPoint(to.box, ...(mid[mid.length - 1] ?? centerOf(from.box)), EDGE_GAP)
@@ -730,10 +867,29 @@ export function planOps(
     return { elementId: newId(), text: t.text, x, y }
   })
 
+  // ---------- 照图还原：每张图画成一块，放在原图旁边的空位（或叠在原图上） ----------
+  const lines: PlannedLine[] = []
+  const placedSoFar: Bbox[] = [
+    ...nodes.map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h })),
+    ...texts.map((t) => ({ x: t.x, y: t.y, ...textSize(t.text) }))
+  ]
+  const stableRefs = new Set<string>()
+  for (const { op, where } of traceOps) {
+    const traced = planTrace(op, graph, newId, [...allBoxes, ...placedSoFar], where)
+    if (traced.byStableId) stableRefs.add(traced.imageRef)
+    else existingRefs.add(traced.imageRef)
+    nodes.push(...traced.nodes)
+    texts.push(...traced.texts)
+    lines.push(...traced.lines)
+    placedSoFar.push(traced.block)
+  }
+
   return {
     nodes,
     edges,
     texts,
+    ...(lines.length ? { lines } : {}),
+    ...(stableRefs.size ? { stableRefs: [...stableRefs] } : {}),
     updates,
     textEdits,
     styles: [...styles.values()],
@@ -743,6 +899,157 @@ export function planOps(
     existingRefs: [...existingRefs],
     modifiedRefs: [...modifiedRefs]
   }
+}
+
+// ---------- 照图还原（trace_image） ----------
+
+const TRACE_MAX_ELEMENTS = 500
+const TRACE_MAX_POINTS = 200
+const TRACE_SPACE_MAX = 20000
+const TRACE_GAP = 60 // 还原出来的一块和原图之间留多宽
+const TRACE_FONT_MIN = 8
+const TRACE_FONT_MAX = 120
+
+function planTrace(
+  op: TraceImageOp,
+  graph: SemanticGraph,
+  newId: () => string,
+  obstacles: readonly Bbox[],
+  where: string
+): { imageRef: string; byStableId: boolean; nodes: PlannedNode[]; texts: PlannedText[]; lines: PlannedLine[]; block: Bbox } {
+  const key = String(op.image ?? '').trim()
+  const image = graph.images.find((img) => img.id === key || img.ref === key)
+  if (!image) throw new OpsError(`${where}.image: unknown image "${key}". Use an image id (like I1) from your latest canvas_read`)
+  const space = op.space
+  const dim = (v: unknown): boolean => isFiniteNumber(v) && v > 0 && v <= TRACE_SPACE_MAX
+  if (!space || !dim(space.w) || !dim(space.h)) {
+    throw new OpsError(`${where}.space: give the coordinate space you used, e.g. the image's pixel size {"w": 1200, "h": 800}`)
+  }
+  const elements: TraceElement[] = Array.isArray(op.elements) ? op.elements : []
+  if (!elements.length || elements.length > TRACE_MAX_ELEMENTS) {
+    throw new OpsError(`${where}.elements: give 1 to ${TRACE_MAX_ELEMENTS} elements (boxes, texts, lines)`)
+  }
+  const box = image.bbox
+  const [ox, oy] =
+    op.place === 'over'
+      ? [box.x, box.y]
+      : placeBlock({ w: box.w, h: box.h }, obstacles, {
+          anchors: [box],
+          direction: 'right',
+          fallback: [box.x + box.w + TRACE_GAP, box.y]
+        })
+  const sx = box.w / space.w
+  const sy = box.h / space.h
+  const X = (v: number): number => ox + v * sx
+  const Y = (v: number): number => oy + v * sy
+
+  const num = (v: unknown, name: string, at: string): number => {
+    if (!isFiniteNumber(v)) throw new OpsError(`${at}: "${name}" must be a number`)
+    return v
+  }
+  const color = (v: unknown, at: string, allowTransparent = false): string | undefined => {
+    if (v === undefined || v === null || v === '') return undefined
+    if (typeof v !== 'string' || !(COLOR_RE.test(v) || (allowTransparent && v === 'transparent'))) {
+      throw new OpsError(`${at}: colors are hex like "#1971c2"${allowTransparent ? ' (fill may also be "transparent")' : ''}`)
+    }
+    return v.toLowerCase()
+  }
+  // 字号也在 space 坐标系里，跟着图一起缩放
+  const fontSize = (v: unknown, at: string): number | undefined => {
+    if (v === undefined || v === null) return undefined
+    const size = num(v, 'font_size', at)
+    return Math.round(Math.min(TRACE_FONT_MAX, Math.max(TRACE_FONT_MIN, size * sy)))
+  }
+
+  const nodes: PlannedNode[] = []
+  const texts: PlannedText[] = []
+  const lines: PlannedLine[] = []
+  const boxIds = new Map<string, string>()
+  elements.forEach((el, j) => {
+    const at = `${where}.elements[${j}]`
+    if (!el || typeof el !== 'object') throw new OpsError(`${at}: expected an object`)
+    if (el.kind === 'box') {
+      const x = num(el.x, 'x', at)
+      const y = num(el.y, 'y', at)
+      const w = num(el.w, 'w', at)
+      const h = num(el.h, 'h', at)
+      if (w <= 0 || h <= 0) throw new OpsError(`${at}: "w" and "h" must be positive`)
+      const shape: NodeShape = el.shape ?? 'rectangle'
+      if (!['rectangle', 'ellipse', 'diamond'].includes(shape)) throw new OpsError(`${at}: unknown shape "${String(el.shape)}"`)
+      const node: PlannedNode = {
+        key: `trace:${j}`,
+        elementId: newId(),
+        shape,
+        label: cleanLabel(el.label),
+        x: X(x),
+        y: Y(y),
+        w: Math.max(2, w * sx),
+        h: Math.max(2, h * sy),
+        traced: true
+      }
+      const c = color(el.color, at)
+      const f = color(el.fill, at, true)
+      const fs = fontSize(el.font_size, at) ?? (node.label && node.h < 42 ? Math.round(Math.min(20, Math.max(TRACE_FONT_MIN, node.h * 0.55))) : undefined)
+      if (c) node.color = c
+      if (f) node.fill = f
+      if (fs) node.fontSize = fs
+      if (el.id !== undefined && el.id !== null) {
+        const id = String(el.id).trim()
+        if (!id) throw new OpsError(`${at}: "id" must not be empty`)
+        if (boxIds.has(id)) throw new OpsError(`${at}: duplicate box id "${id}"`)
+        boxIds.set(id, node.elementId)
+      }
+      nodes.push(node)
+    } else if (el.kind === 'text') {
+      const text = String(el.text ?? '').trim()
+      if (!text) throw new OpsError(`${at}: a text needs "text"`)
+      const t: PlannedText = { elementId: newId(), text, x: X(num(el.x, 'x', at)), y: Y(num(el.y, 'y', at)), traced: true }
+      const c = color(el.color, at)
+      const fs = fontSize(el.font_size, at)
+      if (c) t.color = c
+      if (fs) t.fontSize = fs
+      texts.push(t)
+    } else if ((el as { kind?: unknown }).kind !== 'line') {
+      throw new OpsError(`${at}: "kind" must be "box", "text" or "line"`)
+    }
+  })
+  // 线条最后处理：from/to 可以指向排在它后面的方框
+  elements.forEach((el, j) => {
+    if (el.kind !== 'line') return
+    const at = `${where}.elements[${j}]`
+    const raw = Array.isArray(el.points) ? el.points : []
+    if (raw.length < 2 || raw.length > TRACE_MAX_POINTS) throw new OpsError(`${at}: a line needs 2 to ${TRACE_MAX_POINTS} points`)
+    const pts = raw.map((p, k): [number, number] => {
+      if (!Array.isArray(p) || p.length !== 2) throw new OpsError(`${at}.points[${k}]: expected [x, y]`)
+      return [X(num(p[0], 'x', at)), Y(num(p[1], 'y', at))]
+    })
+    const arrow = el.arrow ?? 'none'
+    if (!['none', 'end', 'start', 'both'].includes(arrow)) throw new OpsError(`${at}: "arrow" must be none, end, start or both`)
+    const bind = (v: unknown, name: string): string | undefined => {
+      if (v === undefined || v === null || v === '') return undefined
+      const id = boxIds.get(String(v).trim())
+      if (!id) throw new OpsError(`${at}.${name}: no box with id "${String(v)}" in this trace_image`)
+      return id
+    }
+    const [x0, y0] = pts[0]
+    const line: PlannedLine = {
+      elementId: newId(),
+      x: x0,
+      y: y0,
+      points: pts.map(([px, py]): [number, number] => [px - x0, py - y0]),
+      startArrow: arrow === 'start' || arrow === 'both',
+      endArrow: arrow === 'end' || arrow === 'both',
+      dashed: el.dashed === true
+    }
+    const c = color(el.color, at)
+    const from = bind(el.from, 'from')
+    const to = bind(el.to, 'to')
+    if (c) line.color = c
+    if (from) line.fromElementId = from
+    if (to) line.toElementId = to
+    lines.push(line)
+  })
+  return { imageRef: image.ref, byStableId: image.id !== key, nodes, texts, lines, block: { x: ox, y: oy, w: box.w, h: box.h } }
 }
 
 const SHAPE_WORDS: Record<NodeShape, string> = { rectangle: '矩形', ellipse: '椭圆', diamond: '菱形' }

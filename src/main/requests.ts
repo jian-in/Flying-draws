@@ -73,6 +73,7 @@ export interface HubState {
 // 已经有结果（回应了或取消了）的请求留最近这么多条：agent 可能重复来取同一个结果，
 // 但每条都带着整份画布和截图，全留着的话应用开得越久占的内存越多
 export const FINISHED_KEEP = 8
+export const QUEUE_KEEP = 32
 
 export class RequestHub {
   private requests = new Map<string, DrawRequest>()
@@ -81,9 +82,14 @@ export class RequestHub {
   private waiters = new Set<Waiter>()
   private seq = 0
   private listener: ((s: HubState) => void) | null = null
+  private evictListener: ((requestId: string) => void) | null = null
 
   onChange(fn: (s: HubState) => void): void {
     this.listener = fn
+  }
+
+  onEvict(fn: (requestId: string) => void): void {
+    this.evictListener = fn
   }
 
   state(): HubState {
@@ -129,6 +135,7 @@ export class RequestHub {
       return true
     }
     this.handoffs.push(h)
+    if (this.handoffs.length > QUEUE_KEEP) this.handoffs.splice(0, this.handoffs.length - QUEUE_KEEP)
     this.emit()
     return false
   }
@@ -185,7 +192,10 @@ export class RequestHub {
     this.requests.delete(req.id)
     this.requests.set(req.id, req)
     const finished = [...this.requests.values()].filter((r) => r.status !== 'waiting')
-    for (const old of finished.slice(0, Math.max(0, finished.length - FINISHED_KEEP))) this.requests.delete(old.id)
+    for (const old of finished.slice(0, Math.max(0, finished.length - FINISHED_KEEP))) {
+      this.requests.delete(old.id)
+      this.evictListener?.(old.id)
+    }
   }
 
   // 还在等用户回应的请求，用来存盘
@@ -263,7 +273,10 @@ export class RequestHub {
       // 主动发送，或者请求已经失效：交给正在等收件箱的 agent（点选了席位就只交给那个席位），没人等就放进收件箱
       const fresh = { ...sub, requestId: null, to: sub.to || null }
       delivered = this.settle((t) => 'inbox' in t && this.canTakeSubmission(fresh, t.agent), { status: 'submitted', submission: fresh }, true)
-      if (!delivered) this.inbox.push(fresh)
+      if (!delivered) {
+        this.inbox.push(fresh)
+        if (this.inbox.length > QUEUE_KEEP) this.inbox.splice(0, this.inbox.length - QUEUE_KEEP)
+      }
     }
     this.emit()
     return delivered

@@ -114,3 +114,18 @@ test('提议里的改动预览标记框不进入底稿，接受后删掉也不�
   const accepted = scene().map((el) => (el.customData ? { ...el, customData: { flyingdraws: { author: 'agent', layer: 'final' } } } : el))
   assert.deepEqual(diffProposal(b, accepted), [])
 })
+
+test('trace_image 提议里的普通线条按线条识别，删除或移动不误报成无文字节点', () => {
+  const tracedLine: DiffElement = {
+    id: 'ln1',
+    type: 'line',
+    x: 100,
+    y: 100,
+    width: 200,
+    height: 0,
+    ...mark
+  }
+  const b = captureBaseline([tracedLine], 'p1')
+  assert.deepEqual(diffProposal(b, [{ ...tracedLine, isDeleted: true }]), ['删掉了线条'])
+  assert.deepEqual(diffProposal(b, [{ ...tracedLine, x: 160, y: 100 }]), ['把线条往右挪了'])
+})

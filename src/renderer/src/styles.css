@@ -16,8 +16,8 @@ body,
 .fd-agent button:hover:enabled { background: var(--fd-paper); outline: 1px solid var(--fd-border); }
 .fd-agent button:disabled { cursor: default; opacity: .45; }
 .fd-agent button:focus-visible, .fd-agent input:focus-visible, .fd-agent select:focus-visible, .fd-agent textarea:focus-visible { outline: 2px solid #1971c2; outline-offset: 2px; }
-.fd-agent .fd-agent-primary { background: #f6d64a; border: 1.5px solid #2b2a26; color: #2b2a26; font-weight: 650; box-shadow: 2px 2px 0 #2b2a26; }
-.fd-agent .fd-agent-primary:hover:enabled { background: #ffe478; }
+.fd-agent .fd-agent-primary { background: var(--fd-primary); border: 1.5px solid var(--fd-border); color: var(--fd-on-primary); font-weight: 650; box-shadow: 2px 2px 0 var(--fd-ink); }
+.fd-agent .fd-agent-primary:hover:enabled { background: var(--fd-primary-hover); }
 .fd-agent-heading { padding: 20px 20px 12px; display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
 .fd-agent-eyebrow { color: var(--fd-muted); font-size: 9px; letter-spacing: .14em; }
 .fd-agent h2 { margin: 3px 0 0; font-size: 19px; line-height: 1.4; font-weight: 650; letter-spacing: -.03em; }
@@ -37,6 +37,8 @@ body,
 .fd-agent-workspace > span:first-child, .fd-agent-workspace > span:last-child { flex: none; }
 .fd-agent-workspace > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .fd-agent-history { width: 100%; margin-top: 8px; border: 1px solid var(--fd-border); background: var(--fd-surface); padding: 3px 5px; border-radius: 3px; font-size: 11px !important; }
+.fd-agent-lineage-toggle { margin-top: 8px; cursor: pointer; user-select: none; font-size: 10.5px !important; line-height: 1.4; }
+.fd-agent-lineage-toggle input { cursor: pointer; margin: 0; flex: none; }
 .fd-agent-transcript { flex: 1; overflow-y: auto; min-height: 60px; overscroll-behavior: contain; scrollbar-width: thin; }
 .fd-agent-empty { padding: 38px 25px; }
 .fd-agent-empty h3 { margin: 26px 0 8px; font-size: 21px; font-weight: 500; letter-spacing: -.04em; }
@@ -50,9 +52,9 @@ body,
 .fd-agent-run:last-child { border-bottom: 0; }
 .fd-agent-run-meta { display: flex; align-items: center; justify-content: space-between; gap: 5px; font-size: 10px; color: var(--fd-muted); margin-bottom: 8px; }
 .fd-agent-run-status { white-space: nowrap; }
-.fd-agent-run-running, .fd-agent-run-planned, .fd-agent-run-unverified, .fd-agent-run-interrupted { color: #b47b0b; }
-.fd-agent-run-failed { color: #d04a39; }
-.fd-agent-run-completed { color: #2f9e44; }
+.fd-agent-run-running, .fd-agent-run-planned, .fd-agent-run-unverified, .fd-agent-run-interrupted { color: #d08c00; }
+.fd-agent-run-failed { color: var(--fd-danger); }
+.fd-agent-run-completed { color: var(--fd-ok); }
 .fd-agent-goal { border-left: 2px solid var(--fd-text); padding-left: 10px; margin: 0 0 17px; font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
 .fd-agent-reply { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; margin: 12px 0; font-size: 12px; }
 .fd-agent-draft { color: var(--fd-muted); }
@@ -61,9 +63,19 @@ body,
 .fd-agent-plan > strong { display: block; font-size: 11px; margin-bottom: 7px; }
 .fd-agent-plan > div { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .fd-agent-result-image { margin: 14px 0 0; border: 1px solid var(--fd-border); border-radius: 3px; overflow: hidden; }
-.fd-agent-result-image img { display: block; width: 100%; max-height: 220px; object-fit: contain; background: #fff; }
-.fd-agent-result-image figcaption { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; font-size: 10px; color: var(--fd-muted); }
-.fd-agent-result-image button { font-size: 10px; padding: 3px 6px; }
+.fd-agent-result-image img { display: block; width: 100%; max-height: 220px; object-fit: contain; background: #fff; cursor: zoom-in; }
+.fd-agent-result-image figcaption { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 6px 8px; font-size: 10px; color: var(--fd-muted); }
+.fd-agent-result-image figcaption > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fd-agent-result-image button { font-size: 10px; padding: 3px 6px; flex: none; }
+.fd-agent-trace { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; padding: 7px 10px; border: 1px dashed var(--fd-border); font-size: 11px; color: var(--fd-muted); }
+.fd-agent-trace button { margin-left: auto; font-size: 11px; padding: 3px 8px; background: var(--fd-primary); color: var(--fd-on-primary); border: 1px solid var(--fd-border); font-weight: 600; }
+.fd-agent .fd-agent-trace button:hover:enabled { background: var(--fd-primary-hover); }
+.fd-agent-trace button:disabled { opacity: .45; }
+.fd-agent-scope { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--fd-muted); margin-bottom: 4px; }
+.fd-agent .fd-agent-scope button { border: 0; background: transparent; padding: 0; font-size: 11px; color: var(--fd-agent); text-decoration: underline; text-underline-offset: 2px; }
+.fd-agent .fd-agent-scope button:hover:enabled { background: transparent; outline: none; opacity: 0.85; }
+.fd-agent-lightbox { position: fixed; inset: 0; z-index: 60; background: var(--fd-backdrop); display: flex; align-items: center; justify-content: center; padding: 28px; cursor: zoom-out; }
+.fd-agent-lightbox img { max-width: min(92vw, 1400px); max-height: 88vh; object-fit: contain; background: #fff; border: 1.5px solid var(--fd-border); border-radius: 8px; box-shadow: var(--fd-shadow); }
 .fd-agent-thinking { margin: 8px 0 10px; color: var(--fd-muted); font-size: 11px; }
 .fd-agent-thinking summary { display: flex; align-items: center; gap: 6px; }
 .fd-agent-thinking summary .fd-agent-small { margin-left: auto; }
@@ -75,11 +87,11 @@ body,
 .fd-agent summary { cursor: pointer; }
 .fd-agent-tools details { padding: 5px 0 0 10px; }
 .fd-agent-tools pre, .fd-agent-approval pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10px; max-height: 180px; overflow: auto; margin: 7px 0; }
-.fd-agent-approval { flex: none; max-height: 260px; overflow-y: auto; margin: 10px 14px; padding: 12px; border: 1.5px solid var(--fd-border); border-radius: 4px; background: var(--fd-surface); }
-.fd-agent-approval > strong { display: block; font-size: 13px; }
+.fd-agent-approval { flex: none; max-height: 260px; overflow-y: auto; margin: 10px 14px; padding: 12px; border: 1.5px solid var(--fd-border); border-left: 3.5px solid #e9a51a; border-radius: 4px; background: var(--fd-surface); }
+.fd-agent-approval > strong { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
 .fd-agent-approval > span { font-size: 11px; color: var(--fd-muted); }
 .fd-agent-approval > div { display: flex; justify-content: flex-end; gap: 9px; margin-top: 10px; }
-.fd-agent-error { color: #c44b3c; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.fd-agent-error { color: var(--fd-danger); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .fd-agent-alert { max-height: 110px; overflow: auto; flex: none; padding: 7px 20px; border-top: 1px dashed var(--fd-border); }
 .fd-agent-composer { padding: 13px 16px 18px; flex: none; border-top: 1px solid var(--fd-border); background: var(--fd-paper); }
 .fd-agent-composer textarea { width: 100%; resize: vertical; min-height: 70px; max-height: 160px; border: 0; background: var(--fd-surface); border-radius: 4px; padding: 9px; margin-top: 5px; line-height: 1.6; font-size: 12px; }
@@ -87,7 +99,7 @@ body,
 .fd-agent-actions { display: flex; gap: 10px; justify-content: space-between; align-items: center; padding-top: 8px; }
 .fd-agent-check { display: flex !important; flex-direction: row !important; align-items: center; gap: 6px; font-size: 11px; color: var(--fd-muted); }
 .fd-agent-check input { accent-color: #b49721; width: 13px !important; }
-.fd-agent .fd-agent-stop { border-color: #c44b3c; color: #c44b3c; }
+.fd-agent .fd-agent-stop { border-color: var(--fd-danger); color: var(--fd-danger); }
 .fd-agent-settings { overflow: auto; padding: 15px 20px 25px; border-top: 1px solid var(--fd-border); }
 .fd-agent-settings h3 { margin: 0 0 6px; font-size: 17px; }
 .fd-agent-settings > p { font-size: 11px; color: var(--fd-muted); margin: 0 0 17px; }
@@ -252,6 +264,7 @@ body {
 /* 自己的界面（右上角、横幅、弹窗、提示）共用一套颜色，跟着 Excalidraw 的深浅色切换。
    --fd-agent 和画布上 agent 画的东西是同一个蓝色。 */
 :root {
+  color-scheme: light;
   --fd-ink: #2b2a26;
   --fd-line: 1.5px;
   --fd-paper: #fffbe6;
@@ -276,6 +289,7 @@ body {
 }
 
 :root[data-fd-theme='dark'] {
+  color-scheme: dark;
   --fd-ink: #e9e2c8;
   --fd-paper: #181508;
   --fd-surface: #26241d;
@@ -597,12 +611,12 @@ body {
 /* ---------- agent 请求横幅：放在工具栏下方居中 ---------- */
 
 .fd-banner {
-  position: fixed;
-  top: calc(76px + var(--fd-titlebar-h));
+  position: absolute;
+  top: 76px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 10;
-  width: min(520px, calc(100vw - 32px));
+  width: min(520px, calc(100% - 32px));
   box-sizing: border-box;
   padding: 14px 16px;
   border-radius: 14px;
@@ -686,12 +700,12 @@ body {
 /* ---------- 顶部的等待提示和底部的短提示 ---------- */
 
 .fd-waiting {
-  position: fixed;
-  top: calc(76px + var(--fd-titlebar-h));
+  position: absolute;
+  top: 76px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 10;
-  max-width: calc(100vw - 32px);
+  max-width: calc(100% - 32px);
   box-sizing: border-box;
   display: flex;
   align-items: center;
@@ -703,6 +717,13 @@ body {
   box-shadow: var(--fd-shadow);
   font-size: 12px;
   color: var(--fd-text);
+}
+
+/* 用户正在落笔/编辑时 Agent 等待画图的轻提示：不拦截鼠标/触控笔，自动随松笔消失 */
+.fd-deferred-draw {
+  pointer-events: none;
+  bottom: 58px;
+  top: auto;
 }
 
 /* agent 正等着的时候，蓝点慢慢呼吸 */
@@ -746,7 +767,7 @@ body {
 }
 
 .fd-toast {
-  position: fixed;
+  position: absolute;
   bottom: 72px;
   left: 50%;
   transform: translateX(-50%);
@@ -759,7 +780,7 @@ body {
   font-size: 13px;
   border: 0;
   cursor: pointer;
-  max-width: calc(100vw - 32px);
+  max-width: calc(100% - 32px);
   box-shadow: var(--fd-shadow);
 }
 
@@ -793,11 +814,13 @@ body {
 /* ---------- 底部按作者筛选显示 ---------- */
 
 .fd-filter {
-  position: fixed;
+  position: absolute;
   bottom: 16px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 5;
+  max-width: calc(100% - 24px);
+  overflow-x: auto;
   display: flex;
   align-items: center;
   gap: 2px;

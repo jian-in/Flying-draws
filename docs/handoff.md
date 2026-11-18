@@ -1,6 +1,22 @@
 # 接手文档
 
-## 最新：内置 Fuxi Agent（2026-11-17）
+## 最新：多轮视觉演进墙、零门槛 CLI/免编译打包与架构白皮书（2026-11-18）
+
+围绕「对外 30 秒零门槛接入吸 Star」与「底层五大工程设计沉淀」完成三项升级（深度架构解析见 [architecture.md](architecture.md)，演示录制步骤见 [demo-playbook.md](demo-playbook.md)）：
+
+- **多轮视觉演进墙（`src/main/lineage.ts` + `agent.ts` + `App.tsx` + `AgentPanel.tsx`）**：
+  - `AgentRun` 与 `ImageSourceMeta` 记录演进血缘（`sourceImageRef`）与本轮修改过的短文件名摘要（`changedFiles`，从已完成的 `write_file` / `edit_file` / `apply_patch` 提取最多 4 项）。
+  - `shouldAutoPlaceResultImage()` 严格剔除 `canvas_read` / `canvas_list`（含 `mcp_*canvas_read*`）返回的画布自身截图，杜绝画中画自动插入死循环；仅 `render_page`、`browser_page` 等页面/产物截图参与自动上墙。
+  - `planImageLineage()` 按 `customData.flyingdraws.result === image.id` 幂等去重，自动定位父图（`sourceImageRef` 优先，其次同 `workItemId` 下最近上一轮图片）并在右侧 `parent.x + parent.w + 160` 排布，同步生成带改动文件标签的绑定箭头与顶部题注（如 `v2 · 1280×720`，均带 `author: 'agent', agent: AGENT_SEAT, seat: true, layer: 'final'` 兼容作者筛选）。`AgentPanel` 提供默认开启的「自动把页面结果图连入画布演进链」开关，手动「放到画布 ↗」同样走演进链排版。
+- **零门槛 CLI、多路径寻址与纯画布打包（`src/bridge/index.ts` + `package.json` + `scripts/package-desktop.mjs` + `.github/workflows/release.yml`）**：
+  - `out/bridge/index.js`（同时导出 `flying-draws` 与 `flying-draws-mcp` bin）在无参数或 `--mcp` 时 100% 保持纯净 `stdio` MCP 模式；传入 `setup [claude|cursor|codex|antigravity]`（或 `config`）、`doctor`、`--help`、`--version` 时执行轻量 CLI 配置向导与环境自检。
+  - `launchApp()` 按 `FLYINGDRAWS_APP` → 独立包同级 `Flying draws.exe` → 仓库 `dist/Flying-draws-win32-x64/Flying draws.exe` / `%LOCALAPPDATA%\Flying draws\Flying draws.exe` → 开发环境 `require('electron')` 依次寻址。
+  - 新增 `npm run package:canvas`（`node scripts/package-desktop.mjs --without-fuxi`），无私有 Fuxi 源码也能打出纯 MCP 外部画布桌面包；新增 `.github/workflows/release.yml` 自动跑 CI 并在 `v*` tag 构建 Windows Release 包。
+- **门面重写、架构白皮书与示例资产**：
+  - 重写根目录 `README.md`：明确「给编码 Agent 用的本地视觉演进画板与双向提议草稿纸」定位，首屏前置三大核心场景与 30 秒零门槛接入，内置 Fuxi 工作台收归进阶章节。
+  - 新增 [docs/architecture.md](architecture.md)（拆解双向提议 Diff、乐观并发指纹与 Rebase、两阶段手写分组与像素逆映射、Win32 DWM 伴随吸附、双通道隔离安全五大设计）、[docs/demo-playbook.md](demo-playbook.md)（两支 15s GIF 分镜录制手册）与标准示例画板 `examples/architecture-sketch.excalidraw`。
+
+## 内置 Fuxi Agent（2026-11-17）
 
 产品已转向以画布为主界面的独立 Agent；原 MCP 画布功能保留。实现契约与分工见 [fuxi-host-plan.md](fuxi-host-plan.md)。下方旧里程碑描述原 MCP 阶段，不再代表全部现状。
 
@@ -67,10 +83,15 @@ Flying draws：本地桌面画布（Electron + Excalidraw），通过 MCP 接任
 ```bash
 npm install          # 会顺带下载 Electron（postinstall）并拷贝字体
 npm run build        # 应用打包到 out/，桥接编译到 out/bridge/
+npm run build:bridge # 仅编译 MCP 桥接与 CLI（out/bridge/index.js）
 npm run dev          # 开发模式启动画布
-npm test             # 语义层单元测试（node --test，直接跑 .ts）
+npm test             # 单元测试（node --test "test/*.test.ts"）
 npm run typecheck
-npm run inspect      # 打印 ~/.flyingdraws/boards/default.excalidraw 的结构
+npm run inspect      # 打印画板结构（可跟路径，如 node scripts/inspect.mjs examples/architecture-sketch.excalidraw）
+npm run package:canvas   # 免 Fuxi 内核打包纯 MCP 画布 Windows 独立目录包
+npm run package:desktop  # 打包带内置 Fuxi 内核的完整 Windows 独立目录包
+node out/bridge/index.js setup    # 输出 Claude Code / Cursor / Codex / Antigravity 接入配置
+node out/bridge/index.js doctor   # 环境、构建产物与桌面端寻址自检
 ```
 
 端到端测试（扮演 agent 调 MCP，用 CDP 扮演用户点按钮）：
@@ -93,21 +114,26 @@ npm run e2e:draw     # 自己拉起一个隔离实例，画板在 out/e2e-home�
 ## 代码地图
 
 ```
-src/main/index.ts      主进程入口：窗口、多画板会话切换/重命名/删除/版本号（含 N/T/S 编号对照）、给页面的 RPC、本地服务的路由
+src/main/index.ts      主进程入口：窗口、多画板会话切换/重命名/删除/版本号（含 N/T/S/I 编号对照）、给页面的 RPC、本地服务的路由
 src/main/boards.ts     画板标识校验、文件名映射、标题归一化/更新、回退画板选择、空画板模板与元数据解析（纯函数）
 src/main/geometry.ts   纯几何工具：图形轮廓出线点 exitPoint()（主进程排版与页面改节点形状/尺寸共用）
-src/main/semantic.ts   语义层（纯函数，不依赖 Electron）：buildGraph() 出结构（含 N/T/S 编号与 agent 署名，过滤提议标记框），summarize() 出中文描述
-src/main/ops.ts        绘图指令 → 绘图计划（纯函数）：校验 ops、编号换算（N/T/S）、定好元素位置大小与样式、toProposalPlan() 把改动转为标记框预览
+src/main/semantic.ts   语义层（纯函数）：buildGraph() 出结构（含 N/T/S/I 编号、标注圈预判与原图像素逆映射），summarize() 出中文描述
+src/main/imageSize.ts  零依赖二进制图像头像素尺寸解析（PNG / GIF / WebP / JPEG / SVG）
+src/main/ops.ts        绘图指令 → 绘图计划（纯函数）：校验 ops、编号换算、trace_image 照图还原、toProposalPlan() 预览标记框转换
 src/main/diff.ts       提议的底稿和改动对比（纯函数）：用户在提议上改了什么（跳过 role: 'marker' 标记框）
-src/main/daemon.ts     本地 HTTP 服务：127.0.0.1 随机端口 + token，信息写 ~/.flyingdraws/daemon.json
-src/main/requests.ts   请求队列：agent 请求作画、提议（含 pending 改动）、用户发送/取消、长轮询等待、主动发送的收件箱（可指定目标席位 `to`）与席位间递画笔交接（含重启恢复与批量清理）、剪贴板取画指令 `pickupHint()`
-src/main/seats.ts      在线席位登记表 SeatRegistry（纯逻辑，不依赖 Electron）：跟踪连着画布的桥接或调用方、分配 6 色色板、离场或超时后清理
-src/preload/index.ts   页面能调用的全部接口（含画板新建/切换/重命名/删除/列表，以及可清理的监听器）
-src/renderer/src/App.tsx  画布、标题栏里的画板工具、右上角「发给 agent」、底部动态席位/作者筛选标签、请求横幅、交接提示、"发给 agent"、响应主进程 RPC（snapshot / applyPlan / loadScene / syncBoards）
-src/bridge/index.ts    MCP 桥接（stdio）：10 个工具，支持 as 席位声明并自动上报客户端名字，转发给本地服务；应用没开时自动拉起
-test/                  单元测试（boards / diff / ops / requests / seats / semantic）；test/fixtures/flow.excalidraw 是测试用画板
-scripts/e2e.mjs        M1 端到端测试（注意其工具列表断言仍停在 M1 的 4 个工具）
-scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
+src/main/lineage.ts    多轮视觉演进墙排版（纯函数）：防 canvas_read 递归过滤、幂等防重、横向 v1→v2→v3 落位与改动文件连线规划
+src/main/dock.ts       Win32 窗口伴随吸附（koffi FFI + DWM 跨 DPI 边框校准 + SetWinEventHook）；几何计算在 dockGeometry.ts
+src/main/daemon.ts     本地 HTTP 服务：127.0.0.1 随机端口 + token + Origin/Host 防重绑定，信息写 ~/.flyingdraws/daemon.json
+src/main/requests.ts   请求队列：agent 请求作画、提议（含 pending 改动）、用户发送/取消、长轮询等待、收件箱与席位递画笔交接
+src/main/seats.ts      在线席位登记表 SeatRegistry（纯逻辑）：跟踪桥接或调用方、分配 6 色色板、离场或超时后清理
+src/preload/index.ts   页面能调用的全部接口（含画板管理、请求与内置 Agent 业务接口）
+src/renderer/src/App.tsx  画布、标题栏画板工具、底部动态席位/作者筛选、请求横幅、图像插入与演进连线落地、主进程 RPC 响应
+src/renderer/src/AgentPanel.tsx  内置 Agent 面板：模型设置、任务历史、审批、自动演进链开关与手动放到画布
+src/bridge/index.ts    MCP 桥接（stdio 10 个工具）+ 零门槛 CLI（setup / doctor / --version / --help）+ 多路径桌面端自动寻址拉起
+examples/architecture-sketch.excalidraw  开箱体验用的标准 Excalidraw 示例画板
+docs/architecture.md   五大核心工程设计白皮书；docs/demo-playbook.md 为 15s GIF 分镜录制手册
+test/                  单元测试（boards / cli / daemon / diff / dock / imageSize / lineage / ops / pending / requests / seats / semantic / traceImage 等）
+scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试；scripts/e2e-agent.mjs 为内置 Agent 端到端测试
 ```
 
 读的数据流：agent → 桥接（stdio MCP）→ 本地服务（HTTP）→ 主进程 →（RPC）→ 页面取快照 → 主进程算语义 → 原路返回。
@@ -175,7 +201,7 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 **手绘笔画分组（已做）**
 - 挨得近的笔画并成一组，摘要里写成"一组手写或涂鸦（N 笔），在某节点右上方，内容请看附图"，有分组时自动附图。结构在 `graph.strokeGroups`，`graph.strokes` 只剩没被分组的单笔。
 - 判断"挨得近"用的是两笔采样点之间的最短距离，阈值取较小那笔的对角线长度（夹在 30 到 150 之间），见 `semantic.ts` 的 `GROUP_GAP_*`。阈值只按用户现有画板校准过一次，换一种字迹可能要调。
-- 还没做：一个圈圈住一组手写时，不会说"圈住了那组手写"；多笔画成的箭头也会被当成一组涂鸦。
+- **已做**：一个圈圈住一组手写时，预判标注圈不参与并查集吞并，摘要输出「圈住了 S1（一组手写，N 笔）」；反向（往左/往上）起笔的手绘圈按实际 `points` 算外接框；图上的圈选/框选/箭头指向会自动换算成原图像素坐标。还没做：多笔画成的箭头仍会被当成一组涂鸦。
 
 **排版现在怎么做的（M2-b）**
 - 一批指令里没指定坐标的新节点交给 dagre（`@dagrejs/dagre` 3.1.3）排成一块，`direction` 是 `right`（默认）或 `down`。**已有元素一律不动。**
@@ -189,12 +215,12 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
 - 节点编号（N1、N2……）按阅读顺序排，排版一变编号就可能变。测试和 agent 都要用 `canvas_draw` 返回的对照表（`open = N1`），不要假设顺序。
 
 **M2-a、M2-b 留下的缺口**
-- 连线绕行只加一个拐点，障碍很多、很密时可能绕不开，会退回直线。连线上的文字、连线本身不算障碍。
+- 连线绕行优先加一个中垂线拐点，密集多障碍挡死单拐点时退回 `detourPath()` 双拐点平行走廊绕行；仍绕不开才退回直线。连线上的文字、连线本身不算障碍。
 - 找空位只看元素的外接框：用户画的一个大圈、一条长斜线会把它框住的整块区域都算成被占。
 - 没有"移动"指令。改字后（`update_node` / `update_edge`）不会对整块重新排版：连线上的字太长时可能盖住箭头，节点只会长高不会变宽（但 `set_style` 支持直接指定宽高和改形状）。
 - 冲突判断靠主进程内存里的版本记录（最近 60 个版本）。应用重启后查不到旧版本，agent 引用已有元素会被要求重新读一次。
-- "被动过"的判断偏严：元素的 `version` 或它上面文字的 `version` 变了就算。用户拖动一个节点时，连着它的箭头也会变，所以 agent 这时去改那条箭头上的字也会冲突。
-- 用户正在画一笔时，页面最多等 8 秒，超时就报错让 agent 重试；还没有 12.4 节说的"agent 有内容要画"提示。
+- 已修复绑定箭头误判冲突：`elementFingerprints()` 对绑定了节点的箭头按连接关系、折点数、样式和标签文本计算指纹，用户拖动或缩放节点连带拉伸箭头时不再误判连线冲突；真正改了连线文字/样式或挪动节点本身仍会报冲突。
+- 用户正在画一笔或编辑文字时，页面最多等 10 秒，超过 400ms 会在画布底部显示非侵入式提示「Agent 有内容要画，松笔/结束文字编辑后更新」，松笔即自动消失。
 - 改动对比只在接受时做。拒绝时提议已经删掉，agent 只拿到附言。
 - 改动对比按"提议画上去之后"算：两个提议同时挂着时，用户这期间自己加的东西会在两个提议的结果里都出现一次。
 - 端到端测试里"用户改提议"是直接改画布数据模拟的，不是真的鼠标拖动。真拖动时连着的箭头会跟着走，模拟的不会（截图 `propose-edited.png` 里那条箭头悬空就是这个原因）。
@@ -209,8 +235,8 @@ scripts/e2e-draw.mjs   M2 + 多画板完整端到端测试
   2. 待做：给 Claude Code 做 channels 适配，让桥接把「某画板更新了，请去读」推进会话。channels 是预览功能，动手前先查文档确认现状。画布到桥接这一段用长轮询（桥接后台挂 `GET /events?seat=…&after=<游标>`），不用 webhook；事件只当门铃，不带画布内容，带递增 `id` 供断线续传。事件通道要单独用一条不复用的连接（见踩坑第 2 条）。
   3. Codex 和 Antigravity 没有公开的会话注入入口，停在第 1 步观望。
 - **画布没法主动叫醒 agent**（MCP 是 agent 来问工具）。用户点了"发给 agent"而 agent 没在等时，画只能放在收件箱里（现已持久化到 `pending.json`，重启不丢失），要用户在聊天里说一声。画布上现在会明说这一点：发送前提示"要在聊天里说一声"，发出后显示"已发出，agent 还没来取"，被取走时提示"agent 已经取走你的画"。`canvas_read` 和不带 `request_id` 的 `canvas_wait` 都会取走收件箱里的画和附言。想真正做到"发了就到"，得用 MCP 的资源订阅通知（design.md 第 7 节末尾），而且客户端要支持
-- 桥接靠 `require('electron')` 找可执行文件，Electron 现在是 devDependency；做成可分发的 npm 包时要重新设计启动方式
+- **桥接桌面端寻址链已升级**：按 `FLYINGDRAWS_APP` 环境变量 → 独立包同级 `Flying draws.exe` → 仓库 `dist/Flying-draws-win32-x64/Flying draws.exe` 或 `%LOCALAPPDATA%\Flying draws\Flying draws.exe` → 开发环境 `require('electron')` 依次查找，缺 Electron 时给出清晰指引。
 - **多画板当前限制**：目前仍是单窗口渲染，agent 在 `canvas_read`/`draw`/`propose`/`request` 传入非当前 `board` 时会把窗口切换到该画板（且要求该画板已存在，新画板需先通过 `canvas_open` 或界面创建）；支持重命名与删除，但重命名非当前激活画板后窗口不会切过去
 - **升级提示**：如果本机之前已经开着旧版 Flying draws 窗口，重新 `npm run build` 后需要重启一次画布应用窗口（或在宿主里重连 MCP），新加的工具和接口才会生效
 - 摘要只有中文
-- `npm run e2e:draw` 偶尔会在「UI 重命名画板」「MCP canvas_rename」两项上失败（四次里出现过一次，重跑即过），像是时序问题，还没查
+- `npm run e2e:draw` 原画板重命名偶发时序问题已修复（测试实例跳过系统窗口吸附以防 `resize` 误关菜单，脚本改用 `until` 状态轮询替代固定 `sleep`）

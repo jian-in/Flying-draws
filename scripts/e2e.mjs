@@ -82,14 +82,24 @@ const call = (name, args = {}) => client.callTool({ name, arguments: args }, und
 const textOf = (res) => res.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n')
 
 const tools = (await client.listTools()).tools.map((t) => t.name).sort()
-// 只断言 M1 的这四个工具在（后续里程碑还会加），和 e2e-draw.mjs 一样用子集判断
-const expectedTools = ['canvas_open', 'canvas_read', 'canvas_request', 'canvas_wait']
+const expectedTools = [
+  'canvas_open',
+  'canvas_list',
+  'canvas_rename',
+  'canvas_delete',
+  'canvas_read',
+  'canvas_request',
+  'canvas_wait',
+  'canvas_pass',
+  'canvas_propose',
+  'canvas_draw'
+]
 check(expectedTools.every((n) => tools.includes(n)), `工具列表（${tools.length} 个）：${tools.join(', ')}`)
 
-const open = await call('canvas_open')
+const open = await call('canvas_open', { board: 'default' })
 check(!open.isError && /is open/.test(textOf(open)), 'canvas_open')
 
-const read = await call('canvas_read', { image: 'always' })
+const read = await call('canvas_read', { board: 'default', image: 'always' })
 check(!read.isError && /^画板「default」v\d+/.test(textOf(read)), 'canvas_read 返回文字描述')
 const img = read.content.find((c) => c.type === 'image')
 check(Boolean(img), 'canvas_read image=always 附带截图')
