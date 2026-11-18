@@ -129,3 +129,42 @@ test('trace_image 提议里的普通线条按线条识别，删除或移动不�
   assert.deepEqual(diffProposal(b, [{ ...tracedLine, isDeleted: true }]), ['删掉了线条'])
   assert.deepEqual(diffProposal(b, [{ ...tracedLine, x: 160, y: 100 }]), ['把线条往右挪了'])
 })
+
+test('提议里的 move-ghost 落点预览框及内部文字不进入底稿，接受清理后不误报删除', () => {
+  const ghostBox: DiffElement = {
+    id: 'gh_1',
+    type: 'rectangle',
+    x: 240,
+    y: 0,
+    width: 100,
+    height: 60,
+    customData: { flyingdraws: { author: 'agent', layer: 'proposal', proposal: 'p1', role: 'move-ghost' } }
+  }
+  const ghostLabel: DiffElement = {
+    id: 'gh_1_t',
+    type: 'text',
+    x: 250,
+    y: 20,
+    width: 80,
+    height: 20,
+    text: '「入口」移到这里',
+    containerId: 'gh_1',
+    customData: { flyingdraws: { author: 'agent', layer: 'proposal', proposal: 'p1', role: 'move-ghost' } }
+  }
+  const b = captureBaseline([...scene(), ghostBox, ghostLabel], 'p1')
+  assert.equal(b.items.length, 4)
+  const accepted = [
+    ...scene().map((el) =>
+      el.id === 'u1'
+        ? { ...el, x: 240, y: 0 }
+        : el.id === 'u1t'
+          ? { ...el, x: 250, y: 10 }
+          : el.customData
+            ? { ...el, customData: { flyingdraws: { author: 'agent', layer: 'final' } } }
+            : el
+    ),
+    { ...ghostBox, isDeleted: true },
+    { ...ghostLabel, isDeleted: true }
+  ]
+  assert.deepEqual(diffProposal(b, accepted), [])
+})

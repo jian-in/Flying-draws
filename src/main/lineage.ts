@@ -363,7 +363,11 @@ function placeInView(
  */
 export function planImageLineage(input: PlanImageLineageInput): ImageLineagePlan {
   const { elements, image, view } = input
-  const live = elements.filter((el) => !el.isDeleted && el.customData?.flyingdraws?.role !== 'marker')
+  const live = elements.filter((el) => {
+    if (el.isDeleted) return false
+    const role = el.customData?.flyingdraws?.role
+    return role !== 'marker' && role !== 'move-ghost'
+  })
   const existing = live.find((el) => el.type === 'image' && el.customData?.flyingdraws?.result === image.id)
   if (existing) {
     const box = elementBounds(existing)

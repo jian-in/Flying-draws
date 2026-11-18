@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { bboxOf, buildGraph, summarize, type SceneElement, type SceneFile } from './semantic'
 import {
   OpsError,
@@ -171,7 +171,7 @@ if (process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']) {
 // ---------- 多画板会话状态 ----------
 
 interface VersionRecord {
-  nodes: { id: string; ref: string; label: string | null }[]
+  nodes: { id: string; ref: string; refs?: string[]; label: string | null }[]
   fingerprints: Map<string, string> // 元素 id → 指纹
 }
 const HISTORY_LIMIT = 60
@@ -180,7 +180,7 @@ interface BoardSession {
   id: string
   title: string | null
   version: number
-  lastElementsKey: number | null
+  lastElementsKey: string | null
   hub: RequestHub
   history: Map<number, VersionRecord>
   seats: Map<string, string>
@@ -246,7 +246,7 @@ function syncBoardSeats(boardId: string, elements: readonly SceneElement[]): voi
   for (const el of elements) {
     if (el.isDeleted) continue
     const mark = el.customData?.flyingdraws
-    if (mark?.role === 'marker' || mark?.author !== 'agent') continue
+    if (mark?.role === 'marker' || mark?.role === 'move-ghost' || mark?.author !== 'agent') continue
     if (typeof mark.agent === 'string' && mark.agent) {
       drawn.add(mark.agent)
       if (!session.seats.has(mark.agent)) {
@@ -294,11 +294,14 @@ const TITLEBAR_COLORS = {
 
 // ---------- 画板读写与版本号 ----------
 
-// 和渲染进程用同一个算法：元素的 version 之和加元素个数，变了就说明画面内容变了
-function elementsKey(elements: { version?: number }[]): number {
-  let sum = 0
-  for (const el of elements) sum += el.version ?? 0
-  return sum + elements.length
+// 对元素序列的 (id, version, versionNonce, isDeleted) 做有序摘要，防止等和换元素撞键漏升版本号
+function elementsKey(elements: { id?: string; version?: number; versionNonce?: number; isDeleted?: boolean }[]): string {
+  const hash = createHash('sha1')
+  hash.update(`${elements.length}:`)
+  for (const el of elements) {
+    hash.update(`${el.id ?? ''}\0${el.version ?? 0}\0${el.versionNonce ?? ''}\0${el.isDeleted ? 1 : 0}\n`)
+  }
+  return hash.digest('hex')
 }
 
 async function loadBoard(id = currentBoardId): Promise<{ board: string; title: string | null; version: number; json: string | null; path: string }> {
@@ -835,7 +838,7 @@ function remember(boardId: string, ver: number, elements: readonly VersionedElem
   const items = [
     ...graph.nodes.map(({ id, ref, label }) => ({ id, ref, label })),
     ...graph.notes.map(({ id, ref, text }) => ({ id, ref, label: text })),
-    ...graph.strokeGroups.filter((g) => g.refs.length > 0).map((g) => ({ id: g.id, ref: g.refs[0], label: null })),
+    ...graph.strokeGroups.filter((g) => g.refs.length > 0).map((g) => ({ id: g.id, ref: g.refs[0], refs: [...g.refs], label: null })),
     ...graph.strokes.map((s) => ({ id: s.id, ref: s.ref, label: null })),
     ...graph.images.map((img) => ({ id: img.id, ref: img.ref, label: null }))
   ]
@@ -947,66 +950,104 @@ async function drawOps(
   const fail = (status: 'invalid' | 'conflict', message: string) => ({ ok: false, boardId, result: { status, error: message, ...current() } })
 
   let ops = (Array.isArray(body.ops) ? body.ops : []) as DrawOp[]
+  const MOVE_ALLOWED_KEYS = new Set(['op', 'id', 'x', 'y', 'dx', 'dy', 'near', 'side', 'gap'])
+  for (let i = 0; i < ops.length; i++) {
+    const rawOp = ops[i] as unknown as Record<string, unknown> | null
+    if (rawOp && typeof rawOp === 'object' && rawOp.op === 'move') {
+      const unknown = Object.keys(rawOp).filter((k) => !MOVE_ALLOWED_KEYS.has(k))
+      if (unknown.length) return fail('invalid', `ops[${i}]: unknown field(s) on move: ${unknown.join(', ')}`)
+    }
+  }
 
   // agent 是基于哪个版本下的指令。和当前版本不一样时，先把指令里的旧编号换算成现在的。
-  const base = Number(body.base_version)
-  const record = base !== ver ? session.history.get(base) : undefined
+  const rawBase = body.base_version
+  if (rawBase !== undefined && rawBase !== null) {
+    if (typeof rawBase !== 'number' || !Number.isInteger(rawBase) || rawBase < 0) {
+      return fail('invalid', 'base_version must be a non-negative integer')
+    }
+  }
+  const base = typeof rawBase === 'number' ? rawBase : NaN
+  const record = Number.isFinite(base) && base !== ver ? session.history.get(base) : undefined
   const nameAt = (id: string) => {
-    const label = record?.nodes.find((n) => n.id === id)?.label
-    return label ? `${id} ("${label}")` : id
+    const trimmed = id.trim()
+    const label = record?.nodes.find((n) => n.id === trimmed)?.label
+    return label ? `${trimmed} ("${label}")` : trimmed
   }
   if (record) {
     const rebased = rebaseOps(ops, record.nodes, graph)
     if (rebased.gone.length) {
-      return fail('conflict', `${rebased.gone.map(nameAt).join(', ')} ${rebased.gone.length > 1 ? 'were' : 'was'} deleted after version ${base}.`)
+      const verb = rebased.gone.length > 1 ? 'were' : 'was'
+      // 手绘组（S1）不一定整组被删：用户删掉其中一笔后，它也不再是读到时的那一组了
+      const strokeGroupChanged = rebased.gone.some((id) => /^S\d+$/.test(id.trim()))
+      return fail(
+        'conflict',
+        strokeGroupChanged
+          ? `${rebased.gone.map(nameAt).join(', ')} ${verb} deleted or changed after version ${base} (a hand-drawn group may have lost or gained strokes). Read the canvas again and use the new ids.`
+          : `${rebased.gone.map(nameAt).join(', ')} ${verb} deleted after version ${base}.`
+      )
     }
     ops = rebased.ops
   }
 
   let plan: DrawPlan
   try {
-    plan = planOps(ops, graph, newElementId, { direction: body.direction === 'down' ? 'down' : 'right', view: snap.view ?? null })
+    plan = planOps(ops, graph, newElementId, { direction: body.direction === 'down' ? 'down' : 'right', view: snap.view ?? null, elements })
   } catch (err) {
     if (err instanceof OpsError) return fail('invalid', err.message)
     throw err
   }
 
-  // 只新增、不引用已有节点的指令在任何版本上都能执行。引用了已有节点时：
-  if (plan.existingRefs.length && base !== ver) {
+  const refNameEn = (ref: string): string => {
+    const node = graph.nodes.find((n) => n.ref === ref)
+    if (node) return `${node.id}${node.label ? ` ("${node.label}")` : ''}`
+    const edge = graph.edges.find((e) => e.ref === ref)
+    if (edge) return `arrow ${edge.from ?? '?'}→${edge.to ?? '?'}${edge.label ? ` ("${edge.label}")` : ''}`
+    const note = graph.notes.find((n) => n.ref === ref)
+    if (note) return `${note.id} ("${note.text}")`
+    const sg = graph.strokeGroups.find((g) => g.refs.includes(ref))
+    if (sg) return sg.id
+    const st = graph.strokes.find((s) => s.ref === ref)
+    if (st) return st.id
+    const img = graph.images.find((i) => i.ref === ref)
+    if (img) return img.id
+    return 'an element'
+  }
+
+  // 只新增、或只用稳定 id 做只读 trace_image 的指令在任何版本上都能执行；引用了短编号或改动已有元素时必须过版本与指纹检查：
+  if ((plan.existingRefs.length || plan.modifiedRefs.length) && base !== ver) {
     if (!record) {
-      // 查不到 agent 读的那个版本，编号没法换算
+      // 查不到 agent 读的那个版本，编号与改动基线没法核实
       return fail(
         'conflict',
         Number.isFinite(base)
           ? `The canvas has no record of version ${base} (the app may have restarted, or that read is too old), so node ids like N1 cannot be trusted.`
-          : 'These ops refer to nodes already on the canvas, so base_version is required.'
+          : 'These ops refer to or modify elements already on the canvas, so base_version is required.'
       )
     }
-    // 引用的节点只要还在就行；但要改动或删除的元素，从那个版本到现在不能被别人动过（design.md 12.3）
+    // 引用的节点只要还在就行；但要改动、移动或删除的元素，从那个版本到现在不能被别人动过（design.md 12.3）
     const now = elementFingerprints(elements)
     const touched = plan.modifiedRefs.filter((ref) => record.fingerprints.get(ref) !== now.get(ref))
     if (touched.length) {
-      const names = [
-        ...new Set(
-          touched.map((ref) => {
-            const node = graph.nodes.find((n) => n.ref === ref)
-            if (node) return `${node.id}${node.label ? ` ("${node.label}")` : ''}`
-            const edge = graph.edges.find((e) => e.ref === ref)
-            if (edge) return `arrow ${edge.from ?? '?'}→${edge.to ?? '?'}${edge.label ? ` ("${edge.label}")` : ''}`
-            const note = graph.notes.find((n) => n.ref === ref)
-            if (note) return `${note.id} ("${note.text}")`
-            const sg = graph.strokeGroups.find((g) => g.refs.includes(ref))
-            if (sg) return sg.id
-            const st = graph.strokes.find((s) => s.ref === ref)
-            if (st) return st.id
-            return 'an arrow'
-          })
-        )
-      ]
+      const names = [...new Set(touched.map(refNameEn))]
       return fail('conflict', `${names.join(', ')} ${names.length > 1 ? 'were' : 'was'} changed by someone else after version ${base}.`)
     }
   }
 
+  // 防止同一已有元素同时挂在另一个尚未表态的提议改动列表里（或被直接 draw 绕过待决提议）
+  if (plan.modifiedRefs.length) {
+    const lockedByPending = new Set<string>()
+    for (const p of session.hub.state().pending) {
+      const pc = p.pending as PendingChanges | null | undefined
+      for (const m of pc?.markers ?? []) for (const t of m.targets) lockedByPending.add(t)
+    }
+    const overlapping = plan.modifiedRefs.filter((ref) => lockedByPending.has(ref))
+    if (overlapping.length) {
+      const names = [...new Set(overlapping.map(refNameEn))]
+      return fail('conflict', `${names.join(', ')} ${names.length > 1 ? 'are' : 'is'} already part of an unanswered proposal on this board.`)
+    }
+  }
+
+  const plannedMoves = plan.moves
   let pending: PendingChanges | null = null
   if (proposalId) {
     const elById = new Map(elements.filter((el) => !el.isDeleted).map((el) => [el.id, el]))
@@ -1026,6 +1067,8 @@ async function drawOps(
       if (sg) return `手绘 ${sg.id}`
       const st = graph.strokes.find((s) => s.ref === first)
       if (st) return `手绘 ${st.id}`
+      const img = graph.images.find((i) => i.ref === first)
+      if (img) return `图片 ${img.id}`
       return '元素'
     }
     const converted = toProposalPlan(plan, { box, name }, newElementId)
@@ -1046,6 +1089,29 @@ async function drawOps(
     const node = after.nodes.find((x) => x.ref === n.elementId)
     if (node) nodeIds[n.key] = node.id
   }
+  const moved = plan.moves.map((m) => {
+    const node = after.nodes.find((x) => x.ref === m.targetKey)
+    const note = !node ? after.notes.find((x) => x.ref === m.targetKey) : undefined
+    const sg = !node && !note ? after.strokeGroups.find((x) => x.refs.includes(m.targetKey)) : undefined
+    const st = !node && !note && !sg ? after.strokes.find((x) => x.ref === m.targetKey) : undefined
+    const img = !node && !note && !sg && !st ? after.images.find((x) => x.ref === m.targetKey) : undefined
+    const found = node ?? note ?? sg ?? st ?? img
+    return {
+      id: m.id,
+      now_id: found?.id ?? null,
+      bbox: found?.bbox ?? m.toBbox,
+      ...(m.adjusted ? { adjusted: true } : {}),
+      ...(m.overlaps?.length ? { overlaps: m.overlaps } : {})
+    }
+  })
+  const proposedMoves = proposalId
+    ? plannedMoves.map((m) => ({
+        id: m.id,
+        bbox: m.toBbox,
+        ...(m.adjusted ? { adjusted: true } : {}),
+        ...(m.overlaps?.length ? { overlaps: m.overlaps } : {})
+      }))
+    : []
   return {
     ok: true,
     boardId,
@@ -1056,10 +1122,13 @@ async function drawOps(
       changed: {
         updated: plan.updates.filter((u) => !u.relayout).length + plan.textEdits.length,
         styled: plan.styles.length,
+        moved: plan.moves.length,
         deleted: plan.deletes.length,
         proposed: plan.markers.length
       },
       node_ids: nodeIds,
+      ...(moved.length ? { moved } : {}),
+      ...(proposedMoves.length ? { proposed_moves: proposedMoves } : {}),
       ...describe(applied.sceneJson, newVer, { format: 'summary', image: 'never' }, null, boardId, viewer)
     }
   }

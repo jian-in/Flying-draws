@@ -64,7 +64,8 @@ export function captureBaseline(elements: readonly DiffElement[], proposalId: st
   const names: Record<string, string> = {}
   for (const el of live) {
     if (el.customData?.flyingdraws?.proposal !== proposalId) continue
-    if (el.customData?.flyingdraws?.role === 'marker') continue // 标记框是改动预览，不算提议里的新元素
+    const role = el.customData?.flyingdraws?.role
+    if (role === 'marker' || role === 'move-ghost') continue // 标记框和移动落点框是改动预览，不算提议里的新元素
     if (el.type === 'text' && el.containerId) continue // 绑在容器上的文字算容器的标签，不单独记
     const kind: BaselineItem['kind'] =
       el.type === 'arrow' ? 'edge' : el.type === 'line' ? 'line' : el.type === 'text' ? 'text' : 'node'

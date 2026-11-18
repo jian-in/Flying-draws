@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGraph, summarize, type SceneElement } from '../src/main/semantic.ts'
-import { detourPath, detourPoint, elementFingerprints, estimateTextWidth, exitPoint, OpsError, placeBlock, planOps, rebaseOps, toProposalPlan, type DrawOp, type FingerprintElement } from '../src/main/ops.ts'
+import { detourPath, detourPoint, elementFingerprints, estimateTextWidth, exitPoint, OpsError, placeBeside, placeBlock, planOps, rebaseOps, toProposalPlan, type DrawOp, type FingerprintElement, type MoveSide } from '../src/main/ops.ts'
 
 const ids = () => {
   let n = 0
@@ -642,4 +642,415 @@ test('elementFingerprints：拖动节点连带拉伸绑定箭头时不误报箭�
     { ...before[3], text: '拒绝', version: 2 }
   ]
   assert.notEqual(fp0.get('e1'), elementFingerprints(editedArrowLabel).get('e1'))
+})
+
+test('elementFingerprints 忽略提议挂接抬升的版本号，并识别几何、标签、样式和图片内容变化', () => {
+  const node: FingerprintElement = { ...existing[0], version: 3, strokeColor: '#222222', backgroundColor: 'transparent' }
+  const label: FingerprintElement = { id: 'label', type: 'text', x: 10, y: 15, width: 80, height: 25, text: '入口', fontSize: 20, containerId: node.id }
+  const stroke: FingerprintElement = { id: 'stroke', type: 'freedraw', x: 0, y: 80, width: 100, height: 40, points: [[0, 0], [50, 30], [100, 40]] }
+  const image: FingerprintElement = { id: 'image', type: 'image', x: 100, y: 80, width: 100, height: 40, fileId: 'file1' }
+  const elements = [node, label, stroke, image]
+  const before = elementFingerprints(elements)
+  const attached = { ...node, version: 4, boundElements: [{ id: 'draft-arrow', type: 'arrow' }] }
+  const rejected = { ...node, version: 5, boundElements: [] }
+  for (const changed of [attached, rejected]) {
+    assert.deepEqual(elementFingerprints([changed, { ...label, version: 7 }, stroke, image]), before)
+  }
+  const contentChanges: FingerprintElement[] = [
+    { ...node, x: 30 }, { ...node, width: 160 }, { ...node, angle: Math.PI / 2 },
+    { ...node, backgroundColor: '#ffeeaa', fillStyle: 'solid' }, { ...node, strokeWidth: 3 },
+    { ...label, text: '登录' }, { ...label, strokeColor: '#eeeeee' }, { ...label, fontSize: 24 },
+    { ...stroke, points: [[0, 0], [50, 10], [100, 40]] }, { ...image, fileId: 'file2' }
+  ]
+  for (const changed of contentChanges) {
+    const after = elementFingerprints(elements.map((el) => el.id === changed.id ? changed : el))
+    assert.notEqual(after.get(changed.id), before.get(changed.id))
+    if (changed.id === label.id) assert.notEqual(after.get(node.id), before.get(node.id))
+  }
+})
+
+test('move：绝对坐标和单轴相对位移保留小数，短号与稳定 id 分别登记', () => {
+  const plan = planOps([
+    { op: 'move', id: 'N1', x: -30.5, y: 15 },
+    { op: 'move', id: 'rb', dy: 60.25 }
+  ], buildGraph(existing), ids())
+  assert.deepEqual(plan.moves.map(({ targetKey, fromBbox, toBbox, dx, dy }) => ({ targetKey, fromBbox, toBbox, dx, dy })), [
+    { targetKey: 'ra', fromBbox: box(0, 0, 100, 60), toBbox: box(-30.5, 15, 100, 60), dx: -30.5, dy: 15 },
+    { targetKey: 'rb', fromBbox: box(300, 0, 100, 60), toBbox: box(300, 60.25, 100, 60), dx: 0, dy: 60.25 }
+  ])
+  assert.deepEqual(plan.existingRefs, ['ra'])
+  assert.deepEqual(plan.stableRefs, ['rb'])
+  assert.deepEqual(plan.modifiedRefs, ['ra', 'rb'])
+  assert.deepEqual(plan.targetGroups, [['ra'], ['rb']])
+  assert.deepEqual(plan.moves[0].toTopLeft, { x: -30.5, y: 15 })
+  assert.equal(Object.hasOwn(plan.moves[1], 'toTopLeft'), false)
+})
+
+test('move：near 的四个方向、默认位置和按顺序读取已移动的锚点', () => {
+  const graph = buildGraph(existing)
+  const expected: Record<MoveSide, [number, number]> = { right: [410, 0], left: [190, 0], below: [300, 70], above: [300, -70] }
+  for (const [side, [x, y]] of Object.entries(expected) as [MoveSide, [number, number]][]) {
+    const plan = planOps([{ op: 'move', id: 'N1', near: 'rb', side, gap: 10 }], graph, ids())
+    assert.deepEqual(plan.moves[0].toBbox, box(x, y, 100, 60), side)
+    assert.deepEqual(plan.moves[0].toTopLeft, { x, y }, side)
+    assert.deepEqual(plan.stableRefs, ['rb'])
+    assert.deepEqual(plan.modifiedRefs, ['ra'])
+  }
+  const linked = planOps([
+    { op: 'move', id: 'N2', dx: 100, dy: 50 },
+    { op: 'move', id: 'N1', near: 'N2' }
+  ], graph, ids())
+  assert.deepEqual(linked.moves[1].toBbox, box(540, 50, 100, 60))
+})
+
+test('move：拒绝缺失或混用的位置、非法数字、越界结果及无效目标', () => {
+  type Move = Extract<DrawOp, { op: 'move' }>
+  const graph = buildGraph([
+    ...existing,
+    { id: 'proposal', type: 'rectangle', x: 600, y: 0, width: 100, height: 60, customData: { flyingdraws: { layer: 'proposal' } } },
+    { id: 'line', type: 'line', x: 100, y: 100, width: 75, height: 0, points: [[0, 0], [75, 0]] },
+    { id: 'arrow', type: 'arrow', x: 100, y: 30, width: 200, height: 0, startBinding: { elementId: 'ra' }, endBinding: { elementId: 'rb' } }
+  ])
+  const invalid: [Partial<Move>, RegExp][] = [
+    [{}, /exactly one/],
+    [{ x: 10 }, /provided together/],
+    [{ y: 10 }, /provided together/],
+    [{ x: 10, y: 10, dx: 0 }, /exactly one/],
+    [{ near: 'N2', dy: 1 }, /exactly one/],
+    [{ near: 'N2', x: 10, y: 10 }, /exactly one/],
+    [{ near: '' }, /non-empty id/],
+    [{ near: 'N2', side: 'diagonal' as MoveSide }, /side must be/],
+    [{ near: 'N2', gap: -1 }, /between 0 and 400/],
+    [{ near: 'N2', gap: 401 }, /between 0 and 400/],
+    [{ near: 'N2', gap: NaN }, /between 0 and 400/],
+    [{ dx: 3, gap: 0 }, /require near/],
+    [{ x: NaN, y: 0 }, /x must be a finite number/],
+    [{ dx: Infinity }, /dx must be a finite number/],
+    [{ dy: -1_000_001 }, /dy must be a finite number/],
+    [{ id: 'N2', dx: 1_000_000 }, /destination x/],
+    [{ id: 'N2', x: -1_000_000, y: 0 }, /resulting dx/],
+    [{ near: 'ra' }, /own target/],
+    [{ id: 'missing', dx: 1 }, /unknown element/],
+    [{ id: 'proposal', dx: 1 }, /proposal the user has not answered/],
+    [{ id: 'arrow', dx: 1 }, /line or arrow/],
+    [{ id: 'line', dx: 1 }, /line or arrow/],
+    [{ near: 'arrow' }, /line or arrow/]
+  ]
+  for (const [fields, error] of invalid) {
+    assert.throws(() => planOps([{ op: 'move', id: 'N1', ...fields }], graph, ids()), error)
+  }
+  assert.equal(planOps([{ op: 'move', id: 'N1', x: 1_000_000, y: 0 }], graph, ids()).moves[0].toBbox.x, 1_000_000)
+  assert.throws(() => planOps([{ op: 'move', id: 'N1', dx: 1 }, { op: 'move', id: 'ra', dy: 1 }], graph, ids()), /already moved/)
+  assert.throws(() => planOps([{ op: 'move', id: 'ra', dx: 1 }, { op: 'delete_node', id: 'N1' }], graph, ids()), /deletes element "ra" and also moves it/)
+  assert.throws(() => planOps([{ op: 'delete_node', id: 'N2' }, { op: 'move', id: 'N1', near: 'rb' }], graph, ids()), /near anchor .* is deleted/)
+})
+
+test('所有引用路径均拒绝未决提议节点、文字、连线、笔画和图片', () => {
+  const proposed = { customData: { flyingdraws: { layer: 'proposal' } } }
+  const elements: SceneElement[] = [
+    ...existing,
+    { id: 'draft-node', type: 'rectangle', x: 600, y: 0, width: 100, height: 60, ...proposed },
+    { id: 'draft-text', type: 'text', x: 600, y: 120, width: 80, height: 25, text: '待定', ...proposed },
+    { id: 'draft-arrow', type: 'arrow', x: 100, y: 30, width: 200, height: 0, startBinding: { elementId: 'ra' }, endBinding: { elementId: 'rb' }, ...proposed },
+    { id: 'draft-stroke', type: 'freedraw', x: 610, y: 210, width: 20, height: 20, points: [[0, 0], [20, 20]], ...proposed },
+    { id: 'settled-stroke', type: 'freedraw', x: 615, y: 215, width: 20, height: 20, points: [[0, 0], [20, 20]] },
+    { id: 'draft-image', type: 'image', x: 900, y: 100, width: 100, height: 60, fileId: 'file', ...proposed }
+  ]
+  const graph = buildGraph(elements)
+  const drafts: DrawOp[] = [
+    { op: 'update_edge', from: 'N1', to: 'N2', label: '改字' }, { op: 'delete_edge', from: 'N1', to: 'N2' },
+    { op: 'set_style', from: 'N1', to: 'N2', color: '#123' }
+  ]
+  for (const id of ['N3', 'draft-node']) drafts.push(
+    { op: 'add_edge', from: 'N1', to: id },
+    { op: 'add_edge', from: id, to: 'N1' },
+    { op: 'update_edge', from: 'N1', to: id, label: '改字' },
+    { op: 'delete_edge', from: id, to: 'N1' },
+    { op: 'add_text', text: '旁注', near: id },
+    { op: 'update_node', id, label: '改字' },
+    { op: 'delete_node', id },
+    { op: 'set_style', id, color: '#123' },
+    { op: 'move', id: 'N1', near: id }
+  )
+  for (const id of ['T1', 'draft-text']) drafts.push(
+    { op: 'update_text', id, text: '改字' }, { op: 'delete_text', id }, { op: 'set_style', id, color: '#123' }
+  )
+  for (const id of ['S1', 'draft-stroke']) drafts.push(
+    { op: 'delete_strokes', id }, { op: 'set_style', id, color: '#123' }, { op: 'move', id, dx: 5 }
+  )
+  for (const id of ['I1', 'draft-image']) drafts.push(
+    { op: 'move', id, dx: 5 },
+    { op: 'trace_image', image: id, space: { w: 100, h: 60 }, elements: [{ kind: 'box', x: 0, y: 0, w: 10, h: 10 }] }
+  )
+  for (const op of drafts) {
+    assert.throws(() => planOps([op], graph, ids(), { elements }), /proposal the user has not answered.*canvas_wait/, JSON.stringify(op))
+  }
+  assert.deepEqual(planOps([{ op: 'move', id: 'settled-stroke', dx: 5 }], graph, ids(), { elements }).moves[0].elementIds, ['settled-stroke'])
+})
+
+test('move：S 组保持统一位移，稳定笔画 id 只指一笔，文字和图片独立移动', () => {
+  const elements: SceneElement[] = [
+    { id: 'f1', type: 'freedraw', x: -26, y: 30, width: 20, height: 20, points: [[0, 0], [-20, -20]] },
+    { id: 'f2', type: 'freedraw', x: -22, y: 34, width: 20, height: 20, points: [[0, 0], [-20, -20]] },
+    { id: 'text', type: 'text', x: 150, y: 110, width: 40, height: 24, text: '旁注' },
+    { id: 'image', type: 'image', x: 140, y: 90, width: 100, height: 60, fileId: 'file' }
+  ]
+  const graph = buildGraph(elements)
+  assert.deepEqual(graph.strokeGroups[0].refs, ['f1', 'f2'])
+  const moved = planOps([
+    { op: 'move', id: 'S1', x: -10, y: 20 },
+    { op: 'move', id: 'T1', dx: 10 },
+    { op: 'move', id: 'I1', dy: 120 }
+  ], graph, ids(), { elements })
+  assert.deepEqual(moved.moves.map(({ kind, elementIds, dx, dy }) => [kind, elementIds, dx, dy]), [
+    ['strokes', ['f1', 'f2'], 36, 10], ['text', ['text'], 10, 0], ['image', ['image'], 0, 120]
+  ])
+  assert.deepEqual(moved.modifiedRefs, ['f1', 'f2', 'text', 'image'])
+  const single = planOps([{ op: 'move', id: 'f2', x: -120, y: -50 }], graph, ids(), { elements })
+  assert.deepEqual(single.moves[0].fromBbox, box(-42, 14, 20, 20))
+  assert.deepEqual(single.moves[0].elementIds, ['f2'])
+  assert.deepEqual(single.stableRefs, ['f2'])
+  assert.throws(() => planOps([{ op: 'move', id: 'S1', dx: 1 }, { op: 'move', id: 'f2', dy: 1 }], graph, ids(), { elements }), /already moved/)
+})
+
+test('placeBeside：屏蔽包含锚点中心的框，先横切滑动，再外推和回退', () => {
+  const anchor = box(0, 0, 100, 100)
+  const size = { w: 20, h: 20 }
+  const outer = box(-100, -100, 300, 300)
+  assert.deepEqual(placeBeside(size, anchor, 'right', 0, [anchor, outer]), { x: 100, y: 40, adjusted: false })
+  assert.deepEqual(placeBeside(size, anchor, 'right', 10, [anchor, box(110, 35, 20, 30)]), { x: 110, y: 80, adjusted: true })
+  assert.deepEqual(placeBeside(size, anchor, 'right', 10, [anchor, box(110, -600, 20, 1200)]), { x: 150, y: 40, adjusted: true })
+  assert.deepEqual(placeBeside(size, anchor, 'right', 10, [anchor, box(110, -600, 400, 1200)]), { x: 40, y: 200, adjusted: true })
+  const elements: SceneElement[] = [existing[0], existing[1], { id: 'note', type: 'text', x: 440, y: 0, width: 100, height: 60, text: '占位' }]
+  const plan = planOps([{ op: 'move', id: 'N1', near: 'N2' }], buildGraph(elements), ids())
+  assert.equal(plan.moves[0].adjusted, true)
+  assert.deepEqual(plan.moves[0].toBbox, box(440, 80, 100, 60))
+})
+
+test('move：精确落点报告最终碰撞，原包围框和已删除或已移开的元素不计入', () => {
+  const elements: SceneElement[] = [
+    ...existing,
+    { id: 'frame', type: 'rectangle', x: -15, y: -15, width: 600, height: 140 },
+    { id: 'note', type: 'text', x: 320, y: 5, width: 50, height: 25, text: '撞上' },
+    { id: 'deleted', type: 'text', x: 330, y: 5, width: 20, height: 25, text: '要删' }
+  ]
+  const graph = buildGraph(elements)
+  const nodeId = graph.nodes.find((n) => n.ref === 'rb')!.id
+  const noteId = graph.notes.find((n) => n.ref === 'note')!.id
+  const deleted = graph.notes.find((n) => n.ref === 'deleted')!.id
+  const plan = planOps([{ op: 'move', id: 'ra', x: 300, y: 0 }, { op: 'delete_text', id: deleted }], graph, ids())
+  assert.deepEqual(plan.moves[0].overlaps, [nodeId, noteId])
+  const relative = planOps([{ op: 'move', id: 'ra', dx: 300 }, { op: 'move', id: 'rb', dx: 350 }], graph, ids())
+  assert.deepEqual(relative.moves[0].overlaps, [noteId, deleted])
+})
+
+test('move 与新节点、显式宽度、新连线和旁注共用最终框体', () => {
+  const plan = planOps([
+    { op: 'move', id: 'N1', near: 'fresh', side: 'left', gap: 30 },
+    { op: 'add_node', id: 'fresh' },
+    { op: 'add_edge', from: 'N1', to: 'fresh' },
+    { op: 'add_text', text: 'note', near: 'N1' },
+    { op: 'set_style', id: 'N1', width: 200 },
+    { op: 'update_node', id: 'N1', label: '一段会自动扩宽的中文文本'.repeat(4) },
+    { op: 'set_style', id: 'N1', height: 60 }
+  ], buildGraph([existing[0]]), ids())
+  const [node] = plan.nodes
+  const [move] = plan.moves
+  assert.deepEqual(move.fromBbox, box(-50, 0, 200, 60))
+  assert.deepEqual(move.toBbox, box(node.x - 230, node.y, 200, 60))
+  assert.deepEqual([plan.edges[0].x, plan.edges[0].y], [node.x - 22, node.y + 30])
+  assert.deepEqual([plan.texts[0].x, plan.texts[0].y], [move.toBbox.x + 76, node.y + 74])
+})
+
+test('update_node 的虚拟扩宽保留中心、封顶、只扩不缩，并供近置与旁注使用', () => {
+  const graph = buildGraph([existing[0], { ...existing[1], width: 420 }])
+  const plan = planOps([
+    { op: 'move', id: 'N1', near: 'N2', gap: 0 },
+    { op: 'update_node', id: 'N1', label: '架构'.repeat(25) },
+    { op: 'update_node', id: 'N2', label: '旧指令中的大段文字'.repeat(20) },
+    { op: 'update_node', id: 'N2', label: '短' },
+    { op: 'add_text', text: '旁注', near: 'N1' }
+  ], graph, ids())
+  const [move] = plan.moves
+  assert.equal(move.fromBbox.w, 360)
+  assert.equal(move.fromBbox.x + move.fromBbox.w / 2, 50)
+  assert.equal(move.fromBbox.y + move.fromBbox.h / 2, 30)
+  assert.equal(move.toBbox.x, 720)
+  assert.deepEqual(plan.updates.map(({ elementId, label }) => [elementId, label]), [['ra', '架构'.repeat(25)], ['rb', '短']])
+  assert.equal(plan.texts[0].y, move.toBbox.y + move.toBbox.h + 14)
+})
+
+test('update_node 的虚拟高度使用 25px 行高和形状的 10px 内边距，显式高度优先', () => {
+  for (const [type, expected] of [['rectangle', 85], ['ellipse', 120], ['diamond', 170]] as const) {
+    const graph = buildGraph([{ ...existing[0], type, width: 240 }])
+    const ops: DrawOp[] = [{ op: 'update_node', id: 'N1', label: 'A\nB\nC' }, { op: 'move', id: 'N1', x: 300, y: 200 }]
+    const [move] = planOps(ops, graph, ids()).moves
+    assert.deepEqual(move.fromBbox, box(0, 30 - expected / 2, 240, expected), type)
+    assert.deepEqual(move.toTopLeft, { x: 300, y: 200 })
+    const explicit = planOps([...ops, { op: 'set_style', id: 'N1', height: 45 }], graph, ids())
+    assert.equal(explicit.moves[0].fromBbox.h, 45)
+  }
+  const [moved] = planOps([
+    { op: 'update_node', id: 'N1', label: '短' }, { op: 'move', id: 'N1', dy: 20 }
+  ], buildGraph([{ ...existing[0], height: 200 }]), ids()).moves
+  assert.equal(moved.fromBbox.h, 200)
+})
+
+test('dagre 放新节点时释放本批移走或删除的旧框，trace_image 读取已移动的图片', () => {
+  const placed = planOps([
+    { op: 'add_node', id: 'fresh' },
+    { op: 'move', id: 'N1', x: 1000, y: 1000 },
+    { op: 'delete_node', id: 'N2' }
+  ], buildGraph(existing), ids(), { view: box(0, 0, 500, 100) })
+  assert.deepEqual([placed.nodes[0].x, placed.nodes[0].y], [0, 0])
+  const graph = buildGraph([{ id: 'img', type: 'image', x: 100, y: 200, width: 100, height: 50, fileId: 'file' }])
+  const traced = planOps([
+    { op: 'move', id: 'I1', dx: 250 },
+    { op: 'trace_image', image: 'I1', place: 'over', space: { w: 100, h: 50 }, elements: [{ kind: 'box', x: 5, y: 10, w: 30, h: 20 }] }
+  ], graph, ids())
+  assert.deepEqual([traced.nodes[0].x, traced.nodes[0].y], [355, 210])
+})
+
+test('rebaseOps 同时换算 move 目标与 near 锚点，保留新节点 key 与稳定 id', () => {
+  const before = buildGraph(existing)
+  const after = buildGraph([{ id: 'inserted', type: 'rectangle', x: -300, y: 0, width: 100, height: 60 }, ...existing])
+  const result = rebaseOps([
+    { op: 'move', id: ' N1 ', near: ' N2 ' },
+    { op: 'move', id: ' rb ', near: ' fresh ' },
+    { op: 'add_node', id: ' fresh ' }
+  ], before.nodes, after)
+  assert.deepEqual(result, { gone: [], ops: [
+    { op: 'move', id: 'N2', near: 'N3' },
+    { op: 'move', id: 'rb', near: 'fresh' },
+    { op: 'add_node', id: ' fresh ' }
+  ] })
+  assert.deepEqual(rebaseOps([{ op: 'move', id: 'N1', near: 'N2' }], before.nodes, buildGraph([existing[0]])).gone, ['N2'])
+})
+
+test('rebaseOps 和 planOps 对带空白的旧短号仍指向原节点和 near 锚点', () => {
+  const before = buildGraph(existing)
+  const after = buildGraph([{ ...existing[0], id: 'inserted', x: -300 }, ...existing])
+  const ops: DrawOp[] = [
+    { op: 'move', id: ' N1 ', near: 'N2\n' },
+    { op: 'update_node', id: 'N1\n', label: '改字' },
+    { op: 'set_style', id: ' N1 ', color: '#123' },
+    { op: 'add_text', text: '旁注', near: ' N2\n' }
+  ]
+  const rebased = rebaseOps(ops, before.nodes, after)
+  assert.deepEqual(rebased.gone, [])
+  for (const plan of [planOps(ops, before, ids()), planOps(rebased.ops, after, ids())]) {
+    assert.deepEqual(plan.moves[0].elementIds, ['ra'])
+    assert.deepEqual(plan.moves[0].toTopLeft, { x: 440, y: 0 })
+    assert.equal(plan.updates[0].elementId, 'ra')
+    assert.equal(plan.styles[0].elementId, 'ra')
+    assert.equal(plan.texts[0].x + estimateTextWidth(plan.texts[0].text) / 2, 350)
+  }
+})
+
+test('rebaseOps 仅重映射成员完整且仍为同一组的手绘短号', () => {
+  const stroke = (id: string, x: number): SceneElement => ({ id, type: 'freedraw', x, y: 0, width: 20, height: 20, points: [[0, 0], [20, 20]] })
+  const original = [stroke('f1', 30), stroke('f2', 35)]
+  const before = buildGraph(original).strokeGroups[0]
+  const base = [{ id: before.id, ref: before.refs[0], refs: before.refs }]
+  const op: DrawOp = { op: 'move', id: ' S1 ', dx: 50 }
+  const intact = buildGraph([stroke('new1', -400), stroke('new2', -392), ...original])
+  assert.deepEqual(rebaseOps([op], base, intact), { gone: [], ops: [{ op: 'move', id: 'S2', dx: 50 }] })
+  for (const after of [
+    [original[0]],
+    [original[0], stroke('f2', 500)],
+    [...original, stroke('f3', 40)]
+  ]) assert.deepEqual(rebaseOps([op], base, buildGraph(after)).gone, ['S1'])
+})
+
+test('rebaseOps 三笔手绘组少一笔时拒绝旧版 move 和 delete_strokes', () => {
+  const original = ['f1', 'f2', 'f3'].map((id, i): SceneElement => ({
+    id, type: 'freedraw', x: 30 + i * 5, y: 0, width: 20, height: 20, points: [[0, 0], [20, 20]]
+  }))
+  const [before] = buildGraph(original).strokeGroups
+  assert.equal(before.id, 'S1')
+  assert.deepEqual(before.refs, ['f1', 'f2', 'f3'])
+  const base = [{ id: before.id, ref: before.refs[0], refs: before.refs }]
+  const ops: DrawOp[] = [{ op: 'move', id: 'S1', dx: 50 }, { op: 'delete_strokes', id: 'S1' }]
+  for (const removed of original) {
+    const after = buildGraph(original.map((stroke) => stroke === removed ? { ...stroke, isDeleted: true } : stroke))
+    assert.equal(after.strokeGroups[0].id, 'S1')
+    assert.deepEqual(after.strokeGroups[0].refs, before.refs.filter((ref) => ref !== removed.id))
+    for (const op of ops) {
+      assert.deepEqual(rebaseOps([op], base, after).gone, ['S1'], `${op.op}: ${removed.id} deleted`)
+    }
+  }
+})
+
+test('toProposalPlan 用原位框批准移动及同目标的改字，落点框可单独否决移动', () => {
+  const graph = buildGraph(existing)
+  const info = { box: (ref: string) => graph.nodes.find((n) => n.ref === ref)?.bbox ?? null, name: () => '节点「登录」' }
+  for (const edit of [false, true]) {
+    const ops: DrawOp[] = [{ op: 'move', id: 'N1', x: -300, y: 150 }]
+    if (edit) ops.push({ op: 'update_node', id: 'N1', label: '新标签' })
+    const batch = planOps(ops, graph, ids())
+    const { plan, pending } = toProposalPlan(batch, info, ids())
+    assert.deepEqual(plan.moves, [])
+    assert.equal(plan.reroutes, undefined)
+    assert.deepEqual(plan.updates, [])
+    assert.equal(plan.markers.length, 1)
+    const [frame] = plan.markers
+    assert.equal(frame.note, edit ? '改成「新标签」，移走' : '移走')
+    assert.equal(frame.summary, edit ? '把节点「登录」改成「新标签」，移走' : '移动节点「登录」')
+    assert.deepEqual([frame.x, frame.y, frame.w, frame.h], [-10, -10, 120, 80])
+    const [ghost] = plan.moveGhosts!
+    assert.equal(ghost.frameId, frame.frameId)
+    assert.equal(ghost.summary, '移动节点「登录」')
+    assert.equal(ghost.label, '「登录」移到这里')
+    assert.deepEqual([ghost.x, ghost.y, ghost.w, ghost.h], [-300, 150, batch.moves[0].toBbox.w, batch.moves[0].toBbox.h])
+    assert.deepEqual(pending?.moves, batch.moves)
+    assert.deepEqual(pending?.moves?.[0].toTopLeft, { x: -300, y: 150 })
+    assert.equal(pending?.updates.length, Number(edit))
+    const { w: _w, h: _h, label: _label, ...compact } = ghost
+    assert.deepEqual(pending?.moveGhosts, [compact])
+  }
+})
+
+for (const [scenario, name, label] of [
+  ['多行标签', '节点「写审计日志\n发刷新令牌\n推下游事件」', '「写审计日志…」移到这里'],
+  ['超长单行标签', '节点「统一身份认证会话续期」', '「统一身份认证会话…」移到这里'],
+  ['无标签', '节点 N1', 'N1 移到这里']
+]) {
+  test(`toProposalPlan 落点框提示：${scenario}`, () => {
+    const batch = planOps([{ op: 'move', id: 'N1', dx: 100 }], buildGraph(existing), ids())
+    const { plan, pending } = toProposalPlan(batch, { box: () => null, name: () => name }, ids())
+    assert.equal(plan.moveGhosts?.[0]?.label, label)
+    assert.equal(plan.moveGhosts?.[0]?.summary, `移动${name}`)
+    assert.equal(pending?.moveGhosts?.[0]?.summary, `移动${name}`)
+  })
+}
+
+test('reroutes：单端移动后用最终障碍重排，双端等量移动保留原折点', () => {
+  const elements: (SceneElement & { elbowed?: boolean })[] = [
+    existing[0],
+    { ...existing[1], x: 500 },
+    { id: 'middle', type: 'rectangle', x: 240, y: 10, width: 100, height: 48 },
+    { id: 'bound', type: 'arrow', x: 100, y: 30, width: 400, height: 0, startBinding: { elementId: 'ra' }, endBinding: { elementId: 'rb' } },
+    { id: 'backwards', type: 'arrow', x: 100, y: 30, width: 400, height: 0, startBinding: { elementId: 'ra' }, endBinding: { elementId: 'rb' }, startArrowhead: 'arrow' },
+    { id: 'one-free', type: 'arrow', x: 100, y: 30, width: 400, height: 0, startBinding: { elementId: 'ra' } },
+    { id: 'user-bends', type: 'arrow', x: 100, y: 30, width: 400, height: 60, points: [[0, 0], [160, 60], [400, 0]], startBinding: { elementId: 'ra' }, endBinding: { elementId: 'rb' } },
+    { id: 'agent-bends', type: 'arrow', x: 100, y: 30, width: 400, height: 60, points: [[0, 0], [160, 60], [400, 0]], startBinding: { elementId: 'ra' }, endBinding: { elementId: 'rb' }, ...agent },
+    { id: 'agent-elbow', type: 'arrow', x: 100, y: 30, width: 400, height: 60, points: [[0, 0], [0, 60], [400, 60], [400, 0]], startBinding: { elementId: 'ra' }, endBinding: { elementId: 'rb' }, elbowed: true, ...agent }
+  ]
+  const graph = buildGraph(elements)
+  const single = planOps([{ op: 'move', id: 'ra', dx: 25 }], graph, ids(), { elements })
+  assert.deepEqual(single.reroutes?.map(({ arrowId, fromElementId, toElementId }) => [arrowId, fromElementId, toElementId]), [
+    ['bound', 'ra', 'rb'], ['backwards', 'ra', 'rb'], ['agent-bends', 'ra', 'rb']
+  ])
+  const [route, reversed] = single.reroutes!
+  assert.deepEqual(route.points[0], [0, 0])
+  assert.ok(route.points.length > 2, '围绕中间未移动的节点绕行')
+  assert.ok(route.x < 300)
+  assert.deepEqual(reversed.points, route.points, '箭头头尾按实际绑定排列')
+  const prop = toProposalPlan(single, { box: (ref) => graph.nodes.find((n) => n.ref === ref)?.bbox ?? null, name: () => '节点' }, ids())
+  assert.equal(prop.plan.reroutes, undefined)
+  assert.deepEqual(prop.pending?.reroutes, single.reroutes)
+  const both: DrawOp[] = [{ op: 'move', id: 'ra', dy: 40 }, { op: 'move', id: 'rb', dy: 40 }]
+  assert.equal(planOps(both, graph, ids(), { elements }).reroutes, undefined)
+  const resized = planOps([...both, { op: 'set_style', id: 'N1', width: 160 }], graph, ids(), { elements })
+  assert.equal(resized.reroutes?.length, 3)
 })

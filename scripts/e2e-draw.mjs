@@ -842,6 +842,723 @@ try {
   await call('canvas_read', { as: '前端', image: 'never' })
   await sleep(300)
 
+  // ---------- 元素移动（move）、长文本中心扩宽与可拖拽落点框（move-ghost） ----------
+  await call('canvas_open', { board: 'move-widen', title: '移动与自动扩宽验证' })
+  await until(async () => (await user3.js(`document.querySelector('.fd-board-select')?.value`)) === 'move-widen')
+  const mwInit = textOf(
+    await call('canvas_draw', {
+      board: 'move-widen',
+      ops: [
+        { op: 'add_node', id: 'entry', label: '入口' },
+        { op: 'add_node', id: 'auth', label: '鉴权', shape: 'diamond' },
+        { op: 'add_node', id: 'done', label: '完成' },
+        { op: 'add_edge', from: 'entry', to: 'auth', label: '调用' },
+        { op: 'add_edge', from: 'auth', to: 'done', label: '放行' }
+      ]
+    })
+  )
+  const mwVer0 = Number(mwInit.match(/version (\d+)/)?.[1])
+  const entryId0 = mwInit.match(/entry = (N\d+)/)?.[1]
+  const authId0 = mwInit.match(/auth = (N\d+)/)?.[1]
+  const doneId0 = mwInit.match(/done = (N\d+)/)?.[1]
+  const beforeMetrics = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const byText = (t) => {
+      const tx = els.find((e) => e.type === 'text' && e.text === t)
+      return tx ? els.find((e) => e.id === tx.containerId) : null
+    }
+    const entry = byText('入口')
+    const auth = byText('鉴权')
+    const done = byText('完成')
+    return {
+      entry: { x: entry.x, y: entry.y, w: entry.width, h: entry.height, cx: entry.x + entry.width / 2, cy: entry.y + entry.height / 2 },
+      auth: { w: auth.width, cx: auth.x + auth.width / 2 },
+      done: { w: done.width, h: done.height }
+    }
+  })()`)
+
+  const mwWidened = textOf(
+    await call('canvas_draw', {
+      board: 'move-widen',
+      base_version: mwVer0,
+      ops: [
+        { op: 'update_node', id: entryId0, label: '统一身份认证与双因素会话续期网关 ServiceGatewayV2' },
+        { op: 'update_node', id: authId0, label: '是否已通过多因子校验？' },
+        { op: 'update_node', id: doneId0, label: '写审计日志\n发刷新令牌\n推下游事件' },
+        { op: 'set_style', id: doneId0, height: 72 }
+      ]
+    })
+  )
+  const afterWidenMetrics = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const findContainer = (re) => {
+      const tx = els.find((e) => e.type === 'text' && re.test(e.originalText || e.text || ''))
+      return tx ? els.find((e) => e.id === tx.containerId) : null
+    }
+    const entry = findContainer(/ServiceGatewayV2/)
+    const auth = findContainer(/多因子校验/)
+    const done = findContainer(/写审计日志/)
+    const callLabel = els.find((e) => e.type === 'text' && (e.originalText || e.text) === '调用')
+    const callArrow = callLabel ? els.find((e) => e.id === callLabel.containerId) : null
+    const arrowStartX = callArrow ? callArrow.x + callArrow.points[0][0] : 0
+    const midX = callArrow ? callArrow.x + (callArrow.points[0][0] + callArrow.points[callArrow.points.length - 1][0]) / 2 : 0
+    return {
+      entryW: entry.width,
+      entryCx: entry.x + entry.width / 2,
+      entryCy: entry.y + entry.height / 2,
+      entryRight: entry.x + entry.width,
+      authW: auth.width,
+      authCx: auth.x + auth.width / 2,
+      doneH: done.height,
+      arrowStartGap: arrowStartX - (entry.x + entry.width),
+      labelCenterErr: Math.abs((callLabel.x + callLabel.width / 2) - midX)
+    }
+  })()`)
+  check(
+    !/Nothing was drawn/.test(mwWidened) &&
+      afterWidenMetrics.entryW > beforeMetrics.entry.w + 80 &&
+      Math.abs(afterWidenMetrics.entryCx - beforeMetrics.entry.cx) < 1.5 &&
+      Math.abs(afterWidenMetrics.entryCy - beforeMetrics.entry.cy) < 1.5 &&
+      afterWidenMetrics.authW > beforeMetrics.auth.w + 60 &&
+      afterWidenMetrics.doneH === 72 &&
+      Math.abs(afterWidenMetrics.arrowStartGap - 8) < 3 &&
+      afterWidenMetrics.labelCenterErr < 3,
+    'update_node 长文本从中心自动扩宽（矩形+菱形）、同批显式 set_style 高度不被覆盖、相连箭头与连线标签同步贴边居中'
+  )
+
+  // canvas_draw move（near + side 语义贴边 + 返回新旧阅读顺序编号对照）
+  const mwVer1 = Number(mwWidened.match(/version (\d+)/)?.[1])
+  const doneNow1 = mwWidened.match(/(N\d+) 「写审计日志/)?.[1]
+  const entryNow1 = mwWidened.match(/(N\d+) 「统一身份认证/)?.[1]
+  const mwMoved = textOf(
+    await call('canvas_draw', {
+      board: 'move-widen',
+      base_version: mwVer1,
+      ops: [{ op: 'move', id: doneNow1, near: entryNow1, side: 'below', gap: 50 }]
+    })
+  )
+  const afterNearMove = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const findContainer = (re) => {
+      const tx = els.find((e) => e.type === 'text' && re.test(e.originalText || e.text || ''))
+      return tx ? els.find((e) => e.id === tx.containerId) : null
+    }
+    const entry = findContainer(/ServiceGatewayV2/)
+    const done = findContainer(/写审计日志/)
+    return {
+      gapY: done.y - (entry.y + entry.height),
+      centerDiffX: Math.abs((done.x + done.width / 2) - (entry.x + entry.width / 2))
+    }
+  })()`)
+  check(
+    /1 moved/.test(mwMoved) && /Moved ids:/.test(mwMoved) && Math.abs(afterNearMove.gapY - 50) < 3 && afterNearMove.centerDiffX < 3,
+    'move(near + side: "below", gap: 50) 将节点精确摆到锚点正下方并输出 Moved ids 对照表'
+  )
+
+  // canvas_propose 移动提议：可拖拽落点框微调 + 待决提议目标互斥锁 + 局部删落点框否决
+  const mwRead2 = textOf(await call('canvas_read', { board: 'move-widen', image: 'never' }))
+  const mwVer2 = Number(mwRead2.match(/v(\d+)：/)?.[1])
+  const entryNow2 = mwRead2.match(/(N\d+) 「统一身份认证/)?.[1]
+  const entryBeforeProp = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const tx = els.find((e) => e.type === 'text' && /ServiceGatewayV2/.test(e.originalText || e.text || ''))
+    const box = els.find((e) => e.id === tx.containerId)
+    return { id: box.id, x: box.x, y: box.y }
+  })()`)
+  const propMoveRes = textOf(
+    await call('canvas_propose', {
+      board: 'move-widen',
+      base_version: mwVer2,
+      question: '把入口网关往右挪 200px 可以吗？',
+      ops: [{ op: 'move', id: entryNow2, dx: 200, dy: 0 }]
+    })
+  )
+  const reqMoveProp = propMoveRes.match(/req_\w+/)?.[0]
+  await user3.waitForBanner()
+
+  // 待决提议锁定检查：同一目标不能被另一条并发修改绕过
+  const mwReadDuringProp = textOf(await call('canvas_read', { board: 'move-widen', image: 'never' }))
+  const mwVerDuring = Number(mwReadDuringProp.match(/v(\d+)：/)?.[1])
+  const entryDuringId = mwReadDuringProp.match(/(N\d+) 「统一身份认证/)?.[1]
+  check(!/移到这里/.test(mwReadDuringProp), '提议挂起期间 move-ghost 落点预览框不会混入语义层节点列表')
+  const blockedConcurrent = await call('canvas_draw', {
+    board: 'move-widen',
+    base_version: mwVerDuring,
+    ops: [{ op: 'move', id: entryDuringId, dx: 40, dy: 0 }]
+  })
+  check(
+    blockedConcurrent.isError === true && /unanswered proposal/.test(textOf(blockedConcurrent)),
+    '已有未决提议锁定的元素拒绝被其他并发修改覆盖'
+  )
+
+  // 扮演用户把 move-ghost 落点框再往右下拖 (+60, +80) 后点击「对，就这样」
+  const nudgedGhost = await user3.js(`(() => {
+    const api = window.__flyingdrawsApi
+    const all = api.getSceneElementsIncludingDeleted()
+    const ghost = all.find((e) => !e.isDeleted && e.type === 'rectangle' && e.customData?.flyingdraws?.role === 'move-ghost')
+    if (!ghost) return false
+    api.updateScene({
+      elements: all.map((e) =>
+        e.id === ghost.id || e.containerId === ghost.id
+          ? { ...e, x: e.x + 60, y: e.y + 80, version: e.version + 1, versionNonce: Math.floor(Math.random() * 1e9) }
+          : e
+      )
+    })
+    return true
+  })()`)
+  check(nudgedGhost === true, '（扮演用户）在画布上拖拽提议落点框微调 (+60, +80)')
+  const waitMoveProp = call('canvas_wait', { request_id: reqMoveProp, timeout_s: 30, image: 'never' })
+  await user3.click('对，就这样')
+  const movePropDone = textOf(await waitMoveProp)
+  const entryAfterProp = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const box = els.find((e) => e.id === ${JSON.stringify(entryBeforeProp.id)})
+    const ghostsLeft = els.filter((e) => e.customData?.flyingdraws?.role === 'move-ghost' || e.customData?.flyingdraws?.role === 'marker').length
+    return { x: box.x, y: box.y, ghostsLeft }
+  })()`)
+  check(
+    /ACCEPTED/.test(movePropDone) &&
+      /微调了/.test(movePropDone) &&
+      Math.abs(entryAfterProp.x - (entryBeforeProp.x + 260)) < 2 &&
+      Math.abs(entryAfterProp.y - (entryBeforeProp.y + 80)) < 2 &&
+      entryAfterProp.ghostsLeft === 0,
+    '接受移动提议后：按用户拖拽后的落点 (+260, +80) 生效、回传微调说明并清理预览框'
+  )
+
+  // 同一目标「改字 + 移动」提议中单独删掉落点框：保留改字、单独否决移动
+  const mwRead3 = textOf(await call('canvas_read', { board: 'move-widen', image: 'never' }))
+  const mwVer3 = Number(mwRead3.match(/v(\d+)：/)?.[1])
+  const doneNow3 = mwRead3.match(/(N\d+) 「写审计日志/)?.[1]
+  const doneBeforeVeto = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const tx = els.find((e) => e.type === 'text' && /写审计日志/.test(e.originalText || e.text || ''))
+    const box = els.find((e) => e.id === tx.containerId)
+    return { id: box.id, x: box.x, y: box.y, cx: box.x + box.width / 2, cy: box.y + box.height / 2 }
+  })()`)
+  const propCombo = textOf(
+    await call('canvas_propose', {
+      board: 'move-widen',
+      base_version: mwVer3,
+      question: '把完成节点改名并右移 180px？',
+      ops: [
+        { op: 'update_node', id: doneNow3, label: '审计归档完成' },
+        { op: 'move', id: doneNow3, dx: 180, dy: 0 }
+      ]
+    })
+  )
+  const reqCombo = propCombo.match(/req_\w+/)?.[0]
+  await user3.waitForBanner()
+  await user3.screenshot(join(OUT, 'propose-move-ghost.png'))
+  await user3.js(`(() => {
+    const api = window.__flyingdrawsApi
+    const all = api.getSceneElementsIncludingDeleted()
+    api.updateScene({
+      elements: all.map((e) =>
+        e.customData?.flyingdraws?.role === 'move-ghost' ? { ...e, isDeleted: true, version: e.version + 1 } : e
+      )
+    })
+  })()`)
+  const waitCombo = call('canvas_wait', { request_id: reqCombo, timeout_s: 30, image: 'never' })
+  await user3.click('对，就这样')
+  const comboDone = textOf(await waitCombo)
+  const doneAfterVeto = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const box = els.find((e) => e.id === ${JSON.stringify(doneBeforeVeto.id)})
+    const tx = els.find((e) => e.type === 'text' && e.containerId === box.id)
+    return { cx: box.x + box.width / 2, cy: box.y + box.height / 2, text: tx?.originalText || tx?.text || '' }
+  })()`)
+  // 改字可能触发从中心向两侧的自动扩宽，左上角会随之变化；移动被否决的判据是中心点没动
+  check(
+    /ACCEPTED/.test(comboDone) &&
+      /不同意移动/.test(comboDone) &&
+      doneAfterVeto.text === '审计归档完成' &&
+      Math.abs(doneAfterVeto.cx - doneBeforeVeto.cx) < 2 &&
+      Math.abs(doneAfterVeto.cy - doneBeforeVeto.cy) < 2,
+    '组合提议中单独删掉 move-ghost 落点框：改字照常生效，移动被单独否决并回传给 agent'
+  )
+  // P4 回归 A：同批多行改字 + 绝对坐标 move(x,y) + 向下新增连线，左上角精准落在指定坐标且新箭头起点严格贴在实测底边 +8px
+  const mwRead4 = textOf(await call('canvas_read', { board: 'move-widen', image: 'never' }))
+  const mwVer4 = Number(mwRead4.match(/v(\d+)：/)?.[1])
+  const target4 = mwRead4.match(/(N\d+) 「审计归档完成」/)?.[1]
+  await call('canvas_draw', {
+    board: 'move-widen',
+    base_version: mwVer4,
+    ops: [
+      { op: 'update_node', id: target4, label: '归档\n落盘\n完成' },
+      { op: 'move', id: target4, x: 300, y: 520 },
+      { op: 'add_node', id: 'notify_end', label: '通知归档系统', x: 300, y: 720 },
+      { op: 'add_edge', from: target4, to: 'notify_end', label: '回调' }
+    ]
+  })
+  const reproA = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const box = els.find((e) => e.id === ${JSON.stringify(doneBeforeVeto.id)})
+    const arrow = els.find((e) => e.type === 'arrow' && e.startBinding?.elementId === box.id)
+    const startY = arrow.y + (arrow.points?.[0]?.[1] ?? 0)
+    return { x: box.x, y: box.y, h: box.height, startY }
+  })()`)
+  check(
+    Math.abs(reproA.x - 300) < 1.5 &&
+      Math.abs(reproA.y - 520) < 1.5 &&
+      Math.abs(reproA.startY - (reproA.y + reproA.h + 8)) < 2,
+    '同批多行改字 + 绝对 move(x,y) + 新连线：左上角严格落在 (300, 520)，新连线起点严格贴在实测底边 +8px'
+  )
+
+  // P4 回归 B：提议里 set_style 改宽 + 新增向右连线，删掉原位标记框否决改宽后接受，新连线起点贴回原宽度右边缘 +8px
+  const mwRead5 = textOf(await call('canvas_read', { board: 'move-widen', image: 'never' }))
+  const mwVer5 = Number(mwRead5.match(/v(\d+)：/)?.[1])
+  const notifyId = mwRead5.match(/(N\d+) 「通知归档系统」/)?.[1]
+  const notifyBefore = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const tx = els.find((e) => e.type === 'text' && (e.originalText || e.text) === '通知归档系统')
+    const box = els.find((e) => e.id === tx.containerId)
+    return { id: box.id, x: box.x, w: box.width }
+  })()`)
+  const propStyleEdge = textOf(
+    await call('canvas_propose', {
+      board: 'move-widen',
+      base_version: mwVer5,
+      question: '把通知节点加宽到 280px 并连到回执节点？',
+      ops: [
+        { op: 'set_style', id: notifyId, width: 280 },
+        { op: 'add_node', id: 'ack_box', label: '收到回执', x: 760, y: 720 },
+        { op: 'add_edge', from: notifyId, to: 'ack_box' }
+      ]
+    })
+  )
+  const reqStyleEdge = propStyleEdge.match(/req_\w+/)?.[0]
+  await user3.waitForBanner()
+  await user3.js(`(() => {
+    const api = window.__flyingdrawsApi
+    const all = api.getSceneElementsIncludingDeleted()
+    api.updateScene({
+      elements: all.map((e) =>
+        e.customData?.flyingdraws?.role === 'marker' ? { ...e, isDeleted: true, version: e.version + 1 } : e
+      )
+    })
+  })()`)
+  const waitStyleEdge = call('canvas_wait', { request_id: reqStyleEdge, timeout_s: 30, image: 'never' })
+  await user3.click('对，就这样')
+  const styleEdgeDone = textOf(await waitStyleEdge)
+  const reproB = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const box = els.find((e) => e.id === ${JSON.stringify(notifyBefore.id)})
+    const arrow = els.find((e) => e.type === 'arrow' && e.startBinding?.elementId === box.id)
+    const startX = arrow.x + (arrow.points?.[0]?.[0] ?? 0)
+    return { x: box.x, w: box.width, startX }
+  })()`)
+  check(
+    /ACCEPTED/.test(styleEdgeDone) &&
+      Math.abs(reproB.w - notifyBefore.w) < 1.5 &&
+      Math.abs(reproB.startX - (reproB.x + reproB.w + 8)) < 2,
+    '否决提议里的 set_style 改宽但接受新连线时：节点保持原宽度，新连线起点精准贴回原右边缘 +8px'
+  )
+
+  await user3.screenshot(join(OUT, 'move-widen.png'))
+
+  // ---------- 场景 3：提议挂着时用户拖动原节点 ----------
+  // 提议 move dx:200 挂起时用户拖动原节点 (+40, +40)，不动落点框，接受后仍落回落点框且文字居中、箭头贴边
+  const s3Read = textOf(await call('canvas_read', { board: 'move-widen', image: 'never' }))
+  const s3Ver = Number(s3Read.match(/v(\d+)：/)?.[1])
+  const s3TargetId = s3Read.match(/(N\d+) 「归档[\s\S]*?完成」/)?.[1]
+  const s3Before = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const tx = els.find((e) => e.type === 'text' && /归档[\\s\\S]*完成/.test(e.originalText || e.text || ''))
+    const box = tx ? els.find((e) => e.id === tx.containerId) : null
+    return box ? { id: box.id, x: box.x, y: box.y, w: box.width, h: box.height } : null
+  })()`)
+  const s3Prop = textOf(
+    await call('canvas_propose', {
+      board: 'move-widen',
+      base_version: s3Ver,
+      question: '把归档完成节点右移 200px？',
+      ops: [{ op: 'move', id: s3TargetId, dx: 200, dy: 0 }]
+    })
+  )
+  const s3Req = s3Prop.match(/req_\w+/)?.[0]
+  await user3.waitForBanner()
+  const s3Ghost = await user3.js(`(() => {
+    const api = window.__flyingdrawsApi
+    const all = api.getSceneElementsIncludingDeleted()
+    const ghost = all.find((e) => !e.isDeleted && e.type === 'rectangle' && e.customData?.flyingdraws?.role === 'move-ghost')
+    if (!ghost) return null
+    const bump = (e) => ({ ...e, x: e.x + 40, y: e.y + 40, version: e.version + 1, versionNonce: Math.floor(Math.random() * 1e9) })
+    api.updateScene({
+      elements: all.map((e) => (e.id === ${JSON.stringify(s3Before?.id ?? null)} || e.containerId === ${JSON.stringify(s3Before?.id ?? null)} ? bump(e) : e))
+    })
+    return { x: ghost.x, y: ghost.y }
+  })()`)
+  check(Boolean(s3Ghost), '场景 3 前置：（扮演用户）提议挂起时将原节点连同绑定文字拖动 (+40, +40)，保持落点框不动')
+  const s3Wait = call('canvas_wait', { request_id: s3Req, timeout_s: 30, image: 'never' })
+  await user3.click('对，就这样')
+  const s3Done = textOf(await s3Wait)
+  const s3After = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const box = els.find((e) => e.id === ${JSON.stringify(s3Before?.id ?? null)})
+    if (!box) return null
+    const tx = els.find((e) => e.type === 'text' && e.containerId === box.id)
+    const distToRect = (px, py, b) => Math.hypot(Math.max(b.x - px, 0, px - (b.x + b.width)), Math.max(b.y - py, 0, py - (b.y + b.height)))
+    const arrowDists = els
+      .filter((e) => e.type === 'arrow' && (e.startBinding?.elementId === box.id || e.endBinding?.elementId === box.id))
+      .map((a) => {
+        const pts = a.points && a.points.length >= 2 ? a.points : [[0, 0], [a.width, a.height]]
+        const [p, q] = [pts[0], pts[pts.length - 1]]
+        const endPt = a.startBinding?.elementId === box.id ? [a.x + p[0], a.y + p[1]] : [a.x + q[0], a.y + q[1]]
+        return distToRect(endPt[0], endPt[1], box)
+      })
+    return {
+      x: box.x,
+      y: box.y,
+      textCxDiff: tx ? Math.abs((tx.x + tx.width / 2) - (box.x + box.width / 2)) : Infinity,
+      textCyDiff: tx ? Math.abs((tx.y + tx.height / 2) - (box.y + box.height / 2)) : Infinity,
+      arrowDists
+    }
+  })()`)
+  check(
+    /ACCEPTED/.test(s3Done) &&
+      !/微调了/.test(s3Done) &&
+      Boolean(s3Ghost && s3After) &&
+      Math.abs(s3After.x - s3Ghost.x) < 2 &&
+      Math.abs(s3After.y - s3Ghost.y) < 2 &&
+      s3After.textCxDiff < 2 &&
+      s3After.textCyDiff < 2 &&
+      s3After.arrowDists.length > 0 &&
+      s3After.arrowDists.every((d) => d > 0 && d <= 12),
+    '场景 3：拖动原节点后接受提议，节点落回落点框 toBbox、绑定文字居中、相连箭头贴着节点轮廓（<= 12px）'
+  )
+
+  await call('canvas_delete', { board: 'move-widen' })
+
+  // ---------- 场景 1：旧短号带空白（id: " N1 "） ----------
+  await call('canvas_open', { board: 'id-trim-test', title: '短号空白归一化验证' })
+  await until(async () => (await user3.js(`document.querySelector('.fd-board-select')?.value`)) === 'id-trim-test')
+  const trimInit = textOf(
+    await call('canvas_draw', {
+      board: 'id-trim-test',
+      ops: [
+        { op: 'add_node', id: 'target', label: '目标节点', x: 400, y: 200 },
+        { op: 'add_node', id: 'bystander', label: '旁观节点', x: 700, y: 200 }
+      ]
+    })
+  )
+  const trimVer0 = Number(trimInit.match(/version (\d+)/)?.[1])
+  const oldTargetShortId = trimInit.match(/target = (N\d+)/)?.[1]
+  check(oldTargetShortId === 'N1', `场景 1 前置：初始目标节点短号为 ${oldTargetShortId}`)
+
+  // 在前面插入一个节点，挤掉旧 N1 的阅读顺序位置：现在 N1=前置节点，N2=目标节点，N3=旁观节点
+  await call('canvas_draw', {
+    board: 'id-trim-test',
+    ops: [{ op: 'add_node', id: 'front', label: '前置节点', x: 100, y: 100 }]
+  })
+  const trimReadShift = textOf(await call('canvas_read', { board: 'id-trim-test', image: 'never' }))
+  check(
+    /N1 「前置节点」/.test(trimReadShift) && /N2 「目标节点」/.test(trimReadShift) && /N3 「旁观节点」/.test(trimReadShift),
+    '场景 1 前置：插入前置节点后，原 N1 已重排为 N2'
+  )
+
+  const snapNodes = () =>
+    user3.js(`(() => {
+      const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+      const pick = (re) => {
+        const tx = els.find((e) => e.type === 'text' && re.test(e.originalText || e.text || ''))
+        const box = tx ? els.find((e) => e.id === tx.containerId) : null
+        return box ? { id: box.id, x: box.x, y: box.y, w: box.width, h: box.height, cx: box.x + box.width / 2, cy: box.y + box.height / 2, ver: box.version, text: tx.originalText || tx.text, textVer: tx.version } : null
+      }
+      return { front: pick(/^前置节点$/), target: pick(/^目标/), bystander: pick(/^旁观节点$/) }
+    })()`)
+  const beforeTrim = await snapNodes()
+
+  // 用旧版本 + 带首尾空格的 " N1 " 调 move 和 update_node，必须命中原目标节点（现 N2），绝不改到现 N1（前置节点）或旁观节点
+  const paddedOldId = ` ${oldTargetShortId} `
+  const trimMoveUpdateRes = await call('canvas_draw', {
+    board: 'id-trim-test',
+    base_version: trimVer0,
+    ops: [
+      { op: 'move', id: paddedOldId, dx: 80, dy: 60 },
+      { op: 'update_node', id: paddedOldId, label: '目标已改' }
+    ]
+  })
+  const trimMoveUpdateText = textOf(trimMoveUpdateRes)
+  const afterTrim = await snapNodes()
+  check(
+    !trimMoveUpdateRes.isError &&
+      afterTrim.target?.text === '目标已改' &&
+      Math.abs(afterTrim.target.cx - (beforeTrim.target.cx + 80)) < 2 &&
+      Math.abs(afterTrim.target.cy - (beforeTrim.target.cy + 60)) < 2 &&
+      afterTrim.front?.x === beforeTrim.front?.x &&
+      afterTrim.front?.y === beforeTrim.front?.y &&
+      afterTrim.front?.w === beforeTrim.front?.w &&
+      afterTrim.front?.h === beforeTrim.front?.h &&
+      afterTrim.front?.ver === beforeTrim.front?.ver &&
+      afterTrim.front?.text === '前置节点' &&
+      afterTrim.front?.textVer === beforeTrim.front?.textVer &&
+      afterTrim.bystander?.x === beforeTrim.bystander?.x &&
+      afterTrim.bystander?.y === beforeTrim.bystander?.y &&
+      afterTrim.bystander?.ver === beforeTrim.bystander?.ver &&
+      afterTrim.bystander?.text === '旁观节点',
+    '场景 1：旧短号带首尾空白 " N1 " 调 move+update_node：准确作用到原目标节点，现 N1（前置节点）与旁观节点完全未改'
+  )
+
+  // 同版本下 update_node 带空白（不经过 rebaseOps、直达 planOps）+ 纯空白应返回 invalid 且不改画布
+  const trimVer2 = Number(trimMoveUpdateText.match(/version (\d+)/)?.[1])
+  const sameVerUpdateRes = await call('canvas_draw', {
+    board: 'id-trim-test',
+    base_version: trimVer2,
+    ops: [{ op: 'update_node', id: ' N1 ', label: '前置已改' }]
+  })
+  const afterSameVer = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const tx = els.find((e) => e.type === 'text' && (e.originalText || e.text) === '前置已改')
+    const tgtTx = els.find((e) => e.type === 'text' && (e.originalText || e.text) === '目标已改')
+    const tgtBox = tgtTx ? els.find((e) => e.id === tgtTx.containerId) : null
+    return { frontRenamed: Boolean(tx), targetVer: tgtBox?.version }
+  })()`)
+  check(
+    !sameVerUpdateRes.isError && afterSameVer.frontRenamed && afterSameVer.targetVer === afterTrim.target?.ver,
+    '场景 1：同版本 update_node 带首尾空白 " N1 " 经 planOps trim 命中现 N1，不改其他节点'
+  )
+
+  const trimVer3 = Number(textOf(sameVerUpdateRes).match(/version (\d+)/)?.[1])
+  const blankIdRes = await call('canvas_draw', {
+    board: 'id-trim-test',
+    base_version: trimVer3,
+    ops: [{ op: 'update_node', id: '   ', label: '不应生效' }]
+  })
+  const blankMoveRes = await call('canvas_draw', {
+    board: 'id-trim-test',
+    base_version: trimVer3,
+    ops: [{ op: 'move', id: '   ', dx: 50, dy: 0 }]
+  })
+  const hasInvalidNode = await user3.js(`window.__flyingdrawsApi.getSceneElements().some((e) => !e.isDeleted && e.type === 'text' && (e.originalText || e.text) === '不应生效')`)
+  check(
+    blankIdRes.isError === true && /Nothing was drawn/.test(textOf(blankIdRes)) && blankMoveRes.isError === true && !hasInvalidNode,
+    '场景 1：纯空白 id 调 update_node / move 返回明确报错且不改动任何节点'
+  )
+  await call('canvas_delete', { board: 'id-trim-test' })
+
+  // ---------- 场景 2：手绘组读取后少一笔（move S* 冲突与原子性） ----------
+  await call('canvas_open', { board: 'stroke-conflict', title: '手绘组冲突验证' })
+  await until(async () => (await user3.js(`document.querySelector('.fd-board-select')?.value`)) === 'stroke-conflict')
+  const injectedStrokes = await user3.js(`(() => {
+    const api = window.__flyingdrawsApi
+    const now = Date.now()
+    const mkStroke = (id, x, y, seed) => ({
+      id,
+      type: 'freedraw',
+      x,
+      y,
+      width: 30,
+      height: 24,
+      angle: 0,
+      strokeColor: '#1e1e1e',
+      backgroundColor: 'transparent',
+      fillStyle: 'solid',
+      strokeWidth: 2,
+      strokeStyle: 'solid',
+      roughness: 1,
+      opacity: 100,
+      roundness: null,
+      seed,
+      version: 1,
+      versionNonce: Math.floor(Math.random() * 1e9),
+      index: null,
+      isDeleted: false,
+      groupIds: [],
+      frameId: null,
+      boundElements: null,
+      updated: now,
+      link: null,
+      locked: false,
+      points: [[0, 0], [10, 18], [20, 6], [30, 24]],
+      pressures: [0.5, 0.5, 0.5, 0.5],
+      simulatePressure: true,
+      lastCommittedPoint: [30, 24]
+    })
+    const all = api.getSceneElementsIncludingDeleted()
+    api.updateScene({
+      elements: [
+        ...all,
+        mkStroke('user_fd_1', 200, 200, 1001),
+        mkStroke('user_fd_2', 225, 200, 1002),
+        mkStroke('user_fd_3', 250, 200, 1003)
+      ]
+    })
+    return true
+  })()`)
+  check(injectedStrokes === true, '场景 2 前置：（扮演用户）向画布写入 3 笔挨在一起的 freedraw')
+
+  const strokeRead0 = textOf(await call('canvas_read', { board: 'stroke-conflict', image: 'never' }))
+  const strokeVer0 = Number(strokeRead0.match(/v(\d+)：/)?.[1])
+  const strokeGroupId = strokeRead0.match(/(S\d+) 一组手写或涂鸦（3 笔）/)?.[1]
+  check(Boolean(strokeGroupId) && strokeVer0 > 0, `场景 2 前置：读画布确认 3 笔手绘被归为一组 ${strokeGroupId}（v${strokeVer0}）`)
+
+  // 扮演用户删掉中间一笔 user_fd_2；剩下 user_fd_1 和 user_fd_3 仍聚成 S1（2 笔）
+  await user3.js(`(() => {
+    const api = window.__flyingdrawsApi
+    const all = api.getSceneElementsIncludingDeleted()
+    api.updateScene({
+      elements: all.map((e) =>
+        e.id === 'user_fd_2'
+          ? { ...e, isDeleted: true, version: e.version + 1, versionNonce: Math.floor(Math.random() * 1e9), updated: Date.now() }
+          : e
+      )
+    })
+  })()`)
+  const beforeMoveStrokes = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted && e.type === 'freedraw')
+    return els.map((e) => ({ id: e.id, x: e.x, y: e.y, ver: e.version })).sort((a, b) => a.id.localeCompare(b.id))
+  })()`)
+  check(
+    beforeMoveStrokes.length === 2 && beforeMoveStrokes[0].id === 'user_fd_1' && beforeMoveStrokes[1].id === 'user_fd_3',
+    '场景 2 前置：删掉中间一笔后画布上剩余 2 笔手绘'
+  )
+
+  // 用旧 base_version 移动 S*（drawOps 内部会先 takeSnapshot + acceptScene 落盘后再检查冲突）
+  const staleStrokeMove = await call('canvas_draw', {
+    board: 'stroke-conflict',
+    base_version: strokeVer0,
+    ops: [{ op: 'move', id: strokeGroupId, dx: 120, dy: 80 }]
+  })
+  const staleStrokeMoveText = textOf(staleStrokeMove)
+  const afterMoveStrokes = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted && e.type === 'freedraw')
+    return els.map((e) => ({ id: e.id, x: e.x, y: e.y, ver: e.version })).sort((a, b) => a.id.localeCompare(b.id))
+  })()`)
+  const strokeDiskPath = join(HOME, 'boards', 'stroke-conflict.excalidraw')
+  const diskStrokes = existsSync(strokeDiskPath)
+    ? JSON.parse(readFileSync(strokeDiskPath, 'utf8'))
+        .elements.filter((e) => !e.isDeleted && e.type === 'freedraw')
+        .map((e) => ({ id: e.id, x: e.x, y: e.y }))
+        .sort((a, b) => a.id.localeCompare(b.id))
+    : null
+
+  check(
+    staleStrokeMove.isError === true &&
+      /conflict/.test(staleStrokeMoveText) &&
+      /deleted or changed/.test(staleStrokeMoveText) &&
+      /2 笔/.test(staleStrokeMoveText) &&
+      JSON.stringify(afterMoveStrokes) === JSON.stringify(beforeMoveStrokes) &&
+      JSON.stringify(diskStrokes) ===
+        JSON.stringify([
+          { id: 'user_fd_1', x: 200, y: 200 },
+          { id: 'user_fd_3', x: 250, y: 200 }
+        ]),
+    `场景 2：手绘组 ${strokeGroupId} 读取后少一笔再用旧 base_version move：返回 conflict，画布与落盘文件中剩下两笔坐标和 version 均完全不变`
+  )
+  await call('canvas_delete', { board: 'stroke-conflict' })
+
+  // ---------- 场景 4：提议预览的反向绑定清理 ----------
+  await call('canvas_open', { board: 'propose-cleanup', title: '提议反向绑定清理验证' })
+  await until(async () => (await user3.js(`document.querySelector('.fd-board-select')?.value`)) === 'propose-cleanup')
+  const pcInit = textOf(await call('canvas_draw', { board: 'propose-cleanup', ops: [{ op: 'add_node', id: 'base', label: '已有节点' }] }))
+  const pcVer0 = Number(pcInit.match(/version (\d+)/)?.[1])
+  const hostShort0 = pcInit.match(/base = (N\d+)/)?.[1]
+  const hostElId = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const tx = els.find((e) => e.type === 'text' && (e.originalText || e.text) === '已有节点')
+    return tx ? (els.find((e) => e.id === tx.containerId)?.id ?? null) : null
+  })()`)
+
+  // (a) 拒绝提议后，已有节点的 boundElements 不再含提议连线 id
+  const propRejectRes = textOf(
+    await call('canvas_propose', {
+      board: 'propose-cleanup',
+      base_version: pcVer0,
+      question: '新增节点并连线（用于测试拒绝清理）？',
+      ops: [
+        { op: 'add_node', id: 'tmp_a', label: '临时节点A' },
+        { op: 'add_edge', from: hostShort0, to: 'tmp_a' }
+      ]
+    })
+  )
+  const reqReject = propRejectRes.match(/req_\w+/)?.[0]
+  await user3.waitForBanner()
+  const previewArrowId = await user3.js(`(() => {
+    const els = window.__flyingdrawsApi.getSceneElements().filter((e) => !e.isDeleted)
+    const arr = els.find((e) => e.type === 'arrow' && e.customData?.flyingdraws?.layer === 'proposal')
+    return arr?.id ?? null
+  })()`)
+  const hasPreviewBound = await user3.js(`(() => {
+    const host = window.__flyingdrawsApi.getSceneElements().find((e) => e.id === ${JSON.stringify(hostElId)})
+    return Boolean(host?.boundElements?.some((b) => b.id === ${JSON.stringify(previewArrowId)}))
+  })()`)
+  check(Boolean(previewArrowId) && hasPreviewBound === true, '场景 4(a) 前置：提议挂起时已有节点 boundElements 已挂上提议连线 id')
+  const waitReject = call('canvas_wait', { request_id: reqReject, timeout_s: 30, image: 'never' })
+  await user3.click('不对，去掉')
+  const rejectDone = textOf(await waitReject)
+  const afterRejectBound = await user3.js(`(() => {
+    const host = window.__flyingdrawsApi.getSceneElements().find((e) => e.id === ${JSON.stringify(hostElId)} && !e.isDeleted)
+    return (host?.boundElements ?? []).map((b) => b.id)
+  })()`)
+  check(
+    /REJECTED/.test(rejectDone) && !afterRejectBound.includes(previewArrowId),
+    '场景 4(a)：点「不对，去掉」后，已有节点 boundElements 不再包含提议连线 id'
+  )
+
+  // (b) 再提一次，仅删提议里的新节点、保留提议连线后接受：endBinding 必须为 null，boundElements 不含已删元素
+  const pcRead1 = textOf(await call('canvas_read', { board: 'propose-cleanup', image: 'never' }))
+  const pcVer1 = Number(pcRead1.match(/v(\d+)：/)?.[1])
+  const hostShort1 = pcRead1.match(/(N\d+) 「已有节点」/)?.[1]
+  const propHalfRes = textOf(
+    await call('canvas_propose', {
+      board: 'propose-cleanup',
+      base_version: pcVer1,
+      question: '再提一次（用于测试删掉新节点后接受）？',
+      ops: [
+        { op: 'add_node', id: 'tmp_b', label: '临时节点B' },
+        { op: 'add_edge', from: hostShort1, to: 'tmp_b' }
+      ]
+    })
+  )
+  const reqHalf = propHalfRes.match(/req_\w+/)?.[0]
+  await user3.waitForBanner()
+  const halfDeletedIds = await user3.js(`(() => {
+    const api = window.__flyingdrawsApi
+    const all = api.getSceneElementsIncludingDeleted()
+    const propEdge = all.find((e) => !e.isDeleted && e.type === 'arrow' && e.customData?.flyingdraws?.layer === 'proposal')
+    const propNodeId = propEdge?.endBinding?.elementId
+    if (!propEdge || !propNodeId) return null
+    api.updateScene({
+      elements: all.map((e) =>
+        e.id === propNodeId || e.containerId === propNodeId ? { ...e, isDeleted: true, version: e.version + 1 } : e
+      )
+    })
+    return { edgeId: propEdge.id, deletedNodeId: propNodeId }
+  })()`)
+  check(Boolean(halfDeletedIds), '场景 4(b) 前置：（扮演用户）只删掉提议新节点并保留提议连线')
+  const waitHalf = call('canvas_wait', { request_id: reqHalf, timeout_s: 30, image: 'never' })
+  await user3.click('对，就这样')
+  const halfDone = textOf(await waitHalf)
+  const afterHalfCheck = await user3.js(`(() => {
+    const all = window.__flyingdrawsApi.getSceneElementsIncludingDeleted()
+    const deletedSet = new Set(all.filter((e) => e.isDeleted).map((e) => e.id))
+    const edge = all.find((e) => e.id === ${JSON.stringify(halfDeletedIds?.edgeId ?? null)} && !e.isDeleted)
+    const host = all.find((e) => e.id === ${JSON.stringify(hostElId)} && !e.isDeleted)
+    return {
+      edgeAlive: Boolean(edge),
+      edgeLayer: edge?.customData?.flyingdraws?.layer ?? null,
+      startBindingId: edge?.startBinding?.elementId ?? null,
+      endBinding: edge?.endBinding,
+      hostBoundHasDeleted: (host?.boundElements ?? []).some((b) => deletedSet.has(b.id))
+    }
+  })()`)
+  const halfOk =
+    /ACCEPTED/.test(halfDone) &&
+    afterHalfCheck.edgeAlive === true &&
+    afterHalfCheck.edgeLayer === 'final' &&
+    afterHalfCheck.startBindingId === hostElId &&
+    afterHalfCheck.endBinding === null &&
+    afterHalfCheck.hostBoundHasDeleted === false
+  if (!halfOk) console.log('[场景 4(b) 实测]', JSON.stringify(afterHalfCheck))
+  check(
+    halfOk,
+    '场景 4(b)：只删新节点保留连线并接受后，存活连线 endBinding 为 null 且已有节点 boundElements 不含已删元素'
+  )
+  await call('canvas_delete', { board: 'propose-cleanup' })
+
+  await call('canvas_open', { board: 'default' })
+  await until(async () => (await user3.js(`document.querySelector('.fd-board-select')?.value`)) === 'default')
+
   // 界面截图：浅色和深色各一张，菜单开着
   await user3.screenshot(join(OUT, 'ui-menu.png'))
   await user3.js(`window.__flyingdrawsApi.updateScene({ appState: { theme: 'dark' } })`)

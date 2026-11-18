@@ -2,27 +2,47 @@
 // 纯函数，不依赖 Electron。页面拿到计划后只负责把它变成 Excalidraw 元素。
 //
 // 新增：add_node、add_edge、add_text；trace_image 把一张图里的内容照原样转成可编辑元素。
-// 改动：update_node、delete_node、update_edge、delete_edge、update_text、delete_text、delete_strokes、set_style。
+// 改动：move、update_node、delete_node、update_edge、delete_edge、update_text、delete_text、delete_strokes、set_style。
 // 改动可以用在任何人画的东西上（用户的、别的 agent 的都行，design.md 12.4）；还在等用户确认的提议除外。
 // 排版：这一批里没指定坐标的新节点交给 dagre 排成一块，整块放在已有内容下方；
-// 已有元素不会被挪动。
+// 已有元素只在收到 move 指令时平移。
 import dagre from '@dagrejs/dagre'
 // 带 .ts 后缀：单元测试是用 node 直接跑这些文件的，node 不会自己补后缀
-import { exitPoint, type ShapeBox } from './geometry.ts'
-import type { Bbox, SceneElement, SemanticGraph } from './semantic.ts'
+import { AUTO_TEXT_MAX_W, containerHeightFor, containerWidthFor, exitPoint, type ShapeBox } from './geometry.ts'
+import { bboxOf, type Bbox, type SceneElement, type SemanticGraph } from './semantic.ts'
 
 export interface FingerprintElement extends SceneElement {
   version?: number
+  boundElements?: readonly { id: string; type: string }[] | null
   strokeColor?: string
+  backgroundColor?: string
+  fillStyle?: string
   strokeStyle?: string
   strokeWidth?: number
   opacity?: number
+  roughness?: number
+  roundness?: { type: number; value?: number } | null
+  locked?: boolean
+  link?: string | null
   fontSize?: number
+  fontFamily?: number
+  lineHeight?: number
+  textAlign?: string
+  verticalAlign?: string
+  autoResize?: boolean
+  originalText?: string
+  pressures?: readonly number[]
+  simulatePressure?: boolean
 }
+
+const textFingerprint = (text: FingerprintElement | undefined) => text ? [
+  text.text, text.originalText, text.strokeColor, text.opacity, text.fontSize, text.fontFamily,
+  text.lineHeight, text.textAlign, text.verticalAlign, text.autoResize
+] : null
 
 /**
  * 计算每个元素的冲突检测指纹。
- * - 普通元素（节点、文字、手绘、图片、完全未绑定箭头）使用 version + 绑定文字 version；
+ * - 普通元素使用实际内容、几何和样式，提议连线增删反向绑定时不会造成冲突；
  * - 已绑定到节点的箭头（startBinding / endBinding）：拖动或缩放端点节点时 Excalidraw 会连带递增箭头及其文字坐标的 version，
  *   但箭头的连接关系、折点数、文字内容与样式并未被改动，不应误判冲突；真改了连线文字、样式、方向、折点或自由端坐标时指纹仍会变化。
  */
@@ -64,7 +84,16 @@ export function elementFingerprints(elements: readonly FingerprintElement[]): Ma
         ].join('|')
       )
     } else {
-      out.set(el.id, `${el.version ?? 0}:${bt?.version ?? ''}`)
+      const crop = el.crop
+      out.set(el.id, JSON.stringify([
+        el.type, el.x, el.y, el.width, el.height, el.angle ?? 0,
+        el.strokeColor, el.backgroundColor, el.fillStyle, el.strokeStyle, el.strokeWidth, el.opacity,
+        el.roughness, el.roundness?.type, el.roundness?.value, el.locked, el.link,
+        el.name, el.groupIds, el.frameId, el.containerId, el.fileId, el.scale,
+        crop && [crop.x, crop.y, crop.width, crop.height, crop.naturalWidth, crop.naturalHeight],
+        el.startArrowhead, el.endArrowhead, el.points, el.pressures, el.simulatePressure,
+        el.customData?.flyingdraws?.layer, textFingerprint(el.type === 'text' ? el : undefined), textFingerprint(bt)
+      ]))
     }
   }
   return out
@@ -72,6 +101,7 @@ export function elementFingerprints(elements: readonly FingerprintElement[]): Ma
 
 export type NodeShape = 'rectangle' | 'ellipse' | 'diamond'
 export type Direction = 'right' | 'down'
+export type MoveSide = 'right' | 'left' | 'below' | 'above'
 
 export interface StyleProps {
   color?: string // 线条和文字的颜色
@@ -86,6 +116,7 @@ export type DrawOp =
   | { op: 'add_edge'; from: string; to: string; label?: string }
   | { op: 'add_text'; text: string; near?: string; x?: number; y?: number }
   // 下面这些会改动已有元素
+  | { op: 'move'; id: string; x?: number; y?: number; dx?: number; dy?: number; near?: string; side?: MoveSide; gap?: number }
   | { op: 'update_node'; id: string; label: string }
   | { op: 'delete_node'; id: string }
   | { op: 'update_edge'; from: string; to: string; label: string }
@@ -111,7 +142,7 @@ export type TraceElement =
   | { kind: 'text'; x: number; y: number; text: string; color?: string; font_size?: number }
   | { kind: 'line'; points: [number, number][]; arrow?: 'none' | 'end' | 'start' | 'both'; color?: string; dashed?: boolean; from?: string; to?: string }
 
-export const MODIFY_OPS = ['update_node', 'delete_node', 'update_edge', 'delete_edge', 'update_text', 'delete_text', 'delete_strokes', 'set_style']
+export const MODIFY_OPS = ['move', 'update_node', 'delete_node', 'update_edge', 'delete_edge', 'update_text', 'delete_text', 'delete_strokes', 'set_style']
 
 export interface PlannedNode {
   key: string // agent 在 ops 里起的名字
@@ -163,6 +194,45 @@ export interface PlannedLine {
   toElementId?: string
 }
 
+export interface PlannedMove {
+  id: string // 指令里的目标编号（rebase 后，如 N1 / T1 / S1 / I1 或稳定 id）
+  kind: 'node' | 'text' | 'strokes' | 'image'
+  targetKey: string // 主元素 Excalidraw id（节点/文字/图片为自身 id，手绘组为首笔 id）
+  elementIds: string[] // 要平移的全部底层元素 id（手绘组含组内全部笔画；节点内绑定文字由渲染端随容器平移）
+  dx: number
+  dy: number
+  fromBbox: Bbox
+  toBbox: Bbox
+  toTopLeft?: { x: number; y: number } // x,y / near 绝对目标左上角（渲染端按实测扩宽后框体对齐此左上角，消除估算偏差）
+  adjusted?: boolean // near 理想贴边位被占而发生避障滑动时为 true
+  overlaps?: string[] // x,y / dx,dy 精确落位与已有非自身元素重叠时的提示编号（如 ["N4"]）
+}
+
+export interface PlannedReroute {
+  arrowId: string
+  fromElementId?: string
+  toElementId?: string
+  x: number
+  y: number
+  points: [number, number][] // 相对起点的折线，首点 [0, 0]
+}
+
+// 提议层里的移动落点虚线框：用户可直接拖拽调整最终落点，或删掉它/原位标记框来否决这次移动
+export interface PlannedMoveGhost {
+  ghostId: string
+  frameId: string // 关联的原位 PlannedMarker.frameId
+  targetKey: string
+  elementIds: string[]
+  x: number
+  y: number
+  w: number
+  h: number
+  dx: number // 计划平移量
+  dy: number
+  label: string // 框内提示文字，如"「登录」移到这里"
+  summary: string // 否决/调整时拼给 agent 的主语，如"移动节点「登录」"
+}
+
 export interface DrawPlan {
   nodes: PlannedNode[]
   edges: PlannedEdge[]
@@ -173,7 +243,10 @@ export interface DrawPlan {
   textEdits: { elementId: string; text: string }[] // 改独立文字的内容
   styles: PlannedStyle[]
   deletes: string[] // 要删的元素（节点、连线、独立文字、手绘笔画）。绑在上面的文字、连着被删节点的 agent 连线由页面一并处理
+  moves: PlannedMove[] // 要平移的元素（节点、独立文字、手绘单笔/整组、图片）
+  reroutes?: PlannedReroute[] // 节点移动后，主进程为受影响连线重新算出的绕障折线
   markers: PlannedMarker[] // 只有提议里才有：改动先不执行，画一个标记框告诉用户"打算改这里"
+  moveGhosts?: PlannedMoveGhost[] // 只有提议里才有：移动目标落点的可拖拽虚线预览框
   targetGroups: string[][] // 每条改动指令对应的元素。一组手写是好几个元素，要合在一起标记
   existingRefs: string[] // 这批指令引用到的已有元素（Excalidraw id），页面执行前要确认它们还在
   // 用稳定 id（元素自己的 id）而不是 N1/I1 这类短编号引用的元素：不会随版本错位，不要求 base_version，但执行前同样要确认还在
@@ -210,6 +283,19 @@ export interface PendingChanges {
   textEdits: DrawPlan['textEdits']
   styles: PlannedStyle[]
   deletes: string[]
+  moves?: PlannedMove[]
+  reroutes?: PlannedReroute[]
+  moveGhosts?: {
+    ghostId: string
+    frameId: string
+    targetKey: string
+    elementIds: string[]
+    x: number
+    y: number
+    dx: number
+    dy: number
+    summary: string
+  }[]
   markers: { frameId: string; targets: string[]; summary: string }[]
 }
 
@@ -218,12 +304,13 @@ export interface PendingChanges {
 // 把指令里的旧编号换成同一个元素现在的编号。元素已经不在了的，记进 gone。
 export function rebaseOps(
   ops: readonly DrawOp[],
-  base: readonly { id: string; ref: string }[],
+  base: readonly { id: string; ref: string; refs?: readonly string[] }[],
   graph: SemanticGraph
 ): { ops: DrawOp[]; gone: string[] } {
-  const fresh = new Set(ops.flatMap((op) => (op.op === 'add_node' ? [String(op.id)] : [])))
-  const refOf = new Map(base.map((n) => [n.id, n.ref]))
-  // 元素 → 现在的编号。手绘分组里每一笔都指向那一组：只要当时那组的第一笔还在，就认作同一组
+  const fresh = new Set(ops.flatMap((op) => (op.op === 'add_node' ? [String(op.id).trim()] : [])))
+  const priorById = new Map(base.map((item) => [item.id, item]))
+  const strokeGroups = new Map(graph.strokeGroups.map((group) => [group.id, group.refs]))
+  // 元素 → 现在的编号。手绘分组只有在全部成员仍组成同一组时才重映射。
   const nowOf = new Map<string, string>()
   for (const n of graph.nodes) nowOf.set(n.ref, n.id)
   for (const n of graph.notes) nowOf.set(n.ref, n.id)
@@ -232,13 +319,17 @@ export function rebaseOps(
   for (const img of graph.images) nowOf.set(img.ref, img.id)
   const gone = new Set<string>()
   const fix = <T>(id: T): T => {
-    if (typeof id !== 'string' || fresh.has(id)) return id
-    const ref = refOf.get(id)
-    if (!ref) return id // 那个版本里没有这个编号：留给 planOps 报"不认识这个节点"
-    const now = nowOf.get(ref)
-    if (!now) {
-      gone.add(id)
-      return id
+    if (typeof id !== 'string') return id
+    const key = id.trim()
+    const prior = fresh.has(key) ? undefined : priorById.get(key)
+    if (!prior) return key as T
+    const now = nowOf.get(prior.ref)
+    const refs = prior.refs
+    if (!now || (refs && refs.length > 1 && (
+      strokeGroups.get(now)?.length !== refs.length || refs.some((ref) => nowOf.get(ref) !== now)
+    ))) {
+      gone.add(prior.id)
+      return key as T
     }
     return now as T
   }
@@ -250,6 +341,8 @@ export function rebaseOps(
         return { ...op, from: fix(op.from), to: fix(op.to) }
       case 'add_text':
         return { ...op, near: fix(op.near) }
+      case 'move':
+        return { ...op, id: fix(op.id), ...(op.near !== undefined ? { near: fix(op.near) } : {}) }
       case 'update_node':
       case 'delete_node':
       case 'update_text':
@@ -278,6 +371,7 @@ const EDGE_GAP = 8 // 箭头端点离节点轮廓多远
 const TEXT_GAP = 14
 const FONT_SIZE = 20
 const LINE_H = FONT_SIZE * 1.25
+const BOUND_TEXT_INSET = 10 // Excalidraw 0.18.1 的绑定文字四边各留 5px
 const START: [number, number] = [100, 100] // 空画板上新内容的左上角
 
 // 估算一段文字的宽度：中日韩文字按一个字号宽，其他按 0.6 个字号。
@@ -298,11 +392,9 @@ function textSize(text: string): { w: number; h: number } {
 
 function nodeSize(shape: NodeShape, label: string | null): { w: number; h: number } {
   const t = label ? textSize(label) : { w: 0, h: LINE_H }
-  // 椭圆和菱形里能放字的地方比外接框小，多留一些
-  const pad = shape === 'rectangle' ? 1 : shape === 'ellipse' ? 1.4 : 2
   return {
-    w: Math.max(NODE_MIN_W, Math.ceil((t.w + 40) * pad)),
-    h: Math.max(shape === 'diamond' ? 90 : NODE_H, Math.ceil((t.h + 30) * pad))
+    w: containerWidthFor(shape, t.w, NODE_MIN_W),
+    h: containerHeightFor(shape, t.h, NODE_H)
   }
 }
 
@@ -316,6 +408,46 @@ const PLACE_STEP = 40
 
 const overlaps = (a: Bbox, b: Bbox, margin = 0): boolean =>
   a.x < b.x + b.w + margin && a.x + a.w + margin > b.x && a.y < b.y + b.h + margin && a.y + a.h + margin > b.y
+
+const inside = ([x, y]: [number, number], box: Bbox): boolean =>
+  x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h
+
+export function placeBeside(
+  size: { w: number; h: number },
+  anchor: Bbox,
+  side: MoveSide,
+  gap: number,
+  obstacles: readonly Bbox[]
+): { x: number; y: number; adjusted: boolean } {
+  const center = centerOf(anchor)
+  const others = obstacles.filter((box) => !inside(center, box))
+  const horizontal = side === 'right' || side === 'left'
+  const sign = side === 'right' || side === 'below' ? 1 : -1
+  const x = side === 'right' ? anchor.x + anchor.w + gap : side === 'left' ? anchor.x - size.w - gap : center[0] - size.w / 2
+  const y = side === 'below' ? anchor.y + anchor.h + gap : side === 'above' ? anchor.y - size.h - gap : center[1] - size.h / 2
+  const free = (x: number, y: number) => !others.some((box) => overlaps({ x, y, ...size }, box, DETOUR_PAD))
+  if (free(x, y)) return { x, y, adjusted: false }
+  for (let k = 1; k <= 10; k++) {
+    for (const offset of [PLACE_STEP * k, -PLACE_STEP * k]) {
+      const nx = x + (horizontal ? 0 : offset)
+      const ny = y + (horizontal ? offset : 0)
+      if (free(nx, ny)) return { x: nx, y: ny, adjusted: true }
+    }
+  }
+  for (let k = 1; k <= 8; k++) {
+    const offset = PLACE_STEP * k * sign
+    const nx = x + (horizontal ? offset : 0)
+    const ny = y + (horizontal ? 0 : offset)
+    if (free(nx, ny)) return { x: nx, y: ny, adjusted: true }
+  }
+  const bottom = others.reduce((max, box) => Math.max(max, box.y + box.h), anchor.y + anchor.h)
+  const [nx, ny] = placeBlock(size, others, {
+    anchors: [anchor],
+    direction: horizontal ? 'right' : 'down',
+    fallback: [center[0] - size.w / 2, bottom + BLOCK_GAP]
+  })
+  return { x: nx, y: ny, adjusted: true }
+}
 
 // 新的一块放哪儿，返回它的左上角。
 // - 连着已有节点：紧挨着那些节点放。先试顺着排版方向的那一侧（横排试右边，竖排试下面），被占了试另一侧，
@@ -404,7 +536,6 @@ const DETOUR_STEP = 20
 // 两个节点之间的直线如果会压到别的东西，给它加一个拐点绕开：在线段中点的垂直方向上，
 // 往两边由近到远地试，取第一处让两段线都不压东西的位置。绕不开就返回 null，照旧画直线。
 export function detourPoint(a: [number, number], b: [number, number], obstacles: readonly Bbox[]): [number, number] | null {
-  const inside = (p: [number, number], o: Bbox) => p[0] >= o.x && p[0] <= o.x + o.w && p[1] >= o.y && p[1] <= o.y + o.h
   // 起点或终点落在里面的框不算障碍：那是这两个节点自己，或者圈着它们的大框
   const others = obstacles.filter((o) => !inside(a, o) && !inside(b, o))
   const blocked = (p: [number, number], q: [number, number]) => others.some((o) => segmentHits(p, q, o, DETOUR_PAD))
@@ -431,7 +562,6 @@ export function detourPoint(a: [number, number], b: [number, number], obstacles:
 export function detourPath(a: [number, number], b: [number, number], obstacles: readonly Bbox[]): [number, number][] {
   const single = detourPoint(a, b, obstacles)
   if (single) return [single]
-  const inside = (p: [number, number], o: Bbox) => p[0] >= o.x && p[0] <= o.x + o.w && p[1] >= o.y && p[1] <= o.y + o.h
   const others = obstacles.filter((o) => !inside(a, o) && !inside(b, o))
   const blocked = (p: [number, number], q: [number, number]) => others.some((o) => segmentHits(p, q, o, DETOUR_PAD))
   if (!blocked(a, b)) return []
@@ -502,25 +632,111 @@ function styleProps(op: StyleProps, where: string): Omit<PlannedStyle, 'elementI
   return out
 }
 
+const MOVE_LIMIT = 1e6
+const MOVE_SIDES: readonly MoveSide[] = ['right', 'left', 'below', 'above']
+type MovePosition =
+  | { mode: 'absolute'; x: number; y: number }
+  | { mode: 'relative'; dx: number; dy: number }
+  | { mode: 'near'; near: string; side: MoveSide; gap: number }
+
+function moveNumber(value: unknown, field: string, where: string): number {
+  if (!isFiniteNumber(value) || Math.abs(value) > MOVE_LIMIT) {
+    throw new OpsError(`${where}: ${field} must be a finite number between -${MOVE_LIMIT} and ${MOVE_LIMIT}`)
+  }
+  return value
+}
+
+function movePosition(op: Extract<DrawOp, { op: 'move' }>, where: string): MovePosition {
+  const absolute = op.x !== undefined || op.y !== undefined
+  const relative = op.dx !== undefined || op.dy !== undefined
+  const near = op.near !== undefined
+  if (Number(absolute) + Number(relative) + Number(near) !== 1) {
+    throw new OpsError(`${where}: move needs exactly one of x/y, dx/dy, or near`)
+  }
+  if (near) {
+    if (typeof op.near !== 'string' || !op.near.trim()) throw new OpsError(`${where}: near must be a non-empty id`)
+    const side = op.side === undefined ? 'right' : op.side
+    if (!MOVE_SIDES.includes(side)) throw new OpsError(`${where}: side must be right, left, below, or above`)
+    const gap = op.gap === undefined ? 40 : op.gap
+    if (!isFiniteNumber(gap) || gap < 0 || gap > 400) throw new OpsError(`${where}: gap must be a finite number between 0 and 400`)
+    return { mode: 'near', near: op.near.trim(), side, gap }
+  }
+  if (op.side !== undefined || op.gap !== undefined) throw new OpsError(`${where}: side and gap require near`)
+  if (absolute) {
+    if (op.x === undefined || op.y === undefined) throw new OpsError(`${where}: x and y must be provided together`)
+    return { mode: 'absolute', x: moveNumber(op.x, 'x', where), y: moveNumber(op.y, 'y', where) }
+  }
+  return {
+    mode: 'relative',
+    dx: op.dx === undefined ? 0 : moveNumber(op.dx, 'dx', where),
+    dy: op.dy === undefined ? 0 : moveNumber(op.dy, 'dy', where)
+  }
+}
+
+interface MoveTarget {
+  id: string
+  kind: PlannedMove['kind']
+  elementIds: string[]
+  bbox: Bbox
+  proposed: boolean
+}
+
+function moveTargets(graph: SemanticGraph): MoveTarget[] {
+  const single = (item: { id: string; ref: string; bbox: Bbox; proposed?: boolean }, kind: PlannedMove['kind']): MoveTarget =>
+    ({ id: item.id, kind, elementIds: [item.ref], bbox: item.bbox, proposed: item.proposed ?? false })
+  return [
+    ...graph.nodes.filter((node) => node.kind !== 'line').map((node) => single(node, 'node')),
+    ...graph.notes.map((note) => single(note, 'text')),
+    ...graph.strokes.map((stroke) => single(stroke, 'strokes')),
+    ...graph.strokeGroups.map((group): MoveTarget => ({ ...group, elementIds: group.refs, kind: 'strokes', proposed: false })),
+    ...graph.images.map((image) => single(image, 'image'))
+  ]
+}
+
+function resizedNodeBox(old: Box, style: PlannedStyle | undefined, update: DrawPlan['updates'][number] | undefined): Box {
+  const shape = style?.shape ?? old.shape
+  const label = update?.label
+  const autoWidth = label && (!update.relayout || shape !== old.shape)
+    ? containerWidthFor(shape, Math.min(estimateTextWidth(label), AUTO_TEXT_MAX_W), NODE_MIN_W)
+    : old.w
+  const w = style?.w ?? Math.max(old.w, autoWidth)
+  // 估算文字按 Excalidraw 的有效内宽折行后所需的高度。
+  const innerScale = shape === 'diamond' ? 0.5 : shape === 'ellipse' ? Math.SQRT1_2 : 1
+  const innerWidth = Math.max(1, Math.round(w * innerScale) - BOUND_TEXT_INSET)
+  const lineCount = label ? label.split('\n').reduce((sum, line) => {
+    const lines = Math.min(Array.from(line).length, Math.ceil(estimateTextWidth(line) / innerWidth))
+    return sum + Math.max(1, lines)
+  }, 0) : 0
+  const minHeight = Math.round((lineCount * LINE_H + BOUND_TEXT_INSET) / innerScale)
+  const h = style?.h ?? (label ? Math.max(old.h, NODE_H, minHeight) : old.h)
+  return { x: old.x + (old.w - w) / 2, y: old.y + (old.h - h) / 2, w, h, shape }
+}
+
+function routeBetween(from: Box, to: Box, obstacles: readonly Bbox[], bends: [number, number][] = []): Omit<PlannedReroute, 'arrowId'> {
+  const start = centerOf(from)
+  const end = centerOf(to)
+  const route = [start, ...bends, end]
+  const nextPoints = route.slice(1)
+  const clear = bends.length > 0 && !obstacles.some((box) => !inside(start, box) && !inside(end, box)
+    && nextPoints.some((point, i) => segmentHits(route[i], point, box, DETOUR_PAD)))
+  const mid = clear ? bends : detourPath(start, end, obstacles)
+  const [x, y] = exitPoint(from, ...(mid[0] ?? end), EDGE_GAP)
+  const exit = exitPoint(to, ...(mid[mid.length - 1] ?? start), EDGE_GAP)
+  return { x, y, points: [[0, 0], ...[...mid, exit].map(([px, py]): [number, number] => [px - x, py - y])] }
+}
+
 export function planOps(
   ops: readonly DrawOp[],
   graph: SemanticGraph,
   newId: () => string,
-  opts: { direction?: Direction; view?: Bbox | null } = {} // view：用户当前看得见的那块画布（画布坐标），没有就不管视野
+  opts: { direction?: Direction; view?: Bbox | null; elements?: readonly SceneElement[] } = {} // elements 提供手绘成员与箭头的底层信息
 ): DrawPlan {
   if (!Array.isArray(ops) || ops.length === 0) throw new OpsError('ops must be a non-empty array')
   const direction: Direction = opts.direction === 'down' ? 'down' : 'right'
 
   // 已有节点：agent 用上一次读到的短编号（N1、N2……）引用
   const existing = new Map(graph.nodes.map((n) => [n.id, n]))
-  const allBoxes: Bbox[] = [
-    ...graph.nodes.map((n) => n.bbox),
-    ...graph.notes.map((n) => n.bbox),
-    ...graph.strokes.map((s) => s.bbox),
-    ...graph.strokeGroups.map((g) => g.bbox),
-    ...graph.images.map((i) => i.bbox),
-    ...graph.lines.map((l) => l.bbox)
-  ]
+  const rawById = new Map(opts.elements?.filter((el) => !el.isDeleted).map((el) => [el.id, el]))
 
   // ---------- 第一遍：新节点（先定大小，位置等排版） ----------
   const nodes: PlannedNode[] = []
@@ -544,21 +760,16 @@ export function planOps(
 
   // ---------- 第二遍：连线和文字，这里只校验引用，不算位置 ----------
   const existingRefs = new Set<string>()
-  const check = (key: string, where: string): string => {
-    if (byKey.has(key)) return key
-    const old = existing.get(key)
-    if (old) {
-      existingRefs.add(old.ref)
-      return key
-    }
-    throw new OpsError(`${where}: unknown node "${key}". Use an id from an add_node in this call, or a node id (like N1) from your latest canvas_read`)
-  }
+  const stableRefs = new Set<string>()
   const edgeOps: { from: string; to: string; label: string | null }[] = []
   const traceOps: { op: TraceImageOp; where: string }[] = []
   const textOps: { text: string; near: string | null; x: number | null; y: number | null }[] = []
+  const moveOps: { id: string; target: MoveTarget; anchor?: MoveTarget; position: MovePosition; where: string }[] = []
+  const movingRefs = new Set<string>()
 
   // 改动和删除：谁画的都能动（用户的、别的 agent 的），只有还在等用户确认的提议不行
   const updates: DrawPlan['updates'] = []
+  const nodeUpdateIndexes = new Map<string, number>()
   const textEdits: DrawPlan['textEdits'] = []
   const styles = new Map<string, PlannedStyle>()
   const relayout = new Map<string, string>() // 改了形状或大小的节点 → 它里面的文字（要重新摆）
@@ -566,10 +777,50 @@ export function planOps(
   const deletes = new Set<string>()
   const modifiedRefs = new Set<string>()
   const deletedKeys = new Set<string>()
-  const settled = (item: { proposed: boolean }, what: string, where: string): void => {
-    if (item.proposed) throw new OpsError(`${where}: ${what} is part of a proposal the user has not answered yet. Wait for their answer (canvas_wait) first.`)
+  const targets = moveTargets(graph)
+  const targetsById = new Map(targets.map((target) => [target.id, target]))
+  const targetsByRef = new Map(targets.filter((target) => target.elementIds.length === 1).map((target) => [target.elementIds[0], target]))
+  const groupedMemberRefs = new Set(graph.strokeGroups.flatMap((group) => group.refs))
+  for (const group of graph.strokeGroups) {
+    for (const ref of group.refs) {
+      const el = rawById.get(ref)
+      if (!el) continue
+      targetsByRef.set(ref, { id: group.id, kind: 'strokes', elementIds: [ref], bbox: bboxOf(el), proposed: false })
+    }
+  }
+  const lineRefs = new Set([...graph.edges.map((edge) => edge.ref), ...graph.lines.map((line) => line.ref)])
+  const proposedEdges = new Set(graph.edges.filter((edge) => edge.proposed).map((edge) => edge.ref))
+  const requireSettledRef = (id: string, where: string, target = targetsById.get(id) ?? targetsByRef.get(id)): void => {
+    const proposed = target?.proposed || existing.get(id)?.proposed || proposedEdges.has(id) || (target?.elementIds ?? [id]).some(
+      (ref) => rawById.get(ref)?.customData?.flyingdraws?.layer === 'proposal'
+    )
+    if (proposed) throw new OpsError(`${where}: element ${id} is part of a proposal the user has not answered yet. Wait for their answer (canvas_wait) first.`)
+  }
+  const check = (key: string, where: string): string => {
+    if (byKey.has(key)) return key
+    requireSettledRef(key, where)
+    const old = existing.get(key)
+    if (old) {
+      existingRefs.add(old.ref)
+      return key
+    }
+    throw new OpsError(`${where}: unknown node "${key}". Use an id from an add_node in this call, or a node id (like N1) from your latest canvas_read`)
+  }
+  const moveTarget = (id: string, where: string, anchor = false): MoveTarget => {
+    const target = targetsById.get(id) ?? targetsByRef.get(id)
+    requireSettledRef(id, where, target)
+    if (!target) {
+      if (lineRefs.has(id) || existing.get(id)?.kind === 'line') {
+        throw new OpsError(`${where}: move cannot ${anchor ? 'use a line or arrow as an anchor' : 'move a line or arrow'}`)
+      }
+      throw new OpsError(`${where}: unknown element "${id}". Use an existing N, T, S, or I id, or its stable element id`)
+    }
+    const refs = targetsById.has(id) ? existingRefs : stableRefs
+    for (const ref of target.elementIds) refs.add(ref)
+    return target
   }
   const oldNode = (key: string, where: string) => {
+    requireSettledRef(key, where)
     const node = existing.get(key)
     if (!node) {
       throw new OpsError(
@@ -578,23 +829,25 @@ export function planOps(
           : `${where}: unknown node "${key}". Use a node id (like N1) from your latest canvas_read`
       )
     }
-    settled(node, `node ${key}`, where)
     return node
   }
   const oldEdge = (from: string, to: string, where: string) => {
-    for (const key of [from, to]) if (!existing.has(key)) throw new OpsError(`${where}: unknown node "${key}". Use node ids (like N1) from your latest canvas_read`)
+    for (const key of [from, to]) {
+      requireSettledRef(key, where)
+      if (!existing.has(key)) throw new OpsError(`${where}: unknown node "${key}". Use node ids (like N1) from your latest canvas_read`)
+    }
     const edge =
       graph.edges.find((e) => e.from === from && e.to === to) ??
       graph.edges.find((e) => e.directed !== 'forward' && e.from === to && e.to === from) // 没有方向或双向的线，两头反着说也认
     if (!edge) throw new OpsError(`${where}: there is no arrow from ${from} to ${to} on the canvas`)
-    settled(edge, `the arrow from ${from} to ${to}`, where)
+    requireSettledRef(edge.ref, where)
     return edge
   }
   const notesById = new Map(graph.notes.map((n) => [n.id, n]))
   const oldText = (key: string, where: string) => {
+    requireSettledRef(key, where)
     const note = notesById.get(key)
     if (!note) throw new OpsError(`${where}: unknown text "${key}". Use a text id (like T1) from your latest canvas_read`)
-    settled(note, `text ${key}`, where)
     return note
   }
   const strokeRefs = new Map<string, string[]>([
@@ -602,6 +855,7 @@ export function planOps(
     ...graph.strokes.map((s): [string, string[]] => [s.id, [s.ref]])
   ])
   const oldStrokes = (key: string, where: string): string[] => {
+    requireSettledRef(key, where)
     const refs = strokeRefs.get(key)
     if (!refs) throw new OpsError(`${where}: unknown hand-drawn strokes "${key}". Use a stroke id (like S1) from your latest canvas_read`)
     return refs
@@ -616,21 +870,23 @@ export function planOps(
 
   ops.forEach((op, i) => {
     if (op.op === 'update_node' || op.op === 'delete_node') {
-      const node = oldNode(String(op.id ?? ''), `ops[${i}].id`)
+      const node = oldNode(String(op.id ?? '').trim(), `ops[${i}].id`)
       touch([node.ref])
       if (op.op === 'delete_node') {
         deletes.add(node.ref)
         deletedKeys.add(node.id)
       } else {
-        updates.push({ elementId: node.ref, textId: newId(), label: cleanLabel(op.label) })
+        const index = nodeUpdateIndexes.get(node.ref) ?? updates.length
+        nodeUpdateIndexes.set(node.ref, index)
+        updates[index] = { elementId: node.ref, textId: newId(), label: cleanLabel(op.label) }
       }
     } else if (op.op === 'update_edge' || op.op === 'delete_edge') {
-      const edge = oldEdge(String(op.from ?? ''), String(op.to ?? ''), `ops[${i}]`)
+      const edge = oldEdge(String(op.from ?? '').trim(), String(op.to ?? '').trim(), `ops[${i}]`)
       touch([edge.ref])
       if (op.op === 'delete_edge') deletes.add(edge.ref)
       else updates.push({ elementId: edge.ref, textId: newId(), label: cleanLabel(op.label) })
     } else if (op.op === 'update_text' || op.op === 'delete_text') {
-      const note = oldText(String(op.id ?? ''), `ops[${i}].id`)
+      const note = oldText(String(op.id ?? '').trim(), `ops[${i}].id`)
       touch([note.ref])
       if (op.op === 'delete_text') {
         deletes.add(note.ref)
@@ -640,7 +896,7 @@ export function planOps(
         textEdits.push({ elementId: note.ref, text })
       }
     } else if (op.op === 'delete_strokes') {
-      const refs = oldStrokes(String(op.id ?? ''), `ops[${i}].id`)
+      const refs = oldStrokes(String(op.id ?? '').trim(), `ops[${i}].id`)
       touch(refs)
       for (const ref of refs) deletes.add(ref)
     } else if (op.op === 'set_style') {
@@ -651,6 +907,7 @@ export function planOps(
       let shaped = false // 只有矩形、椭圆、菱形能改填充、形状和大小
       const key = typeof op.id === 'string' ? op.id.trim() : ''
       if (key) {
+        requireSettledRef(key, `${where}.id`)
         if (existing.has(key) || byKey.has(key)) {
           const node = oldNode(key, `${where}.id`)
           refs = [node.ref]
@@ -667,7 +924,7 @@ export function planOps(
           throw new OpsError(`${where}.id: unknown id "${key}". Use a node (N1), text (T1) or stroke (S1) id from your latest canvas_read`)
         }
       } else if (op.from && op.to) {
-        refs = [oldEdge(String(op.from), String(op.to), where).ref]
+        refs = [oldEdge(String(op.from).trim(), String(op.to).trim(), where).ref]
         what = `the arrow from ${op.from} to ${op.to}`
       } else {
         throw new OpsError(`${where}: set_style needs "id" (a node, text or stroke id), or "from" and "to" for an arrow`)
@@ -677,27 +934,44 @@ export function planOps(
       }
       touch(refs)
       for (const ref of refs) styles.set(ref, { ...styles.get(ref), ...props, elementId: ref })
+    } else if (op.op === 'move') {
+      const where = `ops[${i}]`
+      const id = typeof op.id === 'string' ? op.id.trim() : ''
+      const target = moveTarget(id, `${where}.id`)
+      const position = movePosition(op, where)
+      const anchor = position.mode === 'near' && !byKey.has(position.near) ? moveTarget(position.near, `${where}.near`, true) : undefined
+      if (anchor?.elementIds.some((ref) => target.elementIds.includes(ref))) throw new OpsError(`${where}: move cannot use its own target as near`)
+      for (const ref of target.elementIds) {
+        if (movingRefs.has(ref)) throw new OpsError(`${where}: element "${id}" is already moved in this call`)
+        movingRefs.add(ref)
+        modifiedRefs.add(ref)
+      }
+      targetGroups.push(target.elementIds)
+      moveOps.push({ id, target, anchor, position, where })
     } else if (op.op === 'add_edge') {
-      const from = check(String(op.from ?? ''), `ops[${i}].from`)
-      const to = check(String(op.to ?? ''), `ops[${i}].to`)
+      const from = check(String(op.from ?? '').trim(), `ops[${i}].from`)
+      const to = check(String(op.to ?? '').trim(), `ops[${i}].to`)
       if (from === to) throw new OpsError(`ops[${i}]: an edge cannot connect a node to itself`)
       edgeOps.push({ from, to, label: cleanLabel(op.label) })
     } else if (op.op === 'add_text') {
       const text = String(op.text ?? '').trim()
       if (!text) throw new OpsError(`ops[${i}]: add_text needs "text"`)
       const placed = isFiniteNumber(op.x) && isFiniteNumber(op.y)
+      const near = String(op.near ?? '').trim()
+      if (placed && near && !byKey.has(near)) requireSettledRef(near, `ops[${i}].near`)
       textOps.push({
         text,
-        near: !placed && op.near ? check(String(op.near), `ops[${i}].near`) : null,
+        near: !placed && near ? check(near, `ops[${i}].near`) : null,
         x: placed ? op.x! : null,
         y: placed ? op.y! : null
       })
     } else if (op.op === 'trace_image') {
+      requireSettledRef(String(op.image ?? '').trim(), `ops[${i}].image`)
       traceOps.push({ op, where: `ops[${i}]` })
     } else if (op.op !== 'add_node') {
       throw new OpsError(
         `ops[${i}]: unknown op "${String((op as { op?: unknown }).op)}". Supported: add_node, add_edge, add_text, trace_image, ` +
-          'update_node, delete_node, update_edge, delete_edge, update_text, delete_text, delete_strokes, set_style'
+          'move, update_node, delete_node, update_edge, delete_edge, update_text, delete_text, delete_strokes, set_style'
       )
     }
   })
@@ -711,6 +985,55 @@ export function planOps(
     for (const key of [e.from, e.to]) if (deletedKeys.has(key)) throw new OpsError(`this call deletes node ${key} and also adds an arrow to it`)
   }
   for (const t of textOps) if (t.near && deletedKeys.has(t.near)) throw new OpsError(`this call deletes node ${t.near} and also puts text next to it`)
+  for (const { id, target, anchor, where } of moveOps) {
+    if (target.elementIds.some((ref) => deletes.has(ref))) throw new OpsError(`${where}: this call deletes element "${id}" and also moves it`)
+    if (anchor?.elementIds.some((ref) => deletes.has(ref))) throw new OpsError(`${where}: the near anchor "${anchor.id}" is deleted in this call`)
+  }
+
+  const nodeByRef = new Map(graph.nodes.map((node) => [node.ref, node]))
+  const nodeShapes = new Map(graph.nodes.map((node) => [node.ref, node.kind]))
+  const virtualBoxes = new Map<string, Bbox>()
+  const reshapedRefs = new Set<string>()
+  const nodeUpdates = new Map(updates.map((update) => [update.elementId, update]))
+  for (const node of graph.nodes) {
+    if (!['rectangle', 'ellipse', 'diamond'].includes(node.kind) || deletes.has(node.ref)) continue
+    const style = styles.get(node.ref)
+    const update = nodeUpdates.get(node.ref)
+    if (!style && !update) continue
+    const next = resizedNodeBox({ ...node.bbox, shape: node.kind }, style, update)
+    nodeShapes.set(node.ref, next.shape)
+    virtualBoxes.set(node.ref, { x: next.x, y: next.y, w: next.w, h: next.h })
+    if (next.shape !== node.kind || next.w !== node.bbox.w || next.h !== node.bbox.h) reshapedRefs.add(node.ref)
+  }
+
+  // 合并 N/I 等对同一元素的别名，手绘以整组外接框为常规障碍。
+  const groupBoxes = new Map<string, Bbox>()
+  const splitStrokeGroups = new Set<string>()
+  const currentBox = (target: MoveTarget): Bbox => {
+    if (target.elementIds.length === 1) return virtualBoxes.get(target.elementIds[0]) ?? target.bbox
+    if (!splitStrokeGroups.has(target.id)) return groupBoxes.get(target.id) ?? target.bbox
+    const members = target.elementIds.map((ref) => {
+      const member = targetsByRef.get(ref)
+      return member ? currentBox(member) : target.bbox
+    })
+    const x = Math.min(...members.map((box) => box.x))
+    const y = Math.min(...members.map((box) => box.y))
+    return { x, y, w: Math.max(...members.map((box) => box.x + box.w)) - x, h: Math.max(...members.map((box) => box.y + box.h)) - y }
+  }
+  const obstacleTargets = targets.filter((target) => target.elementIds.length > 1 || targetsByRef.get(target.elementIds[0]) === target)
+  const sceneBoxes = (omitted: ReadonlySet<string>) => obstacleTargets.flatMap((target): { id: string; box: Bbox }[] => {
+    const refs = target.elementIds.filter((ref) => !omitted.has(ref))
+    if (!refs.length) return []
+    if (refs.length === target.elementIds.length && (refs.length === 1 || !splitStrokeGroups.has(target.id))) {
+      return [{ id: target.id, box: currentBox(target) }]
+    }
+    return refs.flatMap((ref) => {
+      const member = targetsByRef.get(ref)
+      return member ? [{ id: target.id, box: currentBox(member) }] : []
+    })
+  })
+  const lineBoxes = graph.lines.filter((line) => !deletes.has(line.ref)).map((line) => line.bbox)
+  const layoutBoxes = [...sceneBoxes(new Set([...deletes, ...movingRefs])).map(({ box }) => box), ...lineBoxes]
 
   // 挂在新节点旁边的文字：排版时给它留出位置（横排时在节点下方，竖排时在节点右侧）
   const reserved = new Map<string, { w: number; h: number }>()
@@ -725,7 +1048,7 @@ export function planOps(
   // ---------- 排版：dagre 排自动节点，整块放到已有内容下方 ----------
   const bends = new Map<number, [number, number][]>() // 第几条连线 → dagre 给的中间拐点
   let blockBottom: number | null = null
-  let blockLeft = allBoxes.length ? Math.min(...allBoxes.map((b) => b.x)) : START[0]
+  let blockLeft = layoutBoxes.length ? Math.min(...layoutBoxes.map((b) => b.x)) : START[0]
   if (auto.size) {
     const g = new dagre.graphlib.Graph({ multigraph: true })
     g.setGraph({ rankdir: direction === 'right' ? 'LR' : 'TB', nodesep: NODE_SEP, ranksep: RANK_SEP })
@@ -771,16 +1094,16 @@ export function planOps(
           .flatMap((e) => (auto.has(e.from) !== auto.has(e.to) ? [existing.get(auto.has(e.from) ? e.to : e.from)] : []))
           .filter((n) => n !== undefined)
       )
-    ]
-    const bottomOfAll = allBoxes.length ? Math.max(...allBoxes.map((b) => b.y + b.h)) + BLOCK_GAP : START[1]
+    ].map((node) => virtualBoxes.get(node.ref) ?? node.bbox)
+    const bottomOfAll = layoutBoxes.length ? Math.max(...layoutBoxes.map((b) => b.y + b.h)) + BLOCK_GAP : START[1]
     // 给手工指定了坐标的新节点也留出位置
     const pinned = nodes.filter((n) => !auto.has(n.key)).map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h }))
-    const [originX, originY] = placeBlock({ w: maxX - minX, h: maxY - minY }, [...allBoxes, ...pinned], {
-      anchors: anchors.map((n) => n.bbox),
+    const [originX, originY] = placeBlock({ w: maxX - minX, h: maxY - minY }, [...layoutBoxes, ...pinned], {
+      anchors,
       direction,
       view: opts.view ?? null,
       fallback: [
-        anchors.length ? anchors.reduce((sum, n) => sum + n.bbox.x + n.bbox.w / 2, 0) / anchors.length - (maxX - minX) / 2 : blockLeft,
+        anchors.length ? anchors.reduce((sum, box) => sum + box.x + box.w / 2, 0) / anchors.length - (maxX - minX) / 2 : blockLeft,
         bottomOfAll
       ]
     })
@@ -808,33 +1131,92 @@ export function planOps(
     }
   }
 
+  // ---------- 移动：按指令顺序解析，后续 near 与连线能看到已经更新的位置 ----------
+  const moves: PlannedMove[] = []
+  const moveByRef = new Map<string, PlannedMove>()
+  for (const { id, target, anchor, position, where } of moveOps) {
+    const fromBbox = currentBox(target)
+    let x: number
+    let y: number
+    let adjusted = false
+    if (position.mode === 'near') {
+      const anchorBox = anchor ? currentBox(anchor) : byKey.get(position.near)!
+      const omitted = new Set([...deletes, ...target.elementIds])
+      const obstacles = [...sceneBoxes(omitted).map(({ box }) => box), ...lineBoxes, ...nodes]
+      const placed = placeBeside({ w: fromBbox.w, h: fromBbox.h }, anchorBox, position.side, position.gap, obstacles)
+      x = placed.x
+      y = placed.y
+      adjusted = placed.adjusted
+    } else if (position.mode === 'absolute') {
+      x = position.x
+      y = position.y
+    } else {
+      x = fromBbox.x + position.dx
+      y = fromBbox.y + position.dy
+    }
+    const toBbox = { x, y, w: fromBbox.w, h: fromBbox.h }
+    const dx = moveNumber(position.mode === 'relative' ? position.dx : x - fromBbox.x, 'resulting dx', where)
+    const dy = moveNumber(position.mode === 'relative' ? position.dy : y - fromBbox.y, 'resulting dy', where)
+    moveNumber(x, 'destination x', where)
+    moveNumber(y, 'destination y', where)
+    const { kind, elementIds } = target
+    const targetKey = elementIds[0]
+    const move: PlannedMove = {
+      id, kind, targetKey, elementIds, dx, dy, fromBbox, toBbox,
+      ...(position.mode === 'relative' ? {} : { toTopLeft: { x, y } }),
+      ...(adjusted ? { adjusted } : {})
+    }
+    if (elementIds.length === 1) {
+      virtualBoxes.set(targetKey, toBbox)
+      if (groupedMemberRefs.has(targetKey)) splitStrokeGroups.add(target.id)
+    } else {
+      groupBoxes.set(target.id, toBbox)
+      for (const ref of elementIds) {
+        const member = targetsByRef.get(ref)
+        if (!member) continue
+        const box = currentBox(member)
+        virtualBoxes.set(ref, { ...box, x: box.x + dx, y: box.y + dy })
+      }
+    }
+    moves.push(move)
+    for (const ref of elementIds) moveByRef.set(ref, move)
+  }
+  for (const [i, move] of moves.entries()) {
+    const { position, target } = moveOps[i]
+    if (position.mode === 'near') continue
+    const from = target.bbox
+    const atOrigin = (box: Bbox) => box.x <= from.x && box.y <= from.y && box.x + box.w >= from.x + from.w && box.y + box.h >= from.y + from.h
+      && (box.w > from.w || box.h > from.h)
+    const containers = new Set(obstacleTargets.filter((candidate) => atOrigin(candidate.bbox)).map((candidate) => candidate.id))
+    const others = sceneBoxes(new Set([...deletes, ...move.elementIds]))
+    const collisions = [...new Set(others.filter(({ id, box }) => !containers.has(id) && overlaps(move.toBbox, box)).map(({ id }) => id))]
+    if (collisions.length) move.overlaps = collisions
+  }
+  const allBoxes = [...sceneBoxes(deletes).map(({ box }) => box), ...lineBoxes]
+  if (!auto.size && allBoxes.length) blockLeft = Math.min(...allBoxes.map((box) => box.x))
+
   // ---------- 连线的起止点 ----------
+  const nodeBox = (node: SemanticGraph['nodes'][number]): Box => ({
+    ...(virtualBoxes.get(node.ref) ?? node.bbox),
+    shape: nodeShapes.get(node.ref) ?? node.kind
+  })
   const boxOf = (key: string): { elementId: string; box: Box } => {
     const fresh = byKey.get(key)
     if (fresh) return { elementId: fresh.elementId, box: { x: fresh.x, y: fresh.y, w: fresh.w, h: fresh.h, shape: fresh.shape } }
     const old = existing.get(key)!
-    return { elementId: old.ref, box: { ...old.bbox, shape: old.kind } }
+    return { elementId: old.ref, box: nodeBox(old) }
   }
   // 连线要绕开的东西：画布上已有的，加上这一批新画的节点
   const edgeObstacles: Bbox[] = [...allBoxes, ...nodes.map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h }))]
   const edges: PlannedEdge[] = edgeOps.map((e, i) => {
     const from = boxOf(e.from)
     const to = boxOf(e.to)
-    let mid = bends.get(i) ?? []
-    if (!mid.length) {
-      // 直线会压到别的东西时加拐点绕过去（单拐点优先，密集多障碍时双拐点走廊绕行）
-      mid = detourPath(centerOf(from.box), centerOf(to.box), edgeObstacles)
-    }
-    const [sx, sy] = exitPoint(from.box, ...(mid[0] ?? centerOf(to.box)), EDGE_GAP)
-    const [ex, ey] = exitPoint(to.box, ...(mid[mid.length - 1] ?? centerOf(from.box)), EDGE_GAP)
     return {
       elementId: newId(),
       fromElementId: from.elementId,
       toElementId: to.elementId,
       label: e.label,
-      x: sx,
-      y: sy,
-      points: [[sx, sy] as [number, number], ...mid, [ex, ey] as [number, number]].map(([px, py]): [number, number] => [px - sx, py - sy])
+      ...routeBetween(from.box, to.box, edgeObstacles, bends.get(i))
     }
   })
 
@@ -873,15 +1255,37 @@ export function planOps(
     ...nodes.map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h })),
     ...texts.map((t) => ({ x: t.x, y: t.y, ...textSize(t.text) }))
   ]
-  const stableRefs = new Set<string>()
+  const traceGraph = traceOps.length && moves.length
+    ? { ...graph, images: graph.images.map((image) => ({ ...image, bbox: virtualBoxes.get(image.ref) ?? image.bbox })) }
+    : graph
   for (const { op, where } of traceOps) {
-    const traced = planTrace(op, graph, newId, [...allBoxes, ...placedSoFar], where)
+    const traced = planTrace(op, traceGraph, newId, [...allBoxes, ...placedSoFar], where)
     if (traced.byStableId) stableRefs.add(traced.imageRef)
     else existingRefs.add(traced.imageRef)
     nodes.push(...traced.nodes)
     texts.push(...traced.texts)
     lines.push(...traced.lines)
     placedSoFar.push(traced.block)
+  }
+
+  const reroutes: PlannedReroute[] = []
+  if (moveByRef.size) {
+    const obstacles = [...allBoxes, ...placedSoFar]
+    for (const edge of graph.edges) {
+      if (deletes.has(edge.ref)) continue
+      const raw = rawById.get(edge.ref)
+      if (raw && ((raw as SceneElement & { elbowed?: boolean }).elbowed || (
+        raw.customData?.flyingdraws?.author !== 'agent' && (raw.points?.length ?? 0) > 2
+      ))) continue
+      const from = raw ? nodeByRef.get(raw.startBinding?.elementId ?? '') : edge.from && !edge.inferred ? existing.get(edge.from) : undefined
+      const to = raw ? nodeByRef.get(raw.endBinding?.elementId ?? '') : edge.to && !edge.inferred ? existing.get(edge.to) : undefined
+      if (!from || !to || deletes.has(from.ref) || deletes.has(to.ref)) continue
+      const a = moveByRef.get(from.ref)
+      const b = moveByRef.get(to.ref)
+      if (!a && !b) continue
+      if (a && b && a.dx === b.dx && a.dy === b.dy && !reshapedRefs.has(from.ref) && !reshapedRefs.has(to.ref)) continue
+      reroutes.push({ arrowId: edge.ref, fromElementId: from.ref, toElementId: to.ref, ...routeBetween(nodeBox(from), nodeBox(to), obstacles) })
+    }
   }
 
   return {
@@ -894,6 +1298,8 @@ export function planOps(
     textEdits,
     styles: [...styles.values()],
     deletes: [...deletes],
+    moves,
+    ...(reroutes.length ? { reroutes } : {}),
     markers: [],
     targetGroups,
     existingRefs: [...existingRefs],
@@ -1064,13 +1470,22 @@ export function toProposalPlan(
   info: { box: (ref: string) => Bbox | null; name: (refs: string[]) => string },
   newId: () => string
 ): { plan: DrawPlan; pending: PendingChanges | null } {
-  const seen = new Set<string>()
-  const markers: PlannedMarker[] = []
+  const groups = new Map<string, Set<string>>()
   for (const refs of plan.targetGroups) {
     const key = refs[0]
-    if (!key || seen.has(key)) continue
-    seen.add(key)
+    if (!key) continue
+    const group = groups.get(key) ?? new Set<string>()
+    for (const ref of refs) group.add(ref)
+    groups.set(key, group)
+  }
+  const movedByKey = new Map(plan.moves.map((move) => [move.targetKey, move]))
+  const markers: PlannedMarker[] = []
+  const moveGhosts: PlannedMoveGhost[] = []
+  for (const [key, group] of groups) {
+    const refs = [...group]
+    const move = movedByKey.get(key)
     const boxes = refs.map((ref) => info.box(ref)).filter((b) => b !== null)
+    if (!boxes.length && move) boxes.push(move.fromBbox)
     if (!boxes.length) continue
     const x0 = Math.min(...boxes.map((b) => b.x)) - MARKER_PAD
     const y0 = Math.min(...boxes.map((b) => b.y)) - MARKER_PAD
@@ -1097,11 +1512,14 @@ export function toProposalPlan(
         parts.push(`改样式：${bits.join('、')}`)
       }
     }
+    const moveOnly = Boolean(move && !parts.length)
+    if (move) parts.push('移走')
     if (!parts.length) continue
     const note = parts.join('，')
     const name = info.name(refs)
+    const frameId = newId()
     markers.push({
-      frameId: newId(),
+      frameId,
       noteId: newId(),
       x: x0,
       y: y0,
@@ -1110,17 +1528,37 @@ export function toProposalPlan(
       tone: removed ? 'delete' : 'change',
       note,
       targets: refs,
-      summary: removed ? `删除${name}` : `把${name}${note}`
+      summary: removed ? `删除${name}` : moveOnly ? `移动${name}` : `把${name}${note}`
     })
+    if (move) {
+      const { targetKey, elementIds, dx, dy, toBbox } = move
+      const quotedName = name.match(/「(.+)」/s)?.[1] ?? ''
+      const [firstLine, nextLine] = quotedName.split(/\r\n?|\n/, 2)
+      const chars = Array.from(firstLine)
+      const ellipsis = chars.length > 8 || nextLine !== undefined ? '…' : ''
+      const label = chars.length ? `「${chars.slice(0, 8).join('')}${ellipsis}」` : `${move.id} `
+      moveGhosts.push({
+        ghostId: newId(), frameId, targetKey, elementIds, dx, dy, ...toBbox,
+        label: `${label}移到这里`,
+        summary: `移动${name}`
+      })
+    }
   }
   if (!markers.length) return { plan, pending: null }
   return {
-    plan: { ...plan, updates: [], textEdits: [], styles: [], deletes: [], markers },
+    plan: { ...plan, updates: [], textEdits: [], styles: [], deletes: [], moves: [], reroutes: undefined, markers, ...(moveGhosts.length ? { moveGhosts } : {}) },
     pending: {
       updates: plan.updates,
       textEdits: plan.textEdits,
       styles: plan.styles,
       deletes: plan.deletes,
+      ...(moveGhosts.length ? {
+        moves: plan.moves,
+        reroutes: plan.reroutes,
+        moveGhosts: moveGhosts.map(({ ghostId, frameId, targetKey, elementIds, x, y, dx, dy, summary }) => (
+          { ghostId, frameId, targetKey, elementIds, x, y, dx, dy, summary }
+        ))
+      } : {}),
       markers: markers.map(({ frameId, targets, summary }) => ({ frameId, targets, summary }))
     }
   }

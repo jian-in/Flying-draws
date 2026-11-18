@@ -843,8 +843,33 @@ server.registerTool(
 const existingNode = 'An existing node id like "N1" from your latest canvas_read.'
 const existingText = 'An existing free text id like "T1" from your latest canvas_read.'
 const existingStrokes = 'An existing hand-drawn stroke or stroke group id like "S1" from your latest canvas_read.'
+const moveCoord = z.number().min(-1_000_000).max(1_000_000)
 const modifyOps = [
-  z.object({ op: z.literal('update_node'), id: z.string().min(1).describe(existingNode), label: z.string().describe('The new text inside the node.') }),
+  z
+    .object({
+      op: z.literal('move'),
+      id: z
+        .string()
+        .trim()
+        .min(1)
+        .describe(
+          'Target element to move: node ("N1"), free text ("T1"), stroke/stroke-group ("S1"), image ("I1"), or stable element id. Connected arrows follow automatically (image annotations are separate elements and stay unless moved explicitly).'
+        ),
+      x: moveCoord.optional().describe('Mode 1 (exact top-left canvas position, pair with y): new left coordinate of the element bounding box.'),
+      y: moveCoord.optional().describe('Mode 1 (pair with x): new top coordinate of the element bounding box.'),
+      dx: moveCoord.optional().describe('Mode 2 (relative pixel shift, give dx and/or dy): horizontal shift in px (positive = right).'),
+      dy: moveCoord.optional().describe('Mode 2 (give dx and/or dy): vertical shift in px (positive = down).'),
+      near: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe('Mode 3 (semantic placement, best when reading summary without coordinates): place beside another element id ("N1", "I1", or a new add_node id in this same call), automatically avoiding obstacles.'),
+      side: z.enum(['right', 'left', 'below', 'above']).optional().describe('Used with "near": which side of the anchor to place on (default "right").'),
+      gap: z.number().min(0).max(400).optional().describe('Used with "near": spacing in px from the anchor (default 40).')
+    })
+    .strict(),
+  z.object({ op: z.literal('update_node'), id: z.string().min(1).describe(existingNode), label: z.string().describe('The new text inside the node. Long text automatically widens/grows the node from its center unless explicit width/height is set via set_style.') }),
   z.object({
     op: z.literal('delete_node'),
     id: z.string().min(1).describe(existingNode + ' Arrows drawn by agents that touch it are deleted with it.')
@@ -976,32 +1001,86 @@ const newNodeIds = (res: Record<string, unknown>): string =>
     .map(([key, id]) => `${key} = ${id}`)
     .join(', ')
 
+type MoveSummaryItem = {
+  id: string
+  now_id?: string | null
+  bbox?: { x: number; y: number; w: number; h: number }
+  adjusted?: boolean
+  overlaps?: string[]
+}
+
+const formatMoveList = (list: readonly MoveSummaryItem[], includeRename: boolean): string => {
+  if (!list.length) return ''
+  return list
+    .map((m) => {
+      const pair = includeRename && m.now_id && m.now_id !== m.id ? `${m.id} → ${m.now_id}` : m.id
+      const at = m.bbox ? ` @(${Math.round(m.bbox.x)},${Math.round(m.bbox.y)} ${Math.round(m.bbox.w)}×${Math.round(m.bbox.h)})` : ''
+      const notes = [
+        m.adjusted ? 'adjusted around obstacles' : '',
+        m.overlaps?.length ? `overlaps ${m.overlaps.join(', ')}` : ''
+      ].filter(Boolean)
+      return notes.length ? `${pair}${at} (${notes.join('; ')})` : `${pair}${at}`
+    })
+    .join(', ')
+}
+
+const formatMoved = (res: Record<string, unknown>): string =>
+  formatMoveList(Array.isArray(res.moved) ? (res.moved as MoveSummaryItem[]) : [], true)
+
+const formatProposedMoves = (res: Record<string, unknown>): string =>
+  formatMoveList(Array.isArray(res.proposed_moves) ? (res.proposed_moves as MoveSummaryItem[]) : [], false)
+
+function validateMoveOps(ops: readonly z.infer<typeof drawOpSchema>[]): string | null {
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i]
+    if (op.op !== 'move') continue
+    const hasXY = op.x !== undefined || op.y !== undefined
+    const hasDelta = op.dx !== undefined || op.dy !== undefined
+    const hasNear = op.near !== undefined
+    const modes = Number(hasXY) + Number(hasDelta) + Number(hasNear)
+    if (modes !== 1) {
+      return `ops[${i}]: move requires exactly one positioning mode: (x and y), (dx and/or dy), or (near with optional side/gap).`
+    }
+    if (hasXY && (op.x === undefined || op.y === undefined)) {
+      return `ops[${i}]: move with top-left coordinates requires both "x" and "y".`
+    }
+    if (!hasNear && (op.side !== undefined || op.gap !== undefined)) {
+      return `ops[${i}]: "side" and "gap" can only be used together with "near".`
+    }
+  }
+  return null
+}
+
 server.registerTool(
   'canvas_propose',
   {
     title: 'Draw your understanding and ask the user to confirm',
     description:
       'Draw your understanding, plan, or suggested edits on the canvas as a proposal and ask the user to confirm it. ' +
-      'Use this instead of canvas_draw when you are not sure you understood the user, or want confirmation before changing/deleting their elements: ' +
-      'new elements appear in dashed blue, and proposed edits/deletions/restyles are shown as dashed preview markers (the user can delete any marker frame to decline that single change). ' +
-      'Takes the same ops as canvas_draw (including modifications to user or other-agent elements). Returns a request_id immediately; then call canvas_wait with that request_id to get the answer. ' +
-      'If accepted, additions and approved changes become part of the canvas and you are told what the user changed or declined. If rejected, the proposal is removed. ' +
+      'Use this instead of canvas_draw when you are not sure you understood the user, or want confirmation before changing/moving/deleting their elements: ' +
+      'new elements appear in dashed seat color, proposed edits/deletions/restyles are shown as dashed preview markers, and proposed moves also show a draggable dashed landing frame ' +
+      '(the user can drag the landing frame to fine-tune the destination, or delete either the origin marker or landing frame to decline that single move). ' +
+      'Takes the same ops as canvas_draw (including move and modifications to user or other-agent elements). Returns a request_id immediately; then call canvas_wait with that request_id to get the answer. ' +
+      'If accepted, additions and approved changes become part of the canvas and you are told what the user changed, adjusted, or declined. If rejected, the proposal is removed. ' +
       'The request survives a restart of the canvas app, so keep using the same request_id.',
     inputSchema: {
       board: boardSchema,
       as: asSchema,
-      ops: z.array(drawOpSchema).min(1).describe('What to add, change, restyle, or delete as the proposal, applied together as one batch.'),
+      ops: z.array(drawOpSchema).min(1).describe('What to add, move, change, restyle, or delete as the proposal, applied together as one batch.'),
       question: z.string().min(1).describe('What you want the user to confirm, in the user\'s language, e.g. "Is this the flow you meant?". Shown on the canvas.'),
       direction: directionSchema,
       base_version: baseVersionSchema
     }
   },
   ({ board, as, ops, question, direction, base_version }) => guarded(async () => {
+    const invalidMove = validateMoveOps(ops)
+    if (invalidMove) return { content: text(`Nothing was drawn: ${invalidMove}`).content, isError: true }
     const res = await daemon('/propose', { board, as: rememberSeat(as), ops, question, direction, base_version }, 30_000)
     const failure = drawFailure(res, base_version)
     if (failure) return failure
     if (res.status !== 'proposed') return text(JSON.stringify(res))
     const ids = newNodeIds(res)
+    const proposedMoves = formatProposedMoves(res)
     const changed = (res.changed ?? {}) as { proposed?: number }
     const markerNote = changed.proposed ? ` (${changed.proposed} edit marker(s))` : ''
     return {
@@ -1009,7 +1088,8 @@ server.registerTool(
         res,
         `Proposal ${res.request_id} is shown on the canvas${markerNote} and the user is being asked: "${question}". ` +
           `Now call canvas_wait with request_id "${res.request_id}" to get their answer.` +
-          (ids ? ` Your proposed nodes: ${ids}.` : '')
+          (ids ? ` Your proposed nodes: ${ids}.` : '') +
+          (proposedMoves ? ` Planned moves: ${proposedMoves}.` : '')
       )
     }
   })
@@ -1020,45 +1100,52 @@ server.registerTool(
   {
     title: 'Draw on the canvas',
     description:
-      'Draw, edit, restyle, or delete elements on the Flying draws canvas immediately. ' +
+      'Draw, move, edit, restyle, or delete elements on the Flying draws canvas immediately. ' +
       'New nodes are laid out automatically below existing content unless x/y are given. ' +
-      'You can modify, restyle (color, fill, shape, width, height), or delete any settled element on the canvas ' +
+      'You can move, modify, restyle (color, fill, shape, width, height), or delete any settled element on the canvas ' +
       '(including those drawn by the user or other agents, except unanswered proposals): ' +
-      'update_node, delete_node, update_edge, delete_edge, update_text (T1), delete_text (T1), delete_strokes (S1), set_style. ' +
-      'To refer to elements already on the canvas (N1, T1, S1), pass the version from the read where you saw them as base_version; ' +
-      'it still works if unrelated parts of the canvas changed since, unless an element you modify was changed by someone else. ' +
+      'move (by near+side, dx/dy, or top-left x+y; connected arrows follow), update_node (auto-widens from center for long text), delete_node, update_edge, delete_edge, update_text (T1), delete_text (T1), delete_strokes (S1), set_style. ' +
+      'To refer to elements already on the canvas (N1, T1, S1, I1), pass the version from the read where you saw them as base_version; ' +
+      'it still works if unrelated parts of the canvas changed since, unless an element you modify/move was changed by someone else. ' +
+      'Note that element short ids (like N1, N2) follow reading order and may renumber after moving — check the returned moved mapping and updated summary. ' +
       'To turn a diagram image on the canvas (I1) into editable shapes, use trace_image: describe its boxes, texts and lines in the image\'s own pixel coordinates; the canvas scales them and keeps their colors. ' +
       'Returns the updated canvas description. Things you drew are tagged with your agent name in later reads.',
     inputSchema: {
       board: boardSchema,
       as: asSchema,
-      ops: z.array(drawOpSchema).min(1).describe('What to add, change, restyle, or delete, applied together as one batch: either all of it happens or none.'),
+      ops: z.array(drawOpSchema).min(1).describe('What to add, move, change, restyle, or delete, applied together as one batch: either all of it happens or none.'),
       direction: directionSchema,
       base_version: baseVersionSchema
     }
   },
   ({ board, as, ops, base_version, direction }) => guarded(async () => {
+    const invalidMove = validateMoveOps(ops)
+    if (invalidMove) return { content: text(`Nothing was drawn: ${invalidMove}`).content, isError: true }
     const res = await daemon('/draw', { board, as: rememberSeat(as), ops, base_version, direction }, 30_000)
     const failure = drawFailure(res, base_version)
     if (failure) return failure
     if (res.status !== 'drawn') return text(JSON.stringify(res))
     const added = res.added as { nodes: number; edges: number; texts: number; lines?: number }
-    const changed = (res.changed ?? { updated: 0, styled: 0, deleted: 0 }) as {
+    const changed = (res.changed ?? { updated: 0, styled: 0, moved: 0, deleted: 0 }) as {
       updated: number
       styled?: number
+      moved?: number
       deleted: number
     }
     const changeParts = [
       changed.updated ? `${changed.updated} text(s) updated` : '',
       changed.styled ? `${changed.styled} styled` : '',
+      changed.moved ? `${changed.moved} moved` : '',
       changed.deleted ? `${changed.deleted} deleted` : ''
     ].filter(Boolean)
     const ids = newNodeIds(res)
+    const movedSummary = formatMoved(res)
     const header =
       `Drawn: ${added.nodes} node(s), ${added.edges} arrow(s), ${added.texts} text(s)${added.lines ? `, ${added.lines} line(s)` : ''}.` +
       (changeParts.length ? ` Changed: ${changeParts.join(', ')}.` : '') +
       ` The canvas is now at version ${res.version}.` +
-      (ids ? ` Your new nodes: ${ids}.` : '')
+      (ids ? ` Your new nodes: ${ids}.` : '') +
+      (movedSummary ? ` Moved ids: ${movedSummary}.` : '')
     return { content: boardContent(res, header) }
   })
 )

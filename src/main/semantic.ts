@@ -74,9 +74,10 @@ export function agentOf(el: SceneElement): string | null {
   return authorOf(el) === 'agent' && typeof name === 'string' && name ? name : null
 }
 
-// 提议里"要改这里"的标记框和说明文字：只是给用户看的示意，不算画板内容
+// 提议里"要改这里"的标记框、移动落点预览框和说明文字：只是给用户看的示意，不算画板内容
 export function isMarker(el: SceneElement): boolean {
-  return el.customData?.flyingdraws?.role === 'marker'
+  const role = el.customData?.flyingdraws?.role
+  return role === 'marker' || role === 'move-ghost'
 }
 
 // 作者，以及是不是还在提议层上（agent 画的提议，用户还没确认）

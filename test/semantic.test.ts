@@ -345,3 +345,31 @@ test('图片带原图尺寸与来源元数据，图上的圈选/框选/箭头批
     { x: 800, y: 100, w: 200, h: 100 }
   )
 })
+
+test('提议层的 move-ghost 落点预览框不会被语义层识别为真实节点或文字', () => {
+  const realNode: SceneElement = { id: 'n1', type: 'rectangle', x: 0, y: 0, width: 120, height: 60 }
+  const ghostBox: SceneElement = {
+    id: 'gh1',
+    type: 'rectangle',
+    x: 300,
+    y: 0,
+    width: 120,
+    height: 60,
+    customData: { flyingdraws: { author: 'agent', layer: 'proposal', proposal: 'p1', role: 'move-ghost' } }
+  }
+  const ghostText: SceneElement = {
+    id: 'gh1_t',
+    type: 'text',
+    x: 310,
+    y: 20,
+    width: 90,
+    height: 20,
+    text: 'N1 移到这里',
+    containerId: 'gh1',
+    customData: { flyingdraws: { author: 'agent', layer: 'proposal', proposal: 'p1', role: 'move-ghost' } }
+  }
+  const g = buildGraph([realNode, ghostBox, ghostText])
+  assert.equal(g.nodes.length, 1)
+  assert.equal(g.nodes[0].ref, 'n1')
+  assert.equal(g.notes.length, 0)
+})
