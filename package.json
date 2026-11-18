@@ -1,7 +1,7 @@
 {
   "name": "flying-draws",
   "version": "0.1.0",
-  "description": "Spatial memory, visual diff & live proposal pad for coding agents",
+  "description": "Local interactive canvas & visual workbench for coding agents (built-in Fuxi runtime + MCP)",
   "author": "Bofei Jian",
   "license": "MIT",
   "repository": {

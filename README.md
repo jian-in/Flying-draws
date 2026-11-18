@@ -1,7 +1,7 @@
 # Flying draws
 
-**面向编码 Agent 的本地空间记忆层、视觉演进墙与双向提议画布**  
-*Spatial memory, visual diff & live proposal pad for coding agents*
+**用画跟 Agent 对话的本地桌面画布与视觉工作台**  
+*Draw to talk, edit proposals on canvas, and iterate visually with coding agents*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20.19-339933.svg)](package.json)
@@ -9,8 +9,9 @@
 
 ![Flying draws — 多 Agent 同屏席位、半透明提议层手改确认与内置 Fuxi 工作台](docs/assets/hero.png)
 
-**Flying draws** 不是又一个通用白板，也不是把 Mermaid 单向吐到屏幕上的静态画图插件。它是贴在 IDE / 终端旁边的**本地视觉协作层与一体化 Agent 工作台**（基于 Electron + Excalidraw 构建，内置离线中文字体）：
-- **开箱即用双模式**：既可直接开启随包内置的 **Fuxi** 执行内核，把画布当作独立视觉编码工作台；也可通过标准 MCP 协议一键连入 **Claude Code、Codex、Cursor、Antigravity** 等任意外部客户端，多 Agent 同屏分席位接力。
+有些想法打字解释太费劲——服务怎么连、状态怎么流转、页面哪一处要改，随手画个框、在截图上画个红圈就一目了然。**Flying draws** 把本地桌面画布（基于 Electron + Excalidraw 构建，内置离线手写中文字体）变成你和编码 Agent 共用的活草稿纸：Agent 不仅能读懂你画的拓扑结构与图片圈选，还能把它的理解先画在**半透明虚线提议层**上；你直接在画布上拖拽调整、双击改字再点确认，手改差异就会自动整理成反馈回传给它。
+
+- **开箱即用双模式**：既可直接开启随包内置的 **Fuxi** 执行内核当作独立视觉编码工作台；也可通过标准 MCP 协议一键接入 **Claude Code、Codex、Cursor、Antigravity** 等外部客户端，支持多 Agent 同屏分席位接力。
 
 ---
 
