@@ -50,7 +50,27 @@ For the bundled Fuxi headless agent binary, see `resources/fuxi/LICENSE`.
 
 ---
 
-## 3. License Texts
+## 3. Prebuilt Fuxi Host Kernel Dependencies (`resources/fuxi`)
+
+When distributed with the prebuilt `fuxi` / `fuxi.exe` host runtime (Copyright (c) 2026 Bofei Jian, MIT License), the binary statically links third-party Rust crates under permissive licenses:
+
+| Crate Family | License | Copyright / Upstream |
+|---|---|---|
+| `tokio`, `tokio-util`, `tokio-native-tls`, `hyper`, `hyper-util`, `tower`, `tower-http`, `reqwest`, `mio`, `bytes` | MIT | Copyright (c) Tokio Contributors, Sean McArthur, and respective authors |
+| `serde`, `serde_json`, `toml`, `toml_edit`, `clap`, `anyhow`, `thiserror`, `tracing`, `tracing-subscriber`, `regex`, `ignore`, `walkdir` | MIT OR Apache-2.0 | Copyright (c) Erick Tryzelaar, David Tolnay, Andrew Gallant, Clap Contributors, and respective authors |
+| `ratatui`, `crossterm`, `syntect`, `pulldown-cmark`, `calamine`, `pdf-extract`, `png` | MIT | Copyright (c) Ratatui Developers, Timon Post, Tristan Hume, Raph Levien, and respective authors |
+| `rustls`, `hyper-rustls` | Apache-2.0 OR ISC OR MIT | Copyright (c) Joseph Birr-Pixton and Rustls Contributors |
+| `ring` | Apache-2.0 AND ISC | Copyright (c) 2015-2024 Brian Smith and contributors (includes BoringSSL/OpenSSL-derived code under ISC/OpenSSL-compatible terms) |
+| `rustls-webpki`, `untrusted` | ISC | Copyright (c) Brian Smith |
+| `encoding_rs` | (Apache-2.0 OR MIT) AND BSD-3-Clause | Copyright (c) 2015-2016 Mozilla Foundation |
+| `subtle` | BSD-3-Clause | Copyright (c) 2016-2018 Isis Agora Lovecruft, Henry de Valence |
+| `icu_*`, `litemap`, `tinystr`, `writeable`, `yoke`, `zerofrom`, `zerotrie`, `zerovec`, `unicode-ident`, `unicode-normalization` | Unicode-3.0 | Copyright (c) 2020-2025 Unicode, Inc. (`https://www.unicode.org/copyright.html`) |
+| `zlib-rs`, `foldhash`, `miniz_oxide` | Zlib / MIT / Apache-2.0 | Copyright (c) Trifecta Tech Foundation, Orson Peters, and respective authors |
+| `option-ext` | MPL-2.0 | Copyright (c) Simon Ochsenreither. Used unmodified; source code is available at `https://github.com/soc/option-ext` under Mozilla Public License 2.0 (`https://mozilla.org/MPL/2.0/`). |
+
+---
+
+## 4. License Texts
 
 ### MIT License
 
@@ -130,3 +150,15 @@ THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
 ### GPL v2 Font Exception (Liberation Sans v1.05)
 
 As a special exception, if you create a document which uses this font, and embed this font or unaltered portions of this font into the document, this font does not by itself cause the resulting document to be covered by the GNU General Public License. This exception does not however invalidate any other reasons why the document might be covered by the GNU General Public License. If you modify this font, you may extend this exception to your version of the font, but you are not obligated to do so. If you do not wish to do so, delete this exception statement from your version. (Full GNU GPL v2 text: `https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt`)
+
+---
+
+### Unicode License v3 (`Unicode-3.0`)
+
+COPYRIGHT AND PERMISSION NOTICE — Copyright © 1991-2025 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE TERMS AND CONDITIONS OF THIS AGREEMENT.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of data files and any associated documentation (the "Data Files") or software and any associated documentation (the "Software") to deal in the Data Files or Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, and/or sell copies of the Data Files or Software, and to permit persons to whom the Data Files or Software are furnished to do so, provided that either (a) this copyright and permission notice appear with all copies of the Data Files or Software, or (b) this copyright and permission notice appear in associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF THIRD PARTY RIGHTS. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA FILES OR SOFTWARE.
