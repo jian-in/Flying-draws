@@ -62,7 +62,25 @@ export function AgentPanel({
   const [previewSrc, setPreviewSrc] = useState<{ src: string; alt: string } | null>(null)
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
+  const [following, setFollowing] = useState(true)
+  const lastScrollTopRef = useRef(0)
+  const programmaticScrollTopRef = useRef<number | null>(null)
+  const pointerDownRef = useRef(false)
   const initialSeeded = useRef(false)
+
+  function updateFollow(next: boolean) {
+    follow.current = next
+    setFollowing(prev => (prev === next ? prev : next))
+  }
+
+  function scrollToBottom() {
+    const el = scroll.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    const targetTop = el.scrollTop
+    programmaticScrollTopRef.current = targetTop
+    lastScrollTopRef.current = targetTop
+  }
   const trackedItemRef = useRef<string | null>(null)
   const autoHandledIds = useRef<Set<string>>(new Set())
   const insertImageRef = useRef(insertImage)
@@ -138,14 +156,26 @@ export function AgentPanel({
   }, [state, board, autoLineage, placedImageIds])
   useEffect(() => {
     setError(null)
-  }, [open, board])
+    updateFollow(true)
+  }, [open, board, active?.id])
   useEffect(() => {
     if (!open || state.busy) return
     void api.connect(board).catch(err => setError(String(err.message ?? err)))
   }, [open, board, state.busy])
   useEffect(() => { setContinuation(last?.status === 'failed' ? 'new' : 'resume') }, [last?.id, last?.status])
   useEffect(() => {
-    if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight
+    const clearPointer = () => { pointerDownRef.current = false }
+    window.addEventListener('pointerup', clearPointer)
+    window.addEventListener('pointercancel', clearPointer)
+    window.addEventListener('blur', clearPointer)
+    return () => {
+      window.removeEventListener('pointerup', clearPointer)
+      window.removeEventListener('pointercancel', clearPointer)
+      window.removeEventListener('blur', clearPointer)
+    }
+  }, [])
+  useEffect(() => {
+    if (open && follow.current && !pointerDownRef.current) scrollToBottom()
   }, [state, open])
 
   async function act(action: () => Promise<unknown>): Promise<boolean> {
@@ -162,7 +192,7 @@ export function AgentPanel({
       const context = await capture()
       await api.submit({ board, goal: text, capture: context, mode: planFirst ? 'plan' : 'direct', resume: resumePrevious })
     })
-    if (success) { setGoal(''); follow.current = true }
+    if (success) { setGoal(''); updateFollow(true); scrollToBottom() }
   }
   // 把选中的图片照原样转成可编辑的方框、文字和线条：结果以提议的形式画在原图旁边，确认后才落到画布上
   async function traceSelected() {
@@ -174,10 +204,10 @@ export function AgentPanel({
         capture: context, mode: 'direct', resume: false
       })
     })
-    if (success) follow.current = true
+    if (success) { updateFollow(true); scrollToBottom() }
   }
   async function execute() {
-    if (await act(() => api.execute(goal.trim()))) { setGoal(''); follow.current = true }
+    if (await act(() => api.execute(goal.trim()))) { setGoal(''); updateFollow(true); scrollToBottom() }
   }
   async function saveModel() {
     if (await act(() => api.configure(provider))) {
@@ -261,10 +291,54 @@ export function AgentPanel({
               自动把页面结果图连入画布演进链
             </label>
           </div>
-          <div className="fd-agent-transcript" ref={scroll} onScroll={event => {
-            const el = event.currentTarget
-            follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 70
-          }}>
+          <div className="fd-agent-transcript-wrap">
+          <div
+            className="fd-agent-transcript"
+            ref={scroll}
+            onWheel={event => {
+              if (event.deltaY < 0) {
+                programmaticScrollTopRef.current = null
+                updateFollow(false)
+              }
+            }}
+            onPointerDown={event => {
+              pointerDownRef.current = true
+              const el = event.currentTarget
+              // 点在原生滚动条轨道/滑块上时立即解除自动贴底，避免拖滑块时被流式刷新抢回去
+              if (event.target === el && event.clientX >= el.getBoundingClientRect().left + el.clientWidth) {
+                programmaticScrollTopRef.current = null
+                updateFollow(false)
+              }
+            }}
+            onKeyDown={event => {
+              if (event.key === 'ArrowUp' || event.key === 'PageUp' || event.key === 'Home') {
+                programmaticScrollTopRef.current = null
+                updateFollow(false)
+              } else if (event.key === 'End') {
+                updateFollow(true)
+                scrollToBottom()
+              }
+            }}
+            onScroll={event => {
+              const el = event.currentTarget
+              const currentTop = el.scrollTop
+              if (programmaticScrollTopRef.current !== null && Math.abs(currentTop - programmaticScrollTopRef.current) <= 1) {
+                programmaticScrollTopRef.current = null
+                lastScrollTopRef.current = currentTop
+                return
+              }
+              programmaticScrollTopRef.current = null
+              const prevTop = lastScrollTopRef.current
+              lastScrollTopRef.current = currentTop
+
+              const distanceFromBottom = el.scrollHeight - currentTop - el.clientHeight
+              if (currentTop < prevTop - 1) {
+                updateFollow(false)
+              } else if (distanceFromBottom <= 12) {
+                updateFollow(true)
+              }
+            }}
+          >
             {state.busy && active && active.board !== board ? <p className="fd-agent-alert fd-agent-small">正在处理画板「{active.board}」的任务；本轮结束后可在当前画板发起任务。</p> : null}
             {!active?.runs.length ? <div className="fd-agent-empty">
               <div className="fd-agent-sketch" aria-hidden="true"><span>想法</span><i>→</i><span>行动</span></div>
@@ -287,6 +361,19 @@ export function AgentPanel({
               {run.status === 'unverified' ? <p className="fd-agent-small">本轮已结束，仍有结果未经独立检查，请结合产物确认。</p> : null}
               {run.error ? <p className="fd-agent-error">{run.error}</p> : null}
             </article>)}
+          </div>
+          {!following && state.busy ? (
+            <button
+              type="button"
+              className="fd-agent-jump-bottom"
+              onClick={() => {
+                updateFollow(true)
+                scrollToBottom()
+              }}
+            >
+              ↓ 回到最新输出
+            </button>
+          ) : null}
           </div>
           {currentApproval ? <div className="fd-agent-approval" key={currentApproval.requestId} role="group" aria-label="工具审批">
             <strong><span>允许这项操作？</span>{approvals.length > 1 ? <span className="fd-agent-small">1 / {approvals.length}</span> : null}</strong>

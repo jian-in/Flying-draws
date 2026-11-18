@@ -39,7 +39,10 @@ body,
 .fd-agent-history { width: 100%; margin-top: 8px; border: 1px solid var(--fd-border); background: var(--fd-surface); padding: 3px 5px; border-radius: 3px; font-size: 11px !important; }
 .fd-agent-lineage-toggle { margin-top: 8px; cursor: pointer; user-select: none; font-size: 10.5px !important; line-height: 1.4; }
 .fd-agent-lineage-toggle input { cursor: pointer; margin: 0; flex: none; }
-.fd-agent-transcript { flex: 1; overflow-y: auto; min-height: 60px; overscroll-behavior: contain; scrollbar-width: thin; }
+.fd-agent-transcript-wrap { flex: 1; min-height: 60px; position: relative; display: flex; flex-direction: column; }
+.fd-agent-transcript { flex: 1; overflow-y: auto; min-height: 60px; overscroll-behavior: contain; overflow-anchor: none; scrollbar-width: thin; }
+.fd-agent-jump-bottom { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 4; font-size: 11px !important; padding: 4px 12px !important; border-radius: 999px !important; border: 1.5px solid var(--fd-border) !important; background: var(--fd-surface) !important; box-shadow: 2px 2px 0 var(--fd-ink); white-space: nowrap; }
+.fd-agent-jump-bottom:hover:enabled { background: var(--fd-primary) !important; color: var(--fd-on-primary) !important; outline: none !important; }
 .fd-agent-empty { padding: 38px 25px; }
 .fd-agent-empty h3 { margin: 26px 0 8px; font-size: 21px; font-weight: 500; letter-spacing: -.04em; }
 .fd-agent-empty p { color: var(--fd-muted); margin: 0 0 15px; }
