@@ -77,7 +77,7 @@ export function agentOf(el: SceneElement): string | null {
 // 提议里"要改这里"的标记框、移动落点预览框和说明文字：只是给用户看的示意，不算画板内容
 export function isMarker(el: SceneElement): boolean {
   const role = el.customData?.flyingdraws?.role
-  return role === 'marker' || role === 'move-ghost'
+  return role === 'marker' || role === 'move-ghost' || role === 'compare-overlay'
 }
 
 // 作者，以及是不是还在提议层上（agent 画的提议，用户还没确认）

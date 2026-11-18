@@ -2094,7 +2094,8 @@ export default function App() {
               image,
               size: { w, h },
               naturalSize: { w: natW, h: natH },
-              view
+              view,
+              ...(opts?.annotations?.length ? { annotations: opts.annotations } : {})
             })
 
             if (plan.alreadyPlaced) {
@@ -2134,6 +2135,12 @@ export default function App() {
                 label: { text: plan.edge.label, fontSize: 14 }
               })
             }
+            // 改前圈选位置投到改后截图上：红色虚线框 + 编号，只是对照用，不进语义层
+            for (const overlay of plan.overlays) {
+              skeletons.push({ type: 'rectangle', id: overlay.id, x: overlay.x, y: overlay.y, width: overlay.w, height: overlay.h })
+              skeletons.push({ type: 'text', id: `${overlay.id}_lbl`, x: overlay.x, y: Math.max(plan.y, overlay.y - 20), text: overlay.label, fontSize: 14 })
+            }
+            const overlayIds = new Set(plan.overlays.flatMap((o) => [o.id, `${o.id}_lbl`]))
             if (plan.caption) {
               skeletons.push({
                 type: 'text',
@@ -2173,6 +2180,16 @@ export default function App() {
                       }
                     }
                   }
+                } as SceneEl
+              }
+              if (overlayIds.has(el.id)) {
+                return {
+                  ...el,
+                  strokeColor: '#e03131',
+                  backgroundColor: 'transparent',
+                  strokeStyle: el.type === 'text' ? el.strokeStyle : 'dashed',
+                  opacity: 85,
+                  customData: { ...el.customData, flyingdraws: { ...baseMark, role: 'compare-overlay', lineageRole: 'compare-overlay' } }
                 } as SceneEl
               }
               if (el.type === 'arrow' && plan.edge && el.id === plan.edge.id) {
@@ -2224,6 +2241,8 @@ export default function App() {
               applyAuthorFilter(current, filterRef.current, hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(extractSeats(nextAll)))
             }
             const addedIds = new Set(added.map((a) => a.id))
+            // 父图（圈选原图）和新图一起进视野，方便并排对照
+            if (plan.parentId) addedIds.add(plan.parentId)
             const visibleAdded = current.getSceneElements().filter((el) => addedIds.has(el.id) && el.opacity > 0)
             showElements(current, visibleAdded, false)
             setToast(

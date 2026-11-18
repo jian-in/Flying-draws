@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('flyingdraws', {
     execute: (text: string) => ipcRenderer.invoke('agent:execute', text),
     cancel: () => ipcRenderer.invoke('agent:cancel'),
     approve: (requestId: string, approved: boolean) => ipcRenderer.invoke('agent:approve', requestId, approved),
+    review: (runId: string, verdict: 'approved' | 'rejected', note?: string) => ipcRenderer.invoke('agent:review', runId, verdict, note),
     image: (id: string) => ipcRenderer.invoke('agent:image', id),
     onState: (fn: (state: unknown) => void) => {
       const listener = (_event: Electron.IpcRendererEvent, state: unknown) => fn(state)

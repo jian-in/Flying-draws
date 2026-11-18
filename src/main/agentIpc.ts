@@ -67,6 +67,7 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
   })
   ipcMain.handle('agent:cancel', () => service.cancel())
   ipcMain.handle('agent:approve', (_event, requestId: string, approved: boolean) => service.approve(requestId, approved))
+  ipcMain.handle('agent:review', (_event, runId: string, verdict: 'approved' | 'rejected', note?: string) => service.review(runId, verdict, note))
   ipcMain.handle('agent:image', (_event, id: string) => service.image(id))
   return service
 }

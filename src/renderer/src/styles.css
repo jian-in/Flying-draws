@@ -94,6 +94,12 @@ body,
 .fd-agent-approval > strong { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
 .fd-agent-approval > span { font-size: 11px; color: var(--fd-muted); }
 .fd-agent-approval > div { display: flex; justify-content: flex-end; gap: 9px; margin-top: 10px; }
+.fd-agent-review { margin-top: 9px; padding: 10px 11px; border: 1.5px solid var(--fd-border); border-left: 3.5px solid #e03131; border-radius: 4px; background: var(--fd-surface); }
+.fd-agent-review > strong { display: block; font-size: 13px; }
+.fd-agent-review > p { margin: 5px 0 0; }
+.fd-agent-review textarea { width: 100%; box-sizing: border-box; margin-top: 8px; font: inherit; font-size: 12px; resize: vertical; }
+.fd-agent-review > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 9px; }
+.fd-agent-warning { color: #c2410c; }
 .fd-agent-error { color: var(--fd-danger); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .fd-agent-alert { max-height: 110px; overflow: auto; flex: none; padding: 7px 20px; border-top: 1px dashed var(--fd-border); }
 .fd-agent-composer { padding: 13px 16px 18px; flex: none; border-top: 1px solid var(--fd-border); background: var(--fd-paper); }

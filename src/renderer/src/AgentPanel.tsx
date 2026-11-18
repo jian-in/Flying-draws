@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { shouldAutoPlaceResultImage } from '../../main/lineage'
-import { toolDisplayName, traceImageGoal, type AgentCapture, type AgentResultImage, type AgentRun, type AgentState, type ProviderDraft } from '../../shared/agent'
+import { pickCompareImage, toolDisplayName, traceImageGoal, type AgentCapture, type AgentResultImage, type AgentRun, type AgentState, type ImageRegionAnnotation, type ProviderDraft } from '../../shared/agent'
 
 const LABEL: Record<AgentRun['status'], string> = {
   running: '进行中', planned: '等你确认计划', completed: '已完成', unverified: '结果待核验',
-  cancelled: '已停止', failed: '未完成', interrupted: '已中断'
+  cancelled: '已停止', failed: '未完成', interrupted: '已中断',
+  needs_review: '等你看一眼', rejected: '没改对'
 }
 const EMPTY: AgentState = {
   connection: 'offline', error: null, busy: false, setupNeeded: true, vision: false,
@@ -37,7 +38,7 @@ export function AgentPanel({
   board: string
   onClose(): void
   capture(): Promise<AgentCapture>
-  insertImage(image: AgentResultImage, dataURL: string, opts?: { auto?: boolean }): Promise<void>
+  insertImage(image: AgentResultImage, dataURL: string, opts?: { auto?: boolean; annotations?: readonly ImageRegionAnnotation[] }): Promise<void>
   /** 当前画布上已放置的结果图 ID 集合（用于自动上墙去重与按钮状态同步） */
   placedImageIds?: ReadonlySet<string>
   /** 画布上正好选中一张图片时是它的 id */
@@ -140,18 +141,21 @@ export function AgentPanel({
         return
       }
     }
+    // 每轮只自动上墙一张：本轮结束后挑出的「改后」对照图（没有就取最后一张页面截图）。
+    // 其余截图留在侧栏，需要时手动「放到画布」，免得源图上扇出一堆箭头。
     for (const r of currentBoardItem.runs) {
-      for (const img of r.images ?? []) {
-        if (autoHandledIds.current.has(img.id)) continue
-        autoHandledIds.current.add(img.id)
-        if (!autoLineage) continue
-        if (!shouldAutoPlaceResultImage(img, state.toolLabels)) continue
-        if (placedImageIds?.has(img.id)) continue
-        void api
-          .image(img.id)
-          .then(dataURL => insertImageRef.current(img, dataURL, { auto: true }))
-          .catch(() => undefined)
-      }
+      if (r.status === 'running') continue
+      const pending = (r.images ?? []).filter(img => !autoHandledIds.current.has(img.id))
+      if (!pending.length) continue
+      for (const img of pending) autoHandledIds.current.add(img.id)
+      if (!autoLineage) continue
+      const target = (r.compareImageId && r.images?.find(img => img.id === r.compareImageId)) || pickCompareImage(r, state.toolLabels)
+      if (!target || !pending.includes(target) || !shouldAutoPlaceResultImage(target, state.toolLabels)) continue
+      if (placedImageIds?.has(target.id)) continue
+      void api
+        .image(target.id)
+        .then(dataURL => insertImageRef.current(target, dataURL, { auto: true, annotations: r.annotations }))
+        .catch(() => undefined)
     }
   }, [state, board, autoLineage, placedImageIds])
   useEffect(() => {
@@ -272,6 +276,7 @@ export function AgentPanel({
               <span>工作目录</span><span>{!state.workspace || state.workspace.replace(/\\/g, '/').includes('/agent/workspaces/') ? '应用专用目录' : state.workspace.replace(/\\/g, '/').split('/').slice(-2).join('/')}</span><span>↗</span>
             </button>
             {state.workspaceWarning ? <p className="fd-agent-small" role="status">{state.workspaceWarning}</p> : null}
+            {state.toolStorage?.mode === 'host' ? <p className="fd-agent-small" title={state.toolStorage.artifactsDir}>截图和运行日志存在应用数据目录，不写进项目；只读命令自动放行。</p> : null}
             {items.length ? <select className="fd-agent-history" aria-label="任务历史" value={active?.id ?? ''} disabled={disabled} onChange={e => { if (e.target.value) void act(() => api.openTask(e.target.value)) }}>
               <option value="">新任务</option>{[...items].reverse().map(item => <option key={item.id} value={item.id}>{item.title || '未命名任务'}</option>)}
             </select> : null}
@@ -355,10 +360,22 @@ export function AgentPanel({
               {run.draft ? <div className="fd-agent-reply fd-agent-draft">{run.draft}<span className="fd-agent-caret" /></div> : null}
               {run.plan ? <div className="fd-agent-plan"><strong>{run.status === 'planned' ? '待确认的计划' : '本轮计划'}</strong><div>{run.reply || planBody(run.plan)}</div></div> : null}
               {run.tools.length ? <details className="fd-agent-tools"><summary>工具记录 · {run.tools.length} 项{run.tools.some(t => t.status === 'running') && run.status === 'running' ? ' · 正在执行' : ''}</summary>
-                {run.tools.map((tool, index) => <details key={`${tool.id}/${index}`}><summary><span>{tool.status === 'completed' ? '✓' : tool.status === 'failed' ? '×' : '·'}</span> {toolDisplayName(tool.name, state.toolLabels)}</summary><pre>{tool.input}{tool.result ? `\n\n${tool.result}` : ''}</pre></details>)}
+                {run.tools.map((tool, index) => <details key={`${tool.id}/${index}`}><summary><span>{tool.status === 'completed' ? '✓' : tool.status === 'failed' ? '×' : '·'}</span> {toolDisplayName(tool.name, state.toolLabels)}{tool.autoApproved ? <span className="fd-agent-small" title="只读命令，按规则自动放行，没有弹窗确认"> · 自动放行</span> : null}</summary><pre>{tool.input}{tool.result ? `\n\n${tool.result}` : ''}</pre></details>)}
               </details> : null}
-              {run.images?.map(image => <ResultImage key={image.id} image={image} placed={Boolean(placedImageIds?.has(image.id))} disabled={working || state.busy || active?.board !== board} onPreview={(src, alt) => setPreviewSrc({ src, alt })} onInsert={dataURL => act(() => insertImage(image, dataURL))} />)}
-              {run.status === 'unverified' ? <p className="fd-agent-small">本轮已结束，仍有结果未经独立检查，请结合产物确认。</p> : null}
+              {run.images?.map(image => <ResultImage key={image.id} image={image} placed={Boolean(placedImageIds?.has(image.id))} disabled={working || state.busy || active?.board !== board} onPreview={(src, alt) => setPreviewSrc({ src, alt })} onInsert={dataURL => act(() => insertImage(image, dataURL, { annotations: run.annotations }))} />)}
+              {run.verificationWarning ? <p className="fd-agent-small fd-agent-warning">{run.verificationWarning}</p> : null}
+              {run.status === 'unverified' && !run.verificationWarning ? <p className="fd-agent-small">本轮已结束，仍有结果未经独立检查，请结合产物确认。</p> : null}
+              {run.status === 'needs_review' || (run.status === 'unverified' && run.compareImageId) ? <ReviewBox
+                run={run}
+                disabled={working || state.busy}
+                onShow={() => {
+                  const image = run.images?.find(img => img.id === run.compareImageId)
+                  if (!image) return
+                  void act(async () => insertImage(image, await api.image(image.id), { annotations: run.annotations }))
+                }}
+                onDecide={(verdict, note) => act(() => api.review(run.id, verdict, note))}
+              /> : null}
+              {run.review ? <p className="fd-agent-small">{run.review.verdict === 'approved' ? '你已确认改对了。' : `你标记了没改对${run.review.note ? `：${run.review.note}` : ''}；下一轮会带上这条说明。`}</p> : null}
               {run.error ? <p className="fd-agent-error">{run.error}</p> : null}
             </article>)}
           </div>
@@ -443,6 +460,32 @@ function Thinking({ run }: { run: AgentRun }) {
     <summary>{live ? <><span className="fd-agent-thinking-dot" />思考中…</> : '思考过程'}<span className="fd-agent-small">{text.length.toLocaleString()} 字</span></summary>
     <pre>{text}</pre>
   </details>
+}
+
+/** 视觉改动的核对：对照图已经在画布上和圈选原图并排，用户看一眼给结论。 */
+function ReviewBox({ run, disabled, onShow, onDecide }: {
+  run: AgentRun
+  disabled: boolean
+  onShow(): void
+  onDecide(verdict: 'approved' | 'rejected', note?: string): Promise<boolean>
+}) {
+  const [rejecting, setRejecting] = useState(false)
+  const [note, setNote] = useState('')
+  return <div className="fd-agent-review" role="group" aria-label="核对改动">
+    <strong>看一眼对不对</strong>
+    <p className="fd-agent-small">改后截图已放在圈选原图右边，虚线框是你圈的位置。{run.compareImageId ? '' : '本轮没有拍到改后截图。'}</p>
+    {rejecting ? <>
+      <textarea aria-label="哪里没改对" rows={2} placeholder="哪里不对？例如：血条压住了怪物眼睛（可不填）" value={note} onChange={e => setNote(e.target.value)} />
+      <div>
+        <button disabled={disabled} onClick={() => setRejecting(false)}>返回</button>
+        <button className="fd-agent-primary" disabled={disabled} onClick={() => void onDecide('rejected', note)}>记下，下一轮接着改</button>
+      </div>
+    </> : <div>
+      {run.compareImageId ? <button disabled={disabled} onClick={onShow}>在画布上看</button> : null}
+      <button disabled={disabled} onClick={() => setRejecting(true)}>没改对…</button>
+      <button className="fd-agent-primary" disabled={disabled} onClick={() => void onDecide('approved')}>改对了 ✓</button>
+    </div>}
+  </div>
 }
 
 function ResultImage({

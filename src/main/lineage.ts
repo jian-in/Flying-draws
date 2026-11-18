@@ -4,6 +4,7 @@ import {
   shouldAutoPlaceResultImage,
   type AgentResultImage,
   type AgentTool,
+  type ImageRegionAnnotation,
   type ImageSourceMeta
 } from '../shared/agent.ts'
 
@@ -65,6 +66,16 @@ export interface PlannedLineageCaption {
   fontSize: number
 }
 
+/** 改前圈选的区域投到改后截图上的位置（虚线框），方便对照着看。 */
+export interface PlannedCompareOverlay {
+  id: string
+  x: number
+  y: number
+  w: number
+  h: number
+  label: string
+}
+
 export interface ImageLineagePlan {
   alreadyPlaced: boolean
   existingElementId: string | null
@@ -77,6 +88,7 @@ export interface ImageLineagePlan {
   versionNumber: number
   edge: PlannedLineageEdge | null
   caption: PlannedLineageCaption | null
+  overlays: PlannedCompareOverlay[]
 }
 
 export interface PlanImageLineageInput {
@@ -87,6 +99,43 @@ export interface PlanImageLineageInput {
   sourceImageRef?: string | null
   newImageId?: string
   view?: LineageViewBox | null
+  /** 本轮在源图上的圈选；有父图时投到新图上 */
+  annotations?: readonly ImageRegionAnnotation[]
+}
+
+const OVERLAY_MIN = 28
+
+/**
+ * 把源图（parentId）上的圈选按原图像素比例投到另一张图在画布上的显示框里。
+ * 两张图宽高比差得多时（视口不一致），标签前加「≈」表示位置是近似的。
+ */
+export function mapAnnotationsToImage(
+  annotations: readonly ImageRegionAnnotation[],
+  parentId: string,
+  box: LineageViewBox,
+  targetNatural?: { w: number; h: number } | null
+): Omit<PlannedCompareOverlay, 'id'>[] {
+  const out: Omit<PlannedCompareOverlay, 'id'>[] = []
+  for (const ann of annotations) {
+    if (ann.imageRef !== parentId) continue
+    const nw = ann.naturalSize?.w ?? 0
+    const nh = ann.naturalSize?.h ?? 0
+    if (!(nw > 0 && nh > 0)) continue
+    const approx = Boolean(targetNatural && targetNatural.w > 0 && targetNatural.h > 0 && Math.abs(targetNatural.w / targetNatural.h - nw / nh) > 0.02 * (nw / nh))
+    let x = box.x + (ann.pixelBbox.x / nw) * box.w
+    let y = box.y + (ann.pixelBbox.y / nh) * box.h
+    let w = (ann.pixelBbox.w / nw) * box.w
+    let h = (ann.pixelBbox.h / nh) * box.h
+    if (w < OVERLAY_MIN) { x -= (OVERLAY_MIN - w) / 2; w = OVERLAY_MIN }
+    if (h < OVERLAY_MIN) { y -= (OVERLAY_MIN - h) / 2; h = OVERLAY_MIN }
+    const x0 = Math.max(box.x, Math.min(x, box.x + box.w))
+    const y0 = Math.max(box.y, Math.min(y, box.y + box.h))
+    const x1 = Math.max(box.x, Math.min(x + w, box.x + box.w))
+    const y1 = Math.max(box.y, Math.min(y + h, box.y + box.h))
+    if (x1 - x0 < 2 || y1 - y0 < 2) continue
+    out.push({ x: Math.round(x0), y: Math.round(y0), w: Math.round(x1 - x0), h: Math.round(y1 - y0), label: `${approx ? '≈' : ''}对照 #${out.length + 1}` })
+  }
+  return out
 }
 
 const FILE_EDIT_TOOLS = new Set(['write_file', 'edit_file', 'apply_patch'])
@@ -382,7 +431,8 @@ export function planImageLineage(input: PlanImageLineageInput): ImageLineagePlan
       parentId: null,
       versionNumber: existing.customData?.flyingdraws?.lineageVersion ?? image.meta?.round ?? 1,
       edge: null,
-      caption: null
+      caption: null,
+      overlays: []
     }
   }
 
@@ -424,7 +474,8 @@ export function planImageLineage(input: PlanImageLineageInput): ImageLineagePlan
       parentId: null,
       versionNumber,
       edge: null,
-      caption: null
+      caption: null,
+      overlays: []
     }
   }
 
@@ -478,6 +529,9 @@ export function planImageLineage(input: PlanImageLineageInput): ImageLineagePlan
     parentId: parent.id,
     versionNumber,
     edge,
-    caption
+    caption,
+    overlays: mapAnnotationsToImage(input.annotations ?? [], parent.id, { x, y, w, h }, natW > 0 && natH > 0 ? { w: natW, h: natH } : null).map(
+      (overlay, i) => ({ ...overlay, id: uniqueId(`${imageId}_cmp${i + 1}`) })
+    )
   }
 }

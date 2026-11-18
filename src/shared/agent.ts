@@ -23,6 +23,8 @@ export interface AgentTool {
   input: string
   status: 'running' | 'completed' | 'failed'
   result?: string
+  /** 内核按只读规则自动放行、没有弹审批（目前只有 readonly_shell） */
+  autoApproved?: string
 }
 export interface ImageSourceMeta {
   naturalWidth: number
@@ -38,6 +40,8 @@ export interface ImageSourceMeta {
   sourceImageRef?: string
   changedFiles?: string[]
   capturedAt?: string
+  /** 拍这张图之前，本轮已经改过文件（用来挑「改后」对照图）。 */
+  afterEdit?: boolean
 }
 export interface ImageRegionAnnotation {
   imageId: string
@@ -57,7 +61,17 @@ export interface AgentResultImage {
   name: string
   meta?: ImageSourceMeta
 }
-export type RunStatus = 'running' | 'planned' | 'completed' | 'unverified' | 'cancelled' | 'failed' | 'interrupted'
+export type RunStatus =
+  | 'running' | 'planned' | 'completed' | 'unverified' | 'cancelled' | 'failed' | 'interrupted'
+  /** 视觉改动已拍了改后截图，等用户看一眼对照图再定 */
+  | 'needs_review'
+  /** 用户看过对照图，说没改对 */
+  | 'rejected'
+export interface AgentRunReview {
+  verdict: 'approved' | 'rejected'
+  note?: string
+  decidedAt: string
+}
 export interface AgentRun {
   id: string
   taskId?: string
@@ -80,6 +94,12 @@ export interface AgentRun {
   annotations?: ImageRegionAnnotation[]
   sourceImageRef?: string
   changedFiles?: string[]
+  /** 本轮用来和改前圈选图对照的那张改后截图（只自动上墙这一张） */
+  compareImageId?: string
+  /** 宿主对证据的提醒，例如改了文件却没拍改后截图 */
+  verificationWarning?: string
+  /** 用户看过对照图后的结论 */
+  review?: AgentRunReview
 }
 export interface AgentWorkItem {
   id: string
@@ -104,6 +124,8 @@ export interface AgentState {
   /** Kernel tool name → readable name (MCP tools are numbered inside the kernel). */
   toolLabels?: Record<string, string>
   workspace: string
+  /** 内核把截图、job 日志放在哪：host = 应用数据目录（不写进项目），旧内核没有这一项 */
+  toolStorage?: { mode: string; artifactsDir?: string; jobsDir?: string }
   activeItemId: string | null
   items: AgentWorkItem[]
 }
@@ -128,6 +150,7 @@ export interface AgentApi {
   execute(text: string): Promise<void>
   cancel(): Promise<void>
   approve(requestId: string, approved: boolean): Promise<void>
+  review(runId: string, verdict: AgentRunReview['verdict'], note?: string): Promise<void>
   image(id: string): Promise<string>
   onState(fn: (state: AgentState) => void): () => void
 }
@@ -189,6 +212,34 @@ export function shouldAutoPlaceResultImage(image: AgentResultImage, labels?: Rec
     return false
   }
   return true
+}
+
+/**
+ * 挑本轮用来对照的「改后」截图：只看页面/产物截图（不含画布自读图），
+ * 优先最后一张在改过文件之后拍的，没有就取最后一张页面截图。
+ */
+export function pickCompareImage(run: Pick<AgentRun, 'images'>, labels?: Record<string, string>): AgentResultImage | undefined {
+  const pages = (run.images ?? []).filter(image => shouldAutoPlaceResultImage(image, labels))
+  return [...pages].reverse().find(image => image.meta?.afterEdit) ?? pages.at(-1)
+}
+
+/**
+ * 视觉任务（本轮带着圈选的页面截图发出）的收尾状态：内核的 completed / unverified
+ * 只说明测试和工具层面的证据，不代表看起来对。拍到了改后截图就交给用户看一眼；
+ * 改了文件却没截图，明确提示缺对照证据。其他任务保持内核给的状态。
+ */
+export function resolveVisualStatus(
+  run: Pick<AgentRun, 'annotations' | 'sourceImageRef' | 'images' | 'changedFiles'>,
+  base: RunStatus,
+  labels?: Record<string, string>
+): { status: RunStatus; compareImageId?: string; warning?: string } {
+  if (base !== 'completed' && base !== 'unverified') return { status: base }
+  const visual = Boolean(run.annotations?.length || run.sourceImageRef)
+  if (!visual) return { status: base }
+  const compare = pickCompareImage(run, labels)
+  if (compare) return { status: 'needs_review', compareImageId: compare.id }
+  if (run.changedFiles?.length) return { status: 'unverified', warning: '改了文件，但没有拍改后的页面截图，没法和圈选的原图对照。' }
+  return { status: base }
 }
 
 /**
