@@ -33,6 +33,14 @@ contextBridge.exposeInMainWorld('flyingdraws', {
     ipcRenderer.invoke('board:rename', payload),
   deleteBoard: (payload: { board: string; currentSceneJson?: string }) => ipcRenderer.invoke('board:delete', payload),
   revealBoard: () => ipcRenderer.invoke('board:reveal'),
+  loadLibrary: () => ipcRenderer.invoke('library:load'),
+  saveLibrary: (data: { libraryItems: readonly unknown[] }) => ipcRenderer.invoke('library:save', data),
+  onLibraryInstall: (fn: (payload: { json?: string; itemCount?: number; error?: string }) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, payload: { json?: string; itemCount?: number; error?: string }) =>
+      fn(payload)
+    ipcRenderer.on('library:install', listener)
+    return () => ipcRenderer.removeListener('library:install', listener)
+  },
   // 页面的深浅色变了：让窗口右上角的最小化/关闭按钮跟着换颜色
   setTheme: (theme: 'light' | 'dark') => ipcRenderer.send('window:theme', theme),
   // 系统菜单栏去掉以后，这两项挪到了页面的「⋯」菜单里

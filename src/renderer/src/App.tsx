@@ -7,7 +7,8 @@ import {
   exportToBlob,
   MainMenu,
   newElementWith,
-  serializeAsJSON
+  serializeAsJSON,
+  useHandleLibrary
 } from '@excalidraw/excalidraw'
 import { exitPoint, type ShapeBox } from '../../main/geometry'
 import { displaySizeForImage, planImageLineage, type LineageCanvasElement } from '../../main/lineage'
@@ -21,6 +22,7 @@ import {
 import { StrokeWidthSlider } from './StrokeWidthSlider'
 import { AgentPanel } from './AgentPanel'
 import { AGENT_SEAT } from '../../shared/agent'
+import { LIBRARY_CALLBACK_URL } from '../../shared/library'
 import '@excalidraw/excalidraw/index.css'
 
 type ExcalidrawProps = ComponentProps<typeof Excalidraw>
@@ -922,6 +924,44 @@ export default function App() {
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const apiRef = useRef<Api | null>(null)
   apiRef.current = api
+  const [libraryAdapter] = useState(
+    () =>
+      ({
+        load: () =>
+          window.flyingdraws.loadLibrary() as Promise<{
+            libraryItems: Parameters<NonNullable<Api['updateLibrary']>>[0]['libraryItems'] extends infer T
+              ? Extract<Awaited<T>, readonly unknown[]>
+              : never
+          } | null>,
+        save: (data: { libraryItems: readonly unknown[] }) => window.flyingdraws.saveLibrary(data)
+      }) as NonNullable<Extract<Parameters<typeof useHandleLibrary>[0], { adapter: unknown }>['adapter']>
+  )
+  useHandleLibrary({ excalidrawAPI: api, adapter: libraryAdapter })
+
+  useEffect(() => {
+    return window.flyingdraws.onLibraryInstall((payload) => {
+      if (payload.error) {
+        setToast(`素材库导入失败：${payload.error}`)
+        return
+      }
+      const current = apiRef.current
+      if (!current || !payload.json) return
+      const blob = new Blob([payload.json], { type: 'application/json' })
+      void current
+        .updateLibrary({
+          libraryItems: blob,
+          merge: true,
+          defaultStatus: 'published',
+          openLibraryMenu: true
+        })
+        .then(() => {
+          setToast(payload.itemCount ? `已装入 ${payload.itemCount} 个素材到素材库` : '素材已装入素材库')
+        })
+        .catch((err) => {
+          setToast(`素材库解析失败：${err instanceof Error ? err.message : String(err)}`)
+        })
+    })
+  }, [])
   // 画布上现在这份内容属于哪块画板（存盘时带给主进程），以及载入过几次画板（用来认出「存到一半画板换了」）
   const boardIdRef = useRef<string | null>(null)
   const sceneEpoch = useRef(0)
@@ -1433,6 +1473,7 @@ export default function App() {
         initialData={initialData}
         onChange={onChange}
         langCode="zh-CN"
+        libraryReturnUrl={LIBRARY_CALLBACK_URL}
         renderTopRightUI={() => (
           <div className="fd-status">
             <button className="fd-primary" onClick={() => setComposing(true)} title="把当前画布发给 agent（Ctrl+Shift+Enter）">

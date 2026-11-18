@@ -67,6 +67,9 @@ declare global {
       }) => Promise<BoardLoadResult>
       deleteBoard: (payload: { board: string; currentSceneJson?: string }) => Promise<BoardLoadResult>
       revealBoard: () => Promise<void>
+      loadLibrary: () => Promise<{ libraryItems: unknown[] } | null>
+      saveLibrary: (data: { libraryItems: readonly unknown[] }) => Promise<void>
+      onLibraryInstall: (fn: (payload: { json?: string; itemCount?: number; error?: string }) => void) => () => void
       setTheme: (theme: 'light' | 'dark') => void
       reloadWindow: () => void
       toggleDevTools: () => void

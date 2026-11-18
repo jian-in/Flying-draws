@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ipcMain, Menu, nativeImage, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, ipcMain, Menu, nativeImage, net, shell, Tray } from 'electron'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -27,6 +27,12 @@ import { registerAgent } from './agentIpc'
 import { trayIconPixels } from './trayIcon'
 import { freshApprovals, hasPendingApprovals, trayTooltip } from './agentNotice'
 import { AGENT_SEAT, type AgentState } from '../shared/agent'
+import {
+  isExcalidrawLibraryBrowseUrl,
+  MAX_LIBRARY_BYTES,
+  parseLibraryInstallNavigation
+} from '../shared/library'
+import { LibraryStore, parseAndValidateLibraryJson } from './library'
 import {
   BOARD_EXT,
   DEFAULT_BOARD_ID,
@@ -57,11 +63,14 @@ const legacyM0Path = join(BOARDS_DIR, 'm0.excalidraw')
 const daemonInfoPath = join(HOME, 'daemon.json')
 const pendingPath = join(HOME, 'pending.json')
 const statePath = join(HOME, 'state.json')
+const libraryPath = join(HOME, 'library.excalidrawlib')
+const libraryStore = new LibraryStore(libraryPath)
 
 const WAIT_MAX_S = 45
 const WAIT_DEFAULT_S = 40
 
 let win: BrowserWindow | null = null
+let libraryWin: BrowserWindow | null = null
 const agent = registerAgent(HOME, () => win, () => currentBoardId)
 
 // ---------- 后台常驻 ----------
@@ -755,6 +764,10 @@ function createWindow(): void {
   updateWindowTitle()
 
   win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isExcalidrawLibraryBrowseUrl(url)) {
+      openLibraryBrowserWindow(url)
+      return { action: 'deny' }
+    }
     if (url.startsWith('https://') || url.startsWith('http://')) void shell.openExternal(url)
     return { action: 'deny' }
   })
@@ -1403,6 +1416,131 @@ ipcMain.handle('hub:cancel', (_e, requestId: string) => {
   const boardId = requestBoard.get(requestId) ?? currentBoardId
   return getSession(boardId).hub.cancel(requestId)
 })
+ipcMain.handle('library:load', () => libraryStore.load())
+ipcMain.handle('library:save', (_e, data: { libraryItems?: unknown[] }) =>
+  libraryStore.save({ libraryItems: Array.isArray(data?.libraryItems) ? data.libraryItems : [] })
+)
+
+async function fetchAndInstallRemoteLibrary(libraryUrl: string): Promise<void> {
+  bringToFront()
+  try {
+    const res = await net.fetch(libraryUrl, { signal: AbortSignal.timeout(30_000) })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const reader = res.body?.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) {
+          total += value.byteLength
+          if (total > MAX_LIBRARY_BYTES) {
+            await reader.cancel().catch(() => undefined)
+            throw new Error(`素材库文件体积超出上限（>${Math.round(MAX_LIBRARY_BYTES / (1024 * 1024))} MiB）`)
+          }
+          chunks.push(value)
+        }
+      }
+    } else {
+      const buf = new Uint8Array(await res.arrayBuffer())
+      if (buf.byteLength > MAX_LIBRARY_BYTES) {
+        throw new Error(`素材库文件体积超出上限（>${Math.round(MAX_LIBRARY_BYTES / (1024 * 1024))} MiB）`)
+      }
+      chunks.push(buf)
+    }
+    const rawText = Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8')
+    const { json, itemCount } = parseAndValidateLibraryJson(rawText)
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('library:install', { json, itemCount })
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('library:install', { error: message })
+    }
+  }
+}
+
+function openLibraryBrowserWindow(browseUrl: string): void {
+  if (libraryWin && !libraryWin.isDestroyed()) {
+    void libraryWin.loadURL(browseUrl)
+    libraryWin.focus()
+    return
+  }
+  const child = new BrowserWindow({
+    parent: win && !win.isDestroyed() ? win : undefined,
+    width: 1080,
+    height: 760,
+    minWidth: 720,
+    minHeight: 520,
+    autoHideMenuBar: true,
+    title: '浏览社区素材库 — 点击「Add to Excalidraw」即刻装入画布',
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      partition: 'persist:excalidraw-libraries'
+    }
+  })
+  libraryWin = child
+
+  const interceptInstallUrl = (targetUrl: string): boolean => {
+    try {
+      const match = parseLibraryInstallNavigation(targetUrl)
+      if (!match) return false
+      if (!child.isDestroyed()) child.close()
+      void fetchAndInstallRemoteLibrary(match.libraryUrl)
+      return true
+    } catch (err) {
+      if (!child.isDestroyed()) child.close()
+      bringToFront()
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('library:install', {
+          error: err instanceof Error ? err.message : String(err)
+        })
+      }
+      return true
+    }
+  }
+
+  child.webContents.on('will-navigate', (event, targetUrl) => {
+    if (interceptInstallUrl(targetUrl)) {
+      event.preventDefault()
+      return
+    }
+    if (!isExcalidrawLibraryBrowseUrl(targetUrl)) {
+      event.preventDefault()
+      if (targetUrl.startsWith('https://') || targetUrl.startsWith('http://')) {
+        void shell.openExternal(targetUrl)
+      }
+    }
+  })
+
+  child.webContents.on('will-redirect', (event, targetUrl) => {
+    if (interceptInstallUrl(targetUrl)) {
+      event.preventDefault()
+    }
+  })
+
+  child.webContents.setWindowOpenHandler(({ url: targetUrl }) => {
+    if (interceptInstallUrl(targetUrl)) return { action: 'deny' }
+    if (isExcalidrawLibraryBrowseUrl(targetUrl)) {
+      void child.loadURL(targetUrl)
+      return { action: 'deny' }
+    }
+    if (targetUrl.startsWith('https://') || targetUrl.startsWith('http://')) {
+      void shell.openExternal(targetUrl)
+    }
+    return { action: 'deny' }
+  })
+
+  child.on('closed', () => {
+    if (libraryWin === child) libraryWin = null
+  })
+
+  void child.loadURL(browseUrl)
+}
 
 // ---------- 启动 ----------
 
@@ -1434,6 +1572,10 @@ if (!app.requestSingleInstanceLock()) {
   app.on('before-quit', () => {
     quitting = true
     daemon.markQuitting()
+    if (libraryWin && !libraryWin.isDestroyed()) {
+      libraryWin.destroy()
+      libraryWin = null
+    }
   })
 
   let engineClosing = false
