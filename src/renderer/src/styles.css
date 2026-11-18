@@ -100,6 +100,10 @@ body,
 .fd-agent-review textarea { width: 100%; box-sizing: border-box; margin-top: 8px; font: inherit; font-size: 12px; resize: vertical; }
 .fd-agent-review > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 9px; }
 .fd-agent-warning { color: #c2410c; }
+.fd-agent-yolo { font-weight: 700; letter-spacing: 0.04em; }
+.fd-agent-yolo-on { color: #fff; background: #e03131; border-color: #e03131; }
+.fd-agent-yolo-confirm { border-left-color: #e03131; }
+.fd-agent-yolo-confirm > p { margin: 6px 0 0; }
 .fd-agent-error { color: var(--fd-danger); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .fd-agent-alert { max-height: 110px; overflow: auto; flex: none; padding: 7px 20px; border-top: 1px dashed var(--fd-border); }
 .fd-agent-composer { padding: 13px 16px 18px; flex: none; border-top: 1px solid var(--fd-border); background: var(--fd-paper); }

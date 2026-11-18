@@ -37,6 +37,7 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
   })
   ipcMain.handle('agent:configure', (_event, draft: ProviderDraft) => service.configure(draft))
   ipcMain.handle('agent:model', (_event, provider: string, model: string) => service.selectModel(provider, model))
+  ipcMain.handle('agent:approval-mode', (_event, mode: 'auto-safe' | 'full-access') => service.setApprovalMode(mode))
   ipcMain.handle('agent:workspace', async (_event, requestedBoard: string) => {
     if (requestedBoard !== board()) throw new Error('画板已切换，请重新选择目录')
     const target = window()

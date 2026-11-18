@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('flyingdraws', {
     connect: (board: string) => ipcRenderer.invoke('agent:connect', board),
     configure: (draft: unknown) => ipcRenderer.invoke('agent:configure', draft),
     selectModel: (provider: string, model: string) => ipcRenderer.invoke('agent:model', provider, model),
+    setApprovalMode: (mode: 'auto-safe' | 'full-access') => ipcRenderer.invoke('agent:approval-mode', mode),
     chooseWorkspace: (board: string) => ipcRenderer.invoke('agent:workspace', board),
     newTask: (board: string) => ipcRenderer.invoke('agent:new', board),
     openTask: (id: string) => ipcRenderer.invoke('agent:open', id),

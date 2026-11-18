@@ -15,7 +15,7 @@ const AUTO_APPROVED: Record<string, string> = {
 }
 const EMPTY: AgentState = {
   connection: 'offline', error: null, busy: false, setupNeeded: true, vision: false,
-  provider: '', model: '', choices: [], workspace: '', activeItemId: null, items: []
+  provider: '', model: '', choices: [], workspace: '', activeItemId: null, items: [], approvalMode: 'auto-safe'
 }
 const DEFAULT_PROVIDER: ProviderDraft = {
   protocol: 'openai-compatible', name: 'my-model', base_url: '', credential: '', model: '',
@@ -67,6 +67,8 @@ export function AgentPanel({
   const [settings, setSettings] = useState(false)
   const [provider, setProvider] = useState(DEFAULT_PROVIDER)
   const [previewSrc, setPreviewSrc] = useState<{ src: string; alt: string } | null>(null)
+  const [confirmYolo, setConfirmYolo] = useState(false)
+  const yolo = state.approvalMode === 'full-access'
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   const [following, setFollowing] = useState(true)
@@ -235,8 +237,21 @@ export function AgentPanel({
       <div className="fd-agent-toolbar">
         <span className={`fd-agent-dot fd-agent-dot-${state.busy ? 'working' : state.connection}`} />
         <span role="status">{state.busy ? (approvals.length ? '等你确认操作' : '正在工作') : state.connection === 'starting' ? '连接内核中…' : state.connection === 'ready' ? state.setupNeeded ? '请设置模型' : '准备好了' : '内核未连接'}</span>
+        <button
+          className={yolo ? 'fd-agent-yolo fd-agent-yolo-on' : 'fd-agent-yolo'}
+          aria-pressed={yolo}
+          disabled={working}
+          title={yolo ? 'YOLO 已开启：所有工具调用都不再确认，直接执行。点击关闭' : '开启 YOLO：所有工具调用都不再逐次确认'}
+          onClick={() => { if (yolo) void act(() => api.setApprovalMode('auto-safe')); else setConfirmYolo(true) }}
+        >YOLO{yolo ? ' · 开' : ''}</button>
         <button onClick={() => setSettings(value => !value)} disabled={state.busy}>{settings ? '返回任务' : '模型设置'}</button>
       </div>
+      {confirmYolo ? <div className="fd-agent-approval fd-agent-yolo-confirm" role="alertdialog" aria-label="开启 YOLO">
+        <strong><span>开启 YOLO 模式？</span></strong>
+        <p className="fd-agent-small">开启后，Agent 的所有操作（运行命令、改文件、git push、删除、起服务、访问网页）都不再问你，直接在这台电脑上执行，不是沙箱。会一直记住，直到你手动关掉。</p>
+        <p className="fd-agent-small">建议先提交或备份未提交的改动。</p>
+        <div><button disabled={working} onClick={() => setConfirmYolo(false)}>取消</button><button className="fd-agent-stop" disabled={working} onClick={() => void act(() => api.setApprovalMode('full-access')).then(ok => { if (ok) setConfirmYolo(false) })}>开启 YOLO</button></div>
+      </div> : null}
       {state.recordsWarning ? <div className="fd-agent-alert fd-agent-small" role="status">{state.recordsWarning}</div> : null}
       {settings ? (
         <form className="fd-agent-settings" onSubmit={event => { event.preventDefault(); void saveModel() }}>

@@ -126,9 +126,12 @@ export interface AgentState {
   workspace: string
   /** 内核把截图、job 日志放在哪：host = 应用数据目录（不写进项目），旧内核没有这一项 */
   toolStorage?: { mode: string; artifactsDir?: string; jobsDir?: string }
+  /** 工具审批模式：auto-safe（默认，按风险询问）或 full-access（YOLO，全部自动执行、不再询问）。用户选择会记住。 */
+  approvalMode: ApprovalMode
   activeItemId: string | null
   items: AgentWorkItem[]
 }
+export type ApprovalMode = 'auto-safe' | 'full-access'
 export interface AgentSubmission {
   board: string
   goal: string
@@ -143,6 +146,7 @@ export interface AgentApi {
   connect(board: string): Promise<void>
   configure(draft: ProviderDraft): Promise<void>
   selectModel(provider: string, model: string): Promise<void>
+  setApprovalMode(mode: ApprovalMode): Promise<void>
   chooseWorkspace(board: string): Promise<string | null>
   newTask(board: string): Promise<void>
   openTask(id: string): Promise<void>

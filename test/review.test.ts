@@ -155,3 +155,32 @@ test('只读命令自动放行：tool_auto_approved 不论先于还是晚于 too
   assert.deepEqual(tools.map(tool => [tool.id, tool.autoApproved ?? null]), [['early', 'readonly_shell'], ['late', 'readonly_shell'], ['asked', null]])
   await service.close()
 })
+
+test('YOLO 审批模式：选择会记住、重开应用后恢复，内核事件同步，非法取值拒绝', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-yolo-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  await mkdir(join(home, 'agent'))
+  const service = new AgentService({ home, executable: () => { throw new Error('不应启动内核') }, mcpServers: {} })
+  assert.equal(service.snapshot().approvalMode, 'auto-safe', '默认按风险询问')
+  // 内核没连上时只记住，下次打开工作区时带给内核
+  await service.setApprovalMode('full-access')
+  assert.equal(service.snapshot().approvalMode, 'full-access')
+  assert.deepEqual(JSON.parse(await readFile(join(home, 'agent', 'host-settings.json'), 'utf8')), { approvalMode: 'full-access' })
+  await assert.rejects(service.setApprovalMode('yolo' as never), /审批模式无效/)
+  await service.close()
+  const reopened = new AgentService({ home, executable: () => { throw new Error('不应启动内核') }, mcpServers: {} })
+  assert.equal(reopened.snapshot().approvalMode, 'full-access', '重开应用后恢复')
+  ;(reopened as unknown as { onEvent(e: unknown): void }).onEvent({ type: 'event', seq: 1, req: 1, event: 'approval_mode_changed', data: { mode: 'auto-safe' } })
+  assert.equal(reopened.snapshot().approvalMode, 'auto-safe')
+  ;(reopened as unknown as { onEvent(e: unknown): void }).onEvent({ type: 'event', seq: 2, req: 1, event: 'approval_mode_changed', data: { mode: 'whatever' } })
+  assert.equal(reopened.snapshot().approvalMode, 'auto-safe', '不认识的模式不采纳')
+  await reopened.close()
+  await writeFile(join(home, 'agent', 'host-settings.json'), '{坏掉的')
+  const broken = new AgentService({ home, executable: () => { throw new Error('不应启动内核') }, mcpServers: {} })
+  assert.equal(broken.snapshot().approvalMode, 'auto-safe', '设置损坏时回到默认')
+  await broken.close()
+})
+
+test('提示词：开发服务器用普通 job，不设 keep_alive', () => {
+  assert.match(canvasPrompt('目标', 'default', { sceneJson: '{"elements":[]}', selectedIds: [], pngBase64: null }), /不要设 keep_alive/)
+})
