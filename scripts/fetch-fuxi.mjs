@@ -1,10 +1,15 @@
-// 自动获取并校验预编译 Fuxi 宿主内核（免 Rust 工具链、无需公开内核源码）。
+// 自动获取并校验预编译 Fuxi 宿主内核（免 Rust 工具链、无需公开内核源码，兼容终端代理）。
+import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { gunzipSync } from 'node:zlib'
+
+const execFileAsync = promisify(execFile)
 
 const REPO = 'jian-in/Flying-draws'
 const RELEASE_TAG = 'fuxi-kernel-0.2.0'
@@ -74,17 +79,75 @@ async function writeMetadata(sha256) {
   await writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8')
 }
 
+function hasProxyEnv() {
+  return Boolean(
+    process.env.HTTPS_PROXY ||
+      process.env.HTTP_PROXY ||
+      process.env.ALL_PROXY ||
+      process.env.https_proxy ||
+      process.env.http_proxy ||
+      process.env.all_proxy
+  )
+}
+
+function isLoopbackUrl(rawUrl) {
+  try {
+    const { hostname } = new URL(rawUrl)
+    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '[::1]'
+  } catch {
+    return false
+  }
+}
+
+async function downloadViaCurl(targetUrl) {
+  const curlBin = process.platform === 'win32' ? 'curl.exe' : 'curl'
+  const tempGz = join(tmpdir(), `flyingdraws-fuxi-${process.pid}-${Date.now()}.gz`)
+  try {
+    await execFileAsync(
+      curlBin,
+      ['-fsSL', '--connect-timeout', '15', '--max-time', '90', '-A', 'flying-draws-fetch-fuxi', '-o', tempGz, targetUrl],
+      { windowsHide: true, timeout: 95_000 }
+    )
+    return await readFile(tempGz)
+  } finally {
+    await rm(tempGz, { force: true }).catch(() => {})
+  }
+}
+
 async function downloadCompressedPayload(targetUrl) {
+  const loopback = isLoopbackUrl(targetUrl)
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
+
+  // 终端配置了 HTTP(S)_PROXY 时优先走系统自带 curl（Node 原生 fetch 默认忽略代理环境变量）
+  if (!loopback && hasProxyEnv() && (!token || customUrl)) {
+    try {
+      return await downloadViaCurl(targetUrl)
+    } catch {
+      // curl 不可用或失败时继续回退到原生 fetch
+    }
+  }
+
   const timeoutMs = Number(process.env.FLYINGDRAWS_FUXI_TIMEOUT_MS || 60_000)
-  const response = await fetch(targetUrl, {
-    redirect: 'follow',
-    signal: AbortSignal.timeout(timeoutMs),
-    headers: { 'user-agent': 'flying-draws-fetch-fuxi' }
-  })
+  let response
+  try {
+    response = await fetch(targetUrl, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { 'user-agent': 'flying-draws-fetch-fuxi' }
+    })
+  } catch (fetchErr) {
+    if (!loopback) {
+      try {
+        return await downloadViaCurl(targetUrl)
+      } catch {
+        // 保留原始错误提示
+      }
+    }
+    throw fetchErr
+  }
   if (response.ok) {
     return Buffer.from(await response.arrayBuffer())
   }
-  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
   if (response.status === 404 && token && !customUrl) {
     const metaRes = await fetch(`https://api.github.com/repos/${REPO}/releases/tags/${RELEASE_TAG}`, {
       signal: AbortSignal.timeout(timeoutMs),

@@ -6,3 +6,6 @@ src/renderer/public/fonts/
 *.log
 .rivet/
 .rivet.md
+docs/handoff.md
+docs/roadmap.md
+docs/design.md

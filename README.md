@@ -7,6 +7,8 @@
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20.19-339933.svg)](package.json)
 [![MCP Tools](https://img.shields.io/badge/MCP-10%20Tools-1971c2.svg)](#10-个-mcp-画布工具)
 
+![Flying draws — 多 Agent 同屏席位、半透明提议层手改确认与内置 Fuxi 工作台](docs/assets/hero.png)
+
 **Flying draws** 不是又一个通用白板，也不是把 Mermaid 单向吐到屏幕上的静态画图插件。它是贴在 IDE / 终端旁边的**本地视觉协作层与一体化 Agent 工作台**（基于 Electron + Excalidraw 构建，内置离线中文字体）：
 - **开箱即用双模式**：既可直接开启随包内置的 **Fuxi** 执行内核，把画布当作独立视觉编码工作台；也可通过标准 MCP 协议一键连入 **Claude Code、Codex、Cursor、Antigravity** 等任意外部客户端，多 Agent 同屏分席位接力。
 
