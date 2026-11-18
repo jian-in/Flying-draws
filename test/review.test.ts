@@ -89,6 +89,8 @@ test('收尾事件等结果截图写完再处理：run_finished 紧跟 tool_done
   assert.equal(saved.review.note, '血条压住了怪物眼睛')
   const prompt = canvasPrompt('再调一下', 'default', { sceneJson: '{"elements":[]}', selectedIds: [], pngBase64: null }, saved)
   assert.match(prompt, /认为没改对。用户的说明：血条压住了怪物眼睛/)
+  const visualPrompt = canvasPrompt('血条大一点', 'default', { selectedIds: [], pngBase64: null, sceneJson: JSON.stringify({ elements: [], files: {} }) })
+  assert.doesNotMatch(visualPrompt, /不要把截图/, '没有圈选页面截图时不加视觉对照要求')
   await service.review('r', 'approved')
   saved = JSON.parse(await readFile(join(home, 'agent', 'work-items.json'), 'utf8')).items[0].runs[0]
   assert.equal(saved.status, 'completed')

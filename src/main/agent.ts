@@ -100,7 +100,7 @@ export function canvasPrompt(goal: string, board: string, capture: AgentCapture,
     ? [
         '这是在页面截图上圈出的视觉改动。改完后，用和改前截图相同的页面地址和视口尺寸再截一张完整视口图作为对照，只需要最后一张' +
           (pageImage?.meta?.url ? `（改前截图的页面地址：${pageImage.meta.url}` + (pageImage.meta.viewport ? `，视口 ${pageImage.meta.viewport.w}×${pageImage.meta.viewport.h}` : '') + '）' : '') +
-          '。看起来对不对由用户看对照图决定，结果里如实说明你核对了什么，不要宣称视觉效果已经通过。'
+          '。截图会自动回传到画布，不要把截图或其他产物复制进项目目录。看起来对不对由用户看对照图决定，结果里如实说明你核对了什么，不要宣称视觉效果已经通过。'
       ]
     : []
   return [
