@@ -1,10 +1,11 @@
-import { app, dialog, ipcMain, type BrowserWindow } from 'electron'
+import { app, dialog, type BrowserWindow } from 'electron'
+import type { IpcGuard } from './ipcGuard'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { AgentService } from './agent'
 import { AGENT_SEAT, type AgentSubmission, type ProviderDraft } from '../shared/agent'
 
-export function registerAgent(home: string, window: () => BrowserWindow | null, board: () => string): AgentService {
+export function registerAgent(home: string, window: () => BrowserWindow | null, board: () => string, ipc: IpcGuard): AgentService {
   const filename = process.platform === 'win32' ? 'fuxi.exe' : 'fuxi'
   const service = new AgentService({
     home,
@@ -30,15 +31,15 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
     const target = window()
     if (target && !target.isDestroyed()) target.webContents.send('agent:state', state)
   })
-  ipcMain.handle('agent:state', () => service.snapshot())
-  ipcMain.handle('agent:connect', (_event, requestedBoard: string) => {
+  ipc.handle('agent:state', () => service.snapshot())
+  ipc.handle('agent:connect', (_event, requestedBoard: string) => {
     if (requestedBoard !== board()) throw new Error('画板已切换，请重新打开 Agent 面板')
     return service.connect(requestedBoard)
   })
-  ipcMain.handle('agent:configure', (_event, draft: ProviderDraft) => service.configure(draft))
-  ipcMain.handle('agent:model', (_event, provider: string, model: string) => service.selectModel(provider, model))
-  ipcMain.handle('agent:approval-mode', (_event, mode: 'auto-safe' | 'full-access') => service.setApprovalMode(mode))
-  ipcMain.handle('agent:workspace', async (_event, requestedBoard: string) => {
+  ipc.handle('agent:configure', (_event, draft: ProviderDraft) => service.configure(draft))
+  ipc.handle('agent:model', (_event, provider: string, model: string) => service.selectModel(provider, model))
+  ipc.handle('agent:approval-mode', (_event, mode: 'auto-safe' | 'full-access') => service.setApprovalMode(mode))
+  ipc.handle('agent:workspace', async (_event, requestedBoard: string) => {
     if (requestedBoard !== board()) throw new Error('画板已切换，请重新选择目录')
     const target = window()
     const options = { title: '选择 Agent 工作目录', properties: ['openDirectory'] as ('openDirectory')[] }
@@ -48,27 +49,27 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
     await service.setWorkspace(requestedBoard, result.filePaths[0])
     return result.filePaths[0]
   })
-  ipcMain.handle('agent:new', (_event, requestedBoard: string) => {
+  ipc.handle('agent:new', (_event, requestedBoard: string) => {
     if (requestedBoard !== board()) throw new Error('画板已切换')
     return service.newTask(requestedBoard)
   })
-  ipcMain.handle('agent:open', (_event, id: string) => {
+  ipc.handle('agent:open', (_event, id: string) => {
     if (!service.snapshot().items.some(item => item.id === id && item.board === board())) throw new Error('任务不属于当前画板')
     return service.openTask(id)
   })
-  ipcMain.handle('agent:submit', (_event, input: AgentSubmission) => {
+  ipc.handle('agent:submit', (_event, input: AgentSubmission) => {
     if (input.board !== board()) throw new Error('画板已切换，请重新发送')
     return service.submit(input)
   })
-  ipcMain.handle('agent:execute', (_event, text: string) => {
+  ipc.handle('agent:execute', (_event, text: string) => {
     const active = service.snapshot()
     const item = active.items.find(i => i.id === active.activeItemId && !i.archived)
     if (item && item.board !== board()) throw new Error('画板已切换，请切回原画板或重新拟定计划')
     return service.execute(text)
   })
-  ipcMain.handle('agent:cancel', () => service.cancel())
-  ipcMain.handle('agent:approve', (_event, requestId: string, approved: boolean) => service.approve(requestId, approved))
-  ipcMain.handle('agent:review', (_event, runId: string, verdict: 'approved' | 'rejected', note?: string) => service.review(runId, verdict, note))
-  ipcMain.handle('agent:image', (_event, id: string) => service.image(id))
+  ipc.handle('agent:cancel', () => service.cancel())
+  ipc.handle('agent:approve', (_event, requestId: string, approved: boolean) => service.approve(requestId, approved))
+  ipc.handle('agent:review', (_event, runId: string, verdict: 'approved' | 'rejected', note?: string) => service.review(runId, verdict, note))
+  ipc.handle('agent:image', (_event, id: string) => service.image(id))
   return service
 }
