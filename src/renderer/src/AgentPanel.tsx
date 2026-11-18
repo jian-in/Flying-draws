@@ -7,6 +7,12 @@ const LABEL: Record<AgentRun['status'], string> = {
   cancelled: '已停止', failed: '未完成', interrupted: '已中断',
   needs_review: '等你看一眼', rejected: '没改对'
 }
+/** 内核按规则自动放行（没有弹窗确认）的种类 */
+const AUTO_APPROVED: Record<string, string> = {
+  readonly_shell: '只读命令',
+  task_preview: '本轮服务预览',
+  task_job_cancel: '关闭本轮服务'
+}
 const EMPTY: AgentState = {
   connection: 'offline', error: null, busy: false, setupNeeded: true, vision: false,
   provider: '', model: '', choices: [], workspace: '', activeItemId: null, items: []
@@ -276,7 +282,7 @@ export function AgentPanel({
               <span>工作目录</span><span>{!state.workspace || state.workspace.replace(/\\/g, '/').includes('/agent/workspaces/') ? '应用专用目录' : state.workspace.replace(/\\/g, '/').split('/').slice(-2).join('/')}</span><span>↗</span>
             </button>
             {state.workspaceWarning ? <p className="fd-agent-small" role="status">{state.workspaceWarning}</p> : null}
-            {state.toolStorage?.mode === 'host' ? <p className="fd-agent-small" title={state.toolStorage.artifactsDir}>截图和运行日志存在应用数据目录，不写进项目；只读命令自动放行。</p> : null}
+            {state.toolStorage?.mode === 'host' ? <p className="fd-agent-small" title={state.toolStorage.artifactsDir}>截图和运行日志存在应用数据目录，不写进项目。只读命令、本轮自己起的服务的预览和关闭不再逐次确认。</p> : null}
             {items.length ? <select className="fd-agent-history" aria-label="任务历史" value={active?.id ?? ''} disabled={disabled} onChange={e => { if (e.target.value) void act(() => api.openTask(e.target.value)) }}>
               <option value="">新任务</option>{[...items].reverse().map(item => <option key={item.id} value={item.id}>{item.title || '未命名任务'}</option>)}
             </select> : null}
@@ -360,7 +366,7 @@ export function AgentPanel({
               {run.draft ? <div className="fd-agent-reply fd-agent-draft">{run.draft}<span className="fd-agent-caret" /></div> : null}
               {run.plan ? <div className="fd-agent-plan"><strong>{run.status === 'planned' ? '待确认的计划' : '本轮计划'}</strong><div>{run.reply || planBody(run.plan)}</div></div> : null}
               {run.tools.length ? <details className="fd-agent-tools"><summary>工具记录 · {run.tools.length} 项{run.tools.some(t => t.status === 'running') && run.status === 'running' ? ' · 正在执行' : ''}</summary>
-                {run.tools.map((tool, index) => <details key={`${tool.id}/${index}`}><summary><span>{tool.status === 'completed' ? '✓' : tool.status === 'failed' ? '×' : '·'}</span> {toolDisplayName(tool.name, state.toolLabels)}{tool.autoApproved ? <span className="fd-agent-small" title="只读命令，按规则自动放行，没有弹窗确认"> · 自动放行</span> : null}</summary><pre>{tool.input}{tool.result ? `\n\n${tool.result}` : ''}</pre></details>)}
+                {run.tools.map((tool, index) => <details key={`${tool.id}/${index}`}><summary><span>{tool.status === 'completed' ? '✓' : tool.status === 'failed' ? '×' : '·'}</span> {toolDisplayName(tool.name, state.toolLabels)}{tool.autoApproved ? <span className="fd-agent-small" title="按规则自动放行，没有弹窗确认"> · 自动放行（{AUTO_APPROVED[tool.autoApproved] ?? tool.autoApproved}）</span> : null}</summary><pre>{tool.input}{tool.result ? `\n\n${tool.result}` : ''}</pre></details>)}
               </details> : null}
               {run.images?.map(image => <ResultImage key={image.id} image={image} placed={Boolean(placedImageIds?.has(image.id))} disabled={working || state.busy || active?.board !== board} onPreview={(src, alt) => setPreviewSrc({ src, alt })} onInsert={dataURL => act(() => insertImage(image, dataURL, { annotations: run.annotations }))} />)}
               {run.verificationWarning ? <p className="fd-agent-small fd-agent-warning">{run.verificationWarning}</p> : null}
