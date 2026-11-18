@@ -248,7 +248,7 @@ export function AgentPanel({
       </div>
       {confirmYolo ? <div className="fd-agent-approval fd-agent-yolo-confirm" role="alertdialog" aria-label="开启 YOLO">
         <strong><span>开启 YOLO 模式？</span></strong>
-        <p className="fd-agent-small">开启后，Agent 的所有操作（运行命令、改文件、git push、删除、起服务、访问网页）都不再问你，直接在这台电脑上执行，不是沙箱。会一直记住，直到你手动关掉。</p>
+        <p className="fd-agent-small">开启后，Agent 的所有操作（运行命令、改文件、git push、删除、起服务、访问网页）都不再问你，直接在这台电脑上执行，不是沙箱。只在这次打开期间有效，退出应用后自动关闭。</p>
         <p className="fd-agent-small">建议先提交或备份未提交的改动。</p>
         <div><button disabled={working} onClick={() => setConfirmYolo(false)}>取消</button><button className="fd-agent-stop" disabled={working} onClick={() => void act(() => api.setApprovalMode('full-access')).then(ok => { if (ok) setConfirmYolo(false) })}>开启 YOLO</button></div>
       </div> : null}

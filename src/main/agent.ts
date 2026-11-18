@@ -181,12 +181,14 @@ export class AgentService extends EventEmitter {
     this.options = options
     this.root = join(options.home, 'agent')
     this.records = join(this.root, 'work-items.json')
-    // 审批模式是用户在 Flying draws 里的选择，存在宿主自己的设置里；内核配置文件不能开启 YOLO
+    // 审批模式是用户在 Flying draws 里的选择，存在宿主自己的设置里；内核配置文件不能开启 YOLO。
+    // YOLO 只在本次运行内有效：每次启动都回到按风险询问，设置文件里留下的 full-access 不采纳，
+    // 免得用户忘了开过、或者别的程序改了这个文件，就让 Agent 无审批执行。
     this.settingsPath = join(this.root, 'host-settings.json')
     try {
       if (existsSync(this.settingsPath)) {
         const saved = JSON.parse(readFileSync(this.settingsPath, 'utf8')) as { approvalMode?: unknown }
-        if (isApprovalMode(saved.approvalMode)) this.state.approvalMode = saved.approvalMode
+        if (isApprovalMode(saved.approvalMode) && saved.approvalMode !== 'full-access') this.state.approvalMode = saved.approvalMode
       }
     } catch { /* 设置损坏时用默认的按风险询问 */ }
     let preserveOnly = false
@@ -385,7 +387,7 @@ export class AgentService extends EventEmitter {
     await this.host().request('provider.add', draft, true)
     if (this.state.setupNeeded || this.state.provider !== draft.name || this.state.model !== draft.model) await this.selectModel(draft.name, draft.model)
   }
-  /** 切换审批模式并记住；内核已连上时当场生效（进行中的任务也从下一个工具调用起生效）。 */
+  /** 切换审批模式；内核已连上时当场生效（进行中的任务也从下一个工具调用起生效）。YOLO 只在本次运行内有效。 */
   async setApprovalMode(mode: ApprovalMode): Promise<void> {
     if (!isApprovalMode(mode)) throw new Error('审批模式无效')
     if (this.state.connection === 'ready' && this.client) {
@@ -394,7 +396,8 @@ export class AgentService extends EventEmitter {
     }
     this.state.approvalMode = mode
     await mkdir(this.root, { recursive: true })
-    await atomicWriteJson(this.settingsPath, { approvalMode: mode })
+    // 只记住安全的选择；YOLO 不落盘，退出即失效
+    await atomicWriteJson(this.settingsPath, { approvalMode: mode === 'full-access' ? 'auto-safe' : mode })
     this.changed()
   }
   async selectModel(provider: string, model: string): Promise<void> {
