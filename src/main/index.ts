@@ -884,7 +884,7 @@ async function takeSnapshot(withImage: boolean): Promise<Snapshot> {
   return rpc<Snapshot>('snapshot', { image: withImage })
 }
 
-// 所有写入排成一队，一次只执行一批（design.md 12.2）
+// 所有写入排成一队，一次只执行一批，避免两批指令基于同一个旧版本互相覆盖
 let writeChain: Promise<unknown> = Promise.resolve()
 function serialized<T>(fn: () => Promise<T>): Promise<T> {
   const run = writeChain.then(fn, fn)
@@ -1024,7 +1024,7 @@ async function drawOps(
           : 'These ops refer to or modify elements already on the canvas, so base_version is required.'
       )
     }
-    // 引用的节点只要还在就行；但要改动、移动或删除的元素，从那个版本到现在不能被别人动过（design.md 12.3）
+    // 引用的节点只要还在就行；但要改动、移动或删除的元素，从那个版本到现在不能被别人动过
     const now = elementFingerprints(elements)
     const touched = plan.modifiedRefs.filter((ref) => record.fingerprints.get(ref) !== now.get(ref))
     if (touched.length) {

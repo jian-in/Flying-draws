@@ -3,7 +3,7 @@
 //
 // 新增：add_node、add_edge、add_text；trace_image 把一张图里的内容照原样转成可编辑元素。
 // 改动：move、update_node、delete_node、update_edge、delete_edge、update_text、delete_text、delete_strokes、set_style。
-// 改动可以用在任何人画的东西上（用户的、别的 agent 的都行，design.md 12.4）；还在等用户确认的提议除外。
+// 改动可以用在任何人画的东西上（用户的、别的 agent 的都行）；还在等用户确认的提议除外。
 // 排版：这一批里没指定坐标的新节点交给 dagre 排成一块，整块放在已有内容下方；
 // 已有元素只在收到 move 指令时平移。
 import dagre from '@dagrejs/dagre'
@@ -451,7 +451,7 @@ export function placeBeside(
 
 // 新的一块放哪儿，返回它的左上角。
 // - 连着已有节点：紧挨着那些节点放。先试顺着排版方向的那一侧（横排试右边，竖排试下面），被占了试另一侧，
-//   两侧都被占就从正下方一路往下找到第一处空位——不再一律甩到整张画布的最底下。
+//   两侧都被占就从正下方一路往下找到第一处空位，不再一律甩到整张画布的最底下。
 // - 不连已有节点：知道用户当前的视野时，放进视野里第一处放得下的空位；
 //   视野里放不下，就放在视野这一竖条里已有内容的下面。不知道视野时退回老办法：所有内容的最下方。
 export function placeBlock(
