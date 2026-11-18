@@ -156,7 +156,7 @@ Agent 读到的不是杂乱的坐标 JSON，而是高信噪比的空间语义描
 
 ## 核心工程架构导览
 
-底层数据结构、并发算法与系统编程细节请参阅 **[架构与核心工程设计白皮书 (`docs/architecture.md`)](docs/architecture.md)**，演示复现流程请参阅 **[演示录制分镜手册 (`docs/demo-playbook.md`)](docs/demo-playbook.md)**：
+底层数据结构、并发算法与系统编程细节请参阅 **[架构与核心工程设计白皮书 (`docs/architecture.md`)](docs/architecture.md)**：
 
 1. **双向提议对齐协议（Proposal-Diff Protocol）**：`toProposalPlan` 破坏性操作延迟化预览框、`resolveProposal` 帧存活局部否决、以及 `diffProposal` 双阈值（`24px` 位移 / `25%` 缩放）去噪合成中文反馈。
 2. **基于语义指纹的乐观并发控制（Semantic Rebase & Fingerprinting）**：60 版本滑动历史窗口、`rebaseOps` 阅读序漂移自动重编号、以及 `elementFingerprints` 拓扑签名豁免绑定箭头因拖动节点产生的派生 `version` 伪冲突。
@@ -191,7 +191,7 @@ src/preload/    ContextIsolation 最小白名单桥接接口
 src/renderer/   Excalidraw 画布、请求/提议横幅、动态席位筛选栏、内置 Agent 面板
 src/shared/     主进程与渲染层共享的 Agent 状态、血缘元数据与工具展示定义
 examples/       开箱体验用的标准 Excalidraw 示例画板
-docs/           架构白皮书（architecture.md）、录制手册（demo-playbook.md）、宿主契约（fuxi-host-plan.md）等文档
+docs/           架构白皮书（architecture.md）、宿主契约（fuxi-host-plan.md）等文档
 scripts/        字体同步、预编译内核拉取校验、画板检查、桌面打包与端到端测试脚本
 test/           纯函数与 CLI 自动化测试集
 ```
