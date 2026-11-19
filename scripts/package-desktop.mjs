@@ -1,16 +1,17 @@
 // 使用已经安装的 Electron 与生产依赖，打出可直接启动的目录；不下载打包器或运行时。
-import { cp, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { existsSync, statSync } from 'node:fs'
 import { builtinModules } from 'node:module'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const rawArgs = process.argv.slice(2)
-const supportedFlags = new Set(['--without-fuxi', '--require-fuxi'])
+const supportedFlags = new Set(['--without-fuxi', '--require-fuxi', '--keep-old'])
 for (const arg of rawArgs) {
-  if (!supportedFlags.has(arg)) throw new Error(`未知参数：${arg}（支持 --without-fuxi / --require-fuxi）`)
+  if (!supportedFlags.has(arg)) throw new Error(`未知参数：${arg}（支持 --without-fuxi / --require-fuxi / --keep-old）`)
 }
+const keepOld = rawArgs.includes('--keep-old')
 const withoutFuxi = rawArgs.includes('--without-fuxi')
 const requireFuxi = rawArgs.includes('--require-fuxi')
 if (withoutFuxi && requireFuxi) {
@@ -31,7 +32,15 @@ if (!withoutFuxi && !hasFuxi) {
 }
 if (process.platform !== 'win32') throw new Error('当前目录打包脚本支持 Windows；其他平台仍可运行 npm start')
 const destination = join(root, 'dist', `Flying-draws-${process.platform}-${process.arch}`)
-if (existsSync(destination)) throw new Error(`目标已存在，请先关闭并自行移走旧包：${destination}`)
+// --keep-old：旧包最后按它的目录修改时间（本地时区）改名留着，不删
+let kept = null
+if (existsSync(destination)) {
+  if (!keepOld) throw new Error(`目标已存在，请先关闭并自行移走旧包，或加 --keep-old 自动改名保留：${destination}`)
+  const t = statSync(destination).mtime
+  const pad = n => String(n).padStart(2, '0')
+  kept = `${destination}-prev-${t.getFullYear()}${pad(t.getMonth() + 1)}${pad(t.getDate())}-${pad(t.getHours())}${pad(t.getMinutes())}`
+  if (existsSync(kept)) throw new Error(`保留旧包的目录已存在，请先处理：${kept}`)
+}
 const npm = process.env.npm_execpath
 if (!npm) throw new Error('请通过 npm run package:desktop 或 npm run package:canvas 运行此脚本')
 const modulesRoot = join(root, 'node_modules')
@@ -71,28 +80,61 @@ for (const path of packages) {
   const rel = relative(modulesRoot, path)
   if (rel.startsWith('..') || isAbsolute(rel) || !existsSync(join(path, 'package.json'))) throw new Error('生产依赖路径无法确认，停止打包')
 }
-await mkdir(destination, { recursive: true })
-await cp(join(root, 'node_modules', 'electron', 'dist'), destination, { recursive: true })
-await rename(join(destination, 'electron.exe'), join(destination, 'Flying draws.exe'))
-if (existsSync(join(destination, 'LICENSE'))) {
-  await rename(join(destination, 'LICENSE'), join(destination, 'LICENSE.electron.txt'))
+// 先在同级临时目录打完整，最后再换到标准路径：中途失败不会留下半个包，也不会动旧包
+const staging = `${destination}-staging-${process.pid}`
+if (existsSync(staging)) throw new Error(`临时目录已存在，请先处理：${staging}`)
+try {
+  await mkdir(staging, { recursive: true })
+  await cp(join(root, 'node_modules', 'electron', 'dist'), staging, { recursive: true })
+  await rename(join(staging, 'electron.exe'), join(staging, 'Flying draws.exe'))
+  if (existsSync(join(staging, 'LICENSE'))) {
+    await rename(join(staging, 'LICENSE'), join(staging, 'LICENSE.electron.txt'))
+  }
+  for (const doc of ['LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md']) {
+    if (existsSync(join(root, doc))) await cp(join(root, doc), join(staging, doc))
+  }
+  const app = join(staging, 'resources', 'app')
+  await mkdir(app, { recursive: true })
+  for (const folder of ['main', 'preload', 'renderer', 'bridge']) {
+    await cp(join(root, 'out', folder), join(app, 'out', folder), { recursive: true })
+  }
+  if (!withoutFuxi) {
+    await cp(join(root, 'resources', 'fuxi'), join(staging, 'resources', 'fuxi'), { recursive: true })
+  }
+  const original = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
+  await writeFile(join(app, 'package.json'), JSON.stringify({ name: original.name, productName: 'Flying draws', version: original.version, main: 'out/main/index.js' }, null, 2))
+  for (const path of packages) {
+    const rel = relative(modulesRoot, path)
+    await cp(path, join(app, 'node_modules', rel), { recursive: true, filter: entry => !relative(path, entry).split(sep).includes('node_modules') })
+  }
+} catch (error) {
+  await rm(staging, { recursive: true, force: true })
+  throw error
 }
-for (const doc of ['LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md']) {
-  if (existsSync(join(root, doc))) await cp(join(root, doc), join(destination, doc))
+const busy = error => ['EPERM', 'EBUSY', 'EACCES'].includes(error?.code)
+// 刚写完的目录可能还被杀毒软件扫描占着，改名失败时稍等重试几次
+async function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await rename(from, to) }
+    catch (error) {
+      if (!busy(error) || attempt >= 9) throw error
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+  }
 }
-const app = join(destination, 'resources', 'app')
-await mkdir(app, { recursive: true })
-for (const folder of ['main', 'preload', 'renderer', 'bridge']) {
-  await cp(join(root, 'out', folder), join(app, 'out', folder), { recursive: true })
+if (kept) {
+  try { await renameWithRetry(destination, kept) }
+  catch (error) {
+    await rm(staging, { recursive: true, force: true })
+    if (busy(error)) throw new Error(`旧包还在使用中，没法改名：请从托盘退出 Flying draws 后重试（${destination}）`)
+    throw error
+  }
+  console.log(`旧包已改名保留：${kept}`)
 }
-if (!withoutFuxi) {
-  await cp(join(root, 'resources', 'fuxi'), join(destination, 'resources', 'fuxi'), { recursive: true })
-}
-const original = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
-await writeFile(join(app, 'package.json'), JSON.stringify({ name: original.name, productName: 'Flying draws', version: original.version, main: 'out/main/index.js' }, null, 2))
-for (const path of packages) {
-  const rel = relative(modulesRoot, path)
-  await cp(path, join(app, 'node_modules', rel), { recursive: true, filter: entry => !relative(path, entry).split(sep).includes('node_modules') })
+try { await renameWithRetry(staging, destination) }
+catch (error) {
+  if (kept) await rename(kept, destination).catch(() => {})
+  throw new Error(`新包没能换到标准路径${kept ? '，旧包已尽量恢复原名' : ''}；新包留在：${staging}（${error.message}）`)
 }
 const modeLabel = withoutFuxi ? '（免 Fuxi 纯画布包）' : '（含内置 Fuxi 内核）'
 console.log(`可运行应用${modeLabel}：${join(destination, 'Flying draws.exe')}`)
