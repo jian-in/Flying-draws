@@ -5,7 +5,7 @@ import { app, BrowserWindow, ipcMain, Menu, nativeImage, net, shell, Tray } from
 import { join, resolve } from 'node:path'
 import { WindowDock } from './dock'
 import { isAppRendererUrl } from './ipcGuard'
-import { trayIconPixels } from './trayIcon'
+import { trayRepresentations } from './trayIcon'
 import { freshApprovals, hasPendingApprovals, trayTooltip } from './agentNotice'
 import { AGENT_SEAT, type AgentState } from '../shared/agent'
 import { isExcalidrawLibraryBrowseUrl, MAX_LIBRARY_BYTES, parseLibraryInstallNavigation } from '../shared/library'
@@ -23,9 +23,7 @@ export let launchHidden = process.argv.includes(BACKGROUND_ARG)
 
 export function trayImage(alert = false): Electron.NativeImage {
   const image = nativeImage.createEmpty()
-  for (const [size, scaleFactor] of [[16, 1], [24, 1.5], [32, 2]] as const) {
-    image.addRepresentation({ width: size, height: size, scaleFactor, buffer: trayIconPixels(size, alert) })
-  }
+  for (const rep of trayRepresentations(app.getAppPath(), alert)) image.addRepresentation(rep)
   return image
 }
 
@@ -131,6 +129,7 @@ export let dock: WindowDock | null = null
 
 export function createWindow(): void {
   const win = new BrowserWindow({
+    icon: join(app.getAppPath(), 'resources', 'icon', 'icon-256.png'),
     show: !launchHidden && !(process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT'] && process.env['FLYINGDRAWS_TEST_HIDDEN'] === '1'),
     width: 1280,
     height: 820,
@@ -275,6 +274,7 @@ export function openLibraryBrowserWindow(browseUrl: string): void {
     return
   }
   const child = new BrowserWindow({
+    icon: join(app.getAppPath(), 'resources', 'icon', 'icon-256.png'),
     parent: win && !win.isDestroyed() ? win : undefined,
     width: 1080,
     height: 760,

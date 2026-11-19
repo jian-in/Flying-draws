@@ -14,6 +14,7 @@
     "flying-draws-mcp": "out/bridge/index.js"
   },
   "files": [
+    "resources/icon/",
     "out/bridge/",
     "out/main/",
     "out/preload/",
@@ -40,6 +41,7 @@
     "postinstall": "node node_modules/electron/install.js && node scripts/copy-fonts.mjs && node scripts/fetch-fuxi.mjs",
     "dev": "electron-vite dev",
     "build": "electron-vite build && tsc -p tsconfig.bridge.json",
+    "icons": "electron scripts/generate-icons.cjs",
     "build:bridge": "tsc -p tsconfig.bridge.json",
     "fetch:fuxi": "node scripts/fetch-fuxi.mjs --require",
     "build:fuxi": "node scripts/build-fuxi.mjs",
@@ -70,6 +72,7 @@
     "@vitejs/plugin-react": "6.3.0",
     "electron": "45.3.2",
     "electron-vite": "6.0.0",
+    "resedit": "3.1.1",
     "typescript": "5.9.3",
     "vite": "8.3.8"
   }

@@ -5,6 +5,8 @@ import { builtinModules } from 'node:module'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { setExecutableIcon } from './executable-icon.mjs'
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const rawArgs = process.argv.slice(2)
 const supportedFlags = new Set(['--without-fuxi', '--require-fuxi', '--keep-old'])
@@ -87,6 +89,7 @@ try {
   await mkdir(staging, { recursive: true })
   await cp(join(root, 'node_modules', 'electron', 'dist'), staging, { recursive: true })
   await rename(join(staging, 'electron.exe'), join(staging, 'Flying draws.exe'))
+  await setExecutableIcon(join(staging, 'Flying draws.exe'), join(root, 'resources', 'icon', 'icon.ico'))
   if (existsSync(join(staging, 'LICENSE'))) {
     await rename(join(staging, 'LICENSE'), join(staging, 'LICENSE.electron.txt'))
   }
@@ -95,6 +98,7 @@ try {
   }
   const app = join(staging, 'resources', 'app')
   await mkdir(app, { recursive: true })
+  await cp(join(root, 'resources', 'icon'), join(app, 'resources', 'icon'), { recursive: true })
   for (const folder of ['main', 'preload', 'renderer', 'bridge']) {
     await cp(join(root, 'out', folder), join(app, 'out', folder), { recursive: true })
   }
