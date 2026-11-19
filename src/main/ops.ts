@@ -501,6 +501,42 @@ export function placeBlock(
   return opts.fallback
 }
 
+// 单锚点扇出时保留 dagre 的兄弟间距，平移整组试位。已有分支不能被新的一组盖住。
+function placeFanOut(
+  anchor: Bbox, block: Bbox, leaves: readonly Bbox[], notes: readonly Bbox[], obstacles: readonly Bbox[],
+  previousRoutes: readonly [number, number][][], direction: Direction, gap: number
+): [number, number] | null {
+  const start = centerOf(anchor)
+  const blockers = obstacles.filter(box => !inside(start, box))
+  const cx = start[0] - block.w / 2
+  const cy = start[1] - block.h / 2
+  const right = anchor.x + anchor.w + gap
+  const left = anchor.x - gap - block.w
+  const below = anchor.y + anchor.h + gap
+  const above = anchor.y - gap - block.h
+  for (let step = 0; step <= 12; step++) {
+    for (const offset of step ? [-step * PLACE_STEP, step * PLACE_STEP] : [0]) {
+      const horizontal: [number, number][] = [[right, cy + offset], [left, cy + offset]]
+      const vertical: [number, number][] = [[cx + offset, below], [cx + offset, above]]
+      for (const [x, y] of direction === 'right' ? [...horizontal, ...vertical] : [...vertical, ...horizontal]) {
+        const candidate = { x, y, w: block.w, h: block.h }
+        if (obstacles.some(box => overlaps(candidate, box, PLACE_MARGIN))) continue
+        if (previousRoutes.some(points => points.some((p, i) => i > 0 && segmentHits(points[i - 1], p, candidate, DETOUR_PAD)))) continue
+        const shift = (box: Bbox) => ({ ...box, x: x + box.x - block.x, y: y + box.y - block.y })
+        const slots = leaves.map(shift)
+        const noteBoxes = notes.map(shift)
+        if (slots.every(slot => {
+          const end = centerOf(slot)
+          return !blockers.some(box => segmentHits(start, end, box, DETOUR_PAD))
+            && !noteBoxes.some(box => segmentHits(start, end, box, DETOUR_PAD))
+            && !slots.some(other => other !== slot && segmentHits(start, end, other, DETOUR_PAD))
+        })) return [x, y]
+      }
+    }
+  }
+  return null
+}
+
 // 线段有没有穿过一个框（Liang–Barsky）
 function segmentHits(a: [number, number], b: [number, number], box: Bbox, pad = 0): boolean {
   const dx = b[0] - a[0]
@@ -556,12 +592,12 @@ export function detourPoint(a: [number, number], b: [number, number], obstacles:
 }
 
 /**
- * 连线绕障路径：优先单拐点绕行；若密集多障碍导致单拐点无法同时避开两端障碍，
- * 退而尝试双拐点平行走廊绕行（[p1, p2]），再绕不开才返回空数组画直线。
+ * 小幅绕行保留单拐点。单拐点超过一个块间距时，先找偏移更小的双拐点走廊。
  */
 export function detourPath(a: [number, number], b: [number, number], obstacles: readonly Bbox[]): [number, number][] {
   const single = detourPoint(a, b, obstacles)
-  if (single) return [single]
+  const singleOffset = single ? Math.hypot(single[0] - (a[0] + b[0]) / 2, single[1] - (a[1] + b[1]) / 2) : Infinity
+  if (single && singleOffset <= BLOCK_GAP) return [single]
   const others = obstacles.filter((o) => !inside(a, o) && !inside(b, o))
   const blocked = (p: [number, number], q: [number, number]) => others.some((o) => segmentHits(p, q, o, DETOUR_PAD))
   if (!blocked(a, b)) return []
@@ -571,11 +607,8 @@ export function detourPath(a: [number, number], b: [number, number], obstacles: 
   if (len < 1) return []
   const nx = -dy / len
   const ny = dx / len
-  for (const [t1, t2] of [
-    [0.2, 0.8],
-    [0.05, 0.95]
-  ] as const) {
-    for (let d = DETOUR_STEP * 2; d <= 800; d += DETOUR_STEP) {
+  for (let d = DETOUR_STEP * 2; d <= 800 && d < singleOffset; d += DETOUR_STEP) {
+    for (const [t1, t2] of [[0.2, 0.8], [0.05, 0.95]] as const) {
       for (const sign of [1, -1]) {
         const p1: [number, number] = [a[0] + dx * t1 + nx * d * sign, a[1] + dy * t1 + ny * d * sign]
         const p2: [number, number] = [a[0] + dx * t2 + nx * d * sign, a[1] + dy * t2 + ny * d * sign]
@@ -583,7 +616,7 @@ export function detourPath(a: [number, number], b: [number, number], obstacles: 
       }
     }
   }
-  return []
+  return single ? [single] : []
 }
 
 function centerOf(b: Bbox): [number, number] {
@@ -1047,6 +1080,7 @@ export function planOps(
 
   // ---------- 排版：dagre 排自动节点，整块放到已有内容下方 ----------
   const bends = new Map<number, [number, number][]>() // 第几条连线 → dagre 给的中间拐点
+  let flipFanNotes = false
   let blockBottom: number | null = null
   let blockLeft = layoutBoxes.length ? Math.min(...layoutBoxes.map((b) => b.x)) : START[0]
   if (auto.size) {
@@ -1098,7 +1132,46 @@ export function planOps(
     const bottomOfAll = layoutBoxes.length ? Math.max(...layoutBoxes.map((b) => b.y + b.h)) + BLOCK_GAP : START[1]
     // 给手工指定了坐标的新节点也留出位置
     const pinned = nodes.filter((n) => !auto.has(n.key)).map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h }))
-    const [originX, originY] = placeBlock({ w: maxX - minX, h: maxY - minY }, [...layoutBoxes, ...pinned], {
+    const obstacles = [...layoutBoxes, ...pinned]
+    const root = edgeOps.length ? existing.get(edgeOps[0].from) : undefined
+    let fanOrigin: [number, number] | null = null
+    if (root && edgeOps.every(e => e.from === edgeOps[0].from && auto.has(e.to))
+      && new Set(edgeOps.map(e => e.to)).size === auto.size) {
+      const routes = graph.edges.filter(e => e.from === root.id || e.to === root.id)
+      if (auto.size > 1 || routes.length) {
+        const previousRoutes = routes.flatMap(edge => {
+          const raw = rawById.get(edge.ref)
+          if (raw?.points?.length) return [raw.points.map(([x, y]): [number, number] => [raw.x + x, raw.y + y])]
+          const other = existing.get((edge.from === root.id ? edge.to : edge.from) ?? '')
+          return other ? [[centerOf(root.bbox), centerOf(other.bbox)]] : []
+        })
+        const notes: Bbox[] = []
+        const opposite: Bbox[] = []
+        const leaves = [...auto].map(key => {
+          const { x, y } = g.node(key)
+          const { w, h } = byKey.get(key)!
+          const r = reserved.get(key)
+          if (r) {
+            const note = direction === 'right'
+              ? { x: x - r.w / 2, y: y + h / 2 + TEXT_GAP, w: r.w, h: r.h - TEXT_GAP }
+              : { x: x + w / 2 + TEXT_GAP, y: y - h / 2, w: r.w - TEXT_GAP, h: r.h }
+            notes.push(note)
+            opposite.push(direction === 'right' ? { ...note, y: y - h / 2 - TEXT_GAP - note.h }
+              : { ...note, x: x - w / 2 - TEXT_GAP - note.w })
+          }
+          return { x: x - w / 2, y: y - h / 2, w, h }
+        })
+        const gap = Math.max(BLOCK_GAP, ...edgeOps.map(e => e.label ? estimateTextWidth(e.label) + PLACE_MARGIN : 0))
+        const block = { x: minX, y: minY, w: maxX - minX, h: maxY - minY }
+        fanOrigin = placeFanOut(anchors[0], block, leaves, notes, obstacles, previousRoutes, direction, gap)
+        // 只能从旁注一侧入射时，把这批旁注放到节点另一侧。dagre 已经两侧对称留空。
+        if (!fanOrigin && notes.length) {
+          fanOrigin = placeFanOut(anchors[0], block, leaves, opposite, obstacles, previousRoutes, direction, gap)
+          flipFanNotes = fanOrigin !== null
+        }
+      }
+    }
+    const [originX, originY] = fanOrigin ?? placeBlock({ w: maxX - minX, h: maxY - minY }, obstacles, {
       anchors,
       direction,
       view: opts.view ?? null,
@@ -1206,20 +1279,6 @@ export function planOps(
     const old = existing.get(key)!
     return { elementId: old.ref, box: nodeBox(old) }
   }
-  // 连线要绕开的东西：画布上已有的，加上这一批新画的节点
-  const edgeObstacles: Bbox[] = [...allBoxes, ...nodes.map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h }))]
-  const edges: PlannedEdge[] = edgeOps.map((e, i) => {
-    const from = boxOf(e.from)
-    const to = boxOf(e.to)
-    return {
-      elementId: newId(),
-      fromElementId: from.elementId,
-      toElementId: to.elementId,
-      label: e.label,
-      ...routeBetween(from.box, to.box, edgeObstacles, bends.get(i))
-    }
-  })
-
   // ---------- 文字 ----------
   const stacked = new Map<string, number>() // 同一个节点旁边已经放了多高（或多宽）的文字
   let looseY = (blockBottom ?? (allBoxes.length ? Math.max(...allBoxes.map((b) => b.y + b.h)) : START[1] - TEXT_GAP * 2)) + TEXT_GAP * 2
@@ -1234,11 +1293,11 @@ export function planOps(
       const { box } = boxOf(t.near)
       const used = stacked.get(t.near) ?? 0
       if (direction === 'down' && auto.has(t.near)) {
-        x = box.x + box.w + TEXT_GAP
+        x = flipFanNotes ? box.x - TEXT_GAP - size.w : box.x + box.w + TEXT_GAP
         y = box.y + used
       } else {
         x = box.x + (box.w - size.w) / 2
-        y = box.y + box.h + TEXT_GAP + used
+        y = flipFanNotes && auto.has(t.near) ? box.y - TEXT_GAP - used - size.h : box.y + box.h + TEXT_GAP + used
       }
       stacked.set(t.near, used + size.h + (direction === 'down' && auto.has(t.near) ? 0 : TEXT_GAP))
     } else {
@@ -1247,6 +1306,20 @@ export function planOps(
       looseY += size.h + TEXT_GAP
     }
     return { elementId: newId(), text: t.text, x, y }
+  })
+
+  // 连线要绕开的东西：画布上已有的，加上这一批新画的节点
+  const edgeObstacles: Bbox[] = [...allBoxes, ...nodes, ...texts.map(t => ({ x: t.x, y: t.y, ...textSize(t.text) }))]
+  const edges: PlannedEdge[] = edgeOps.map((e, i) => {
+    const from = boxOf(e.from)
+    const to = boxOf(e.to)
+    return {
+      elementId: newId(),
+      fromElementId: from.elementId,
+      toElementId: to.elementId,
+      label: e.label,
+      ...routeBetween(from.box, to.box, edgeObstacles, bends.get(i))
+    }
   })
 
   // ---------- 照图还原：每张图画成一块，放在原图旁边的空位（或叠在原图上） ----------

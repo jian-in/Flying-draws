@@ -1054,3 +1054,58 @@ test('reroutes：单端移动后用最终障碍重排，双端等量移动保留
   const resized = planOps([...both, { op: 'set_style', id: 'N1', width: 160 }], graph, ids(), { elements })
   assert.equal(resized.reroutes?.length, 3)
 })
+
+test('三次从同一椭圆扇出，六条箭头不穿过兄弟节点或新旧旁注', () => {
+  const scene: SceneElement[] = []
+  const newId = ids()
+  const routes: ReturnType<typeof planOps>['edges'] = []
+  function append(ops: DrawOp[]) {
+    const plan = planOps(ops, buildGraph(scene), newId, { elements: scene })
+    for (const n of plan.nodes) scene.push({ id: n.elementId, type: n.shape, x: n.x, y: n.y, width: n.w, height: n.h })
+    for (const t of plan.texts) scene.push({ id: t.elementId, type: 'text', text: t.text, x: t.x, y: t.y, width: estimateTextWidth(t.text), height: 25 })
+    for (const e of plan.edges) {
+      routes.push(e)
+      scene.push({ id: e.elementId, type: 'arrow', x: e.x, y: e.y, width: 0, height: 0, points: e.points,
+        startBinding: { elementId: e.fromElementId }, endBinding: { elementId: e.toElementId }, endArrowhead: 'arrow' })
+    }
+  }
+  append([{ op: 'add_node', id: 'root', shape: 'ellipse', label: '④ 主人首跑新包', x: 155, y: 169 },
+    { op: 'add_text', near: 'root', text: '首跑之后的改进看板：四个席位接力，各画自己负责的一块' }])
+  const rootRef = scene[0].id
+  for (const [batch, labels] of [
+    ['本轮服务未监听：等端口起来再判定', '记住审批：超时不超过已批上限即命中'],
+    ['完工提醒：托盘红点 + 任务栏闪烁', '按项目预填启动命令和地址', '记住「先拟计划」开关'],
+    ['已完成：AGENTS.md · test:fast · 验证脚本']
+  ].entries()) {
+    const root = buildGraph(scene).nodes.find(n => n.ref === rootRef)!
+    const ops: DrawOp[] = labels.flatMap((label, i): DrawOp[] => [
+      { op: 'add_node', id: 'branch' + i, label },
+      { op: 'add_edge', from: root.id, to: 'branch' + i, label: ['Codex：内核与审批', 'Antigravity：体验', 'Cursor：杂活'][batch] }
+    ])
+    if (batch === 2) ops.push({ op: 'add_text', near: 'branch0', text: '暂缓：跨轮复用 dev server、多 worktree、拆大文件' })
+    append(ops)
+  }
+  assert.equal(routes.length, 6)
+  for (const edge of routes) {
+    const [dx, dy] = edge.points.at(-1)!
+    for (const [x, y] of edge.points.slice(1, -1)) {
+      // 超过一个正常块间距（100px）的横向偏移，会把连线标签带出分支间的空隙。
+      assert.ok(Math.abs(x * dy - y * dx) / Math.hypot(dx, dy) <= 100, '拐点偏离直线超过 100px')
+    }
+    for (const box of scene.filter(b => b.type !== 'arrow' && b.id !== edge.fromElementId && b.id !== edge.toElementId)) {
+      for (let i = 1; i < edge.points.length; i++) {
+        const [ax, ay] = edge.points[i - 1]
+        const [bx, by] = edge.points[i]
+        // 计算线段在两个坐标轴上进入框内的参数区间；区间交集非空即穿框。
+        function interval(start: number, end: number, lo: number, hi: number) {
+          if (start === end) return start > lo && start < hi ? [-Infinity, Infinity] : [Infinity, -Infinity]
+          const t = (lo - start) / (end - start), u = (hi - start) / (end - start)
+          return [Math.min(t, u), Math.max(t, u)]
+        }
+        const tx = interval(ax + edge.x, bx + edge.x, box.x, box.x + box.width)
+        const ty = interval(ay + edge.y, by + edge.y, box.y, box.y + box.height)
+        assert.ok(Math.max(0, tx[0], ty[0]) >= Math.min(1, tx[1], ty[1]), '箭头穿过 ' + box.id)
+      }
+    }
+  }
+})
