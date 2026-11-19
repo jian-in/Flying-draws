@@ -167,6 +167,60 @@ test('CLI doctor 能识别在线的本地画布 daemon 服务', async () => {
   }
 })
 
+test('CLI call：校验参数、列出工具；对在线画布调用工具时转发席位与客户端名，并提示正在用 FLYINGDRAWS_HOME 指定的画布', async () => {
+  const list = runBridge(['call', '--list'])
+  assert.equal(list.status, 0)
+  assert.equal(list.stdout.trim().split(/\r?\n/).length, 10)
+  assert.ok(list.stdout.includes('canvas_wait'))
+  const unknown = runBridge(['call', 'canvas_nope'])
+  assert.equal(unknown.status, 1)
+  assert.match(unknown.stderr, /Unknown tool "canvas_nope"/)
+  const badJson = runBridge(['call', 'canvas_read', '{oops'])
+  assert.equal(badJson.status, 1)
+  assert.match(badJson.stderr, /not valid JSON/)
+
+  const tempHome = mkdtempSync(join(tmpdir(), 'flyingdraws-cli-call-'))
+  const seen: Record<string, unknown>[] = []
+  const server = http.createServer((req, res) => {
+    if (req.headers['x-flyingdraws-token'] !== 'test-token') {
+      res.writeHead(401)
+      res.end('{}')
+      return
+    }
+    if (req.url === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true }))
+      return
+    }
+    const chunks: Buffer[] = []
+    req.on('data', (c: Buffer) => chunks.push(c))
+    req.on('end', () => {
+      seen.push(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'))
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(req.url === '/wait' ? { status: 'waiting', waitingFor: 'user' } : { ok: true }))
+    })
+  })
+  await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+  try {
+    writeFileSync(join(tempHome, 'daemon.json'), JSON.stringify({ port: address.port, token: 'test-token' }), 'utf8')
+    const argsFile = join(tempHome, 'args.json')
+    writeFileSync(argsFile, '\uFEFF{"board":"协作","timeout_s":1}', 'utf8')
+    const res = await runBridgeAsync(['call', 'canvas_wait', `@${argsFile}`, '--as', 'Cursor', '--agent', 'cursor-cli'], { FLYINGDRAWS_HOME: tempHome })
+    assert.equal(res.status, 0, res.stderr)
+    assert.match(res.stdout, /has not sent anything yet/)
+    assert.ok(res.stderr.includes('FLYINGDRAWS_HOME is set'), '设了 FLYINGDRAWS_HOME 时要提示连的是哪个画布')
+    const wait = seen.find((b) => b.board === '协作')
+    assert.ok(wait, '没有收到 /wait 请求')
+    assert.equal(wait.as, 'Cursor')
+    assert.equal(wait.agent, 'cursor-cli')
+  } finally {
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+    rmSync(tempHome, { recursive: true, force: true })
+  }
+})
+
 test('无参数与 --mcp 启动时 stdout 严格只输出合法 MCP JSON-RPC 协议帧（零杂音）', async () => {
   const tempHome = mkdtempSync(join(tmpdir(), 'flyingdraws-mcp-stdio-'))
   try {

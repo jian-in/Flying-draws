@@ -4,10 +4,12 @@
 // - setup / config / doctor / --help / --version：零门槛 CLI 配置向导与本地环境自检
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
@@ -445,6 +447,9 @@ function formatHelp(): string {
     '                                                    Print copy-paste MCP registration command / JSON config',
     '  flying-draws config [client]                      Alias for "setup"',
     '  flying-draws doctor                               Inspect Node, build artifacts, desktop app, daemon & Fuxi status',
+    '  flying-draws call <tool> [json|@file|-] [--as <seat>] [--agent <name>]',
+    '                                                    Call one canvas tool from a shell (for agents without MCP) and print the result',
+    '  flying-draws call --list                          List the canvas tool names',
     '  flying-draws --version, -v                        Print version',
     '  flying-draws --help, -h                           Show this help message',
     '',
@@ -503,6 +508,9 @@ async function runCli(args: readonly string[]): Promise<never> {
     const report = await runDoctor()
     process.stdout.write(`${report}\n`)
     process.exit(0)
+  }
+  if (cmd === 'call') {
+    process.exit(await runCall(args.slice(1)))
   }
   process.stderr.write(`Unknown command "${cmd}". Run with --help for usage.\n`)
   process.exit(1)
@@ -1150,6 +1158,76 @@ server.registerTool(
     return { content: boardContent(res, header) }
   })
 )
+
+// flying-draws call：给没有挂上 MCP、只有终端的 agent 用。在进程内把同一套工具接到一个客户端上，
+// 调一个工具、打印结果后退出；参数校验和工具实现都和 MCP 模式是同一份。
+async function runCall(args: readonly string[]): Promise<number> {
+  const fail = (message: string): number => {
+    process.stderr.write(`${message}\n`)
+    return 1
+  }
+  let agentName = 'cli'
+  const positional: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === '--list') {
+      process.stdout.write(`${MCP_TOOL_NAMES.join('\n')}\n`)
+      return 0
+    }
+    if (arg === '--as' || arg === '--agent') {
+      const value = args[++i]?.trim()
+      if (!value) return fail(`${arg} needs a value`)
+      if (arg === '--as') sessionSeat = value
+      else agentName = value
+      continue
+    }
+    positional.push(arg)
+  }
+  const [tool, raw, extraArg] = positional
+  if (!tool) return fail('Usage: flying-draws call <tool> [json|@file|-] [--as <seat>] [--agent <name>]')
+  if (extraArg !== undefined) return fail(`Unexpected argument "${extraArg}". Pass all tool arguments as one JSON object.`)
+  if (!(MCP_TOOL_NAMES as readonly string[]).includes(tool)) return fail(`Unknown tool "${tool}". Available: ${MCP_TOOL_NAMES.join(', ')}`)
+  let input: Record<string, unknown> = {}
+  if (raw !== undefined) {
+    let source: string
+    try {
+      source = raw === '-' ? readFileSync(0, 'utf8') : raw.startsWith('@') ? readFileSync(raw.slice(1), 'utf8') : raw
+    } catch (err) {
+      return fail(`Cannot read arguments: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(source.replace(/^﻿/, ''))
+    } catch (err) {
+      return fail(`Arguments are not valid JSON: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return fail('Arguments must be a JSON object')
+    input = parsed as Record<string, unknown>
+  }
+  // 设了 FLYINGDRAWS_HOME 会连（或拉起）另一个画布实例，提前说一声，免得在空画板上白等
+  if (OVERRIDE_HOME) process.stderr.write(`Note: FLYINGDRAWS_HOME is set, using the canvas at ${HOME_DIR}\n`)
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+  const client = new Client({ name: agentName, version: PKG_VERSION })
+  try {
+    await server.connect(serverTransport)
+    await client.connect(clientTransport)
+    const result = await client.callTool({ name: tool, arguments: input }, undefined, { timeout: 120_000 })
+    let images = 0
+    for (const item of (result.content ?? []) as Content[]) {
+      if (item.type === 'text') process.stdout.write(`${item.text}\n`)
+      else if (item.type === 'image') {
+        const file = join(tmpdir(), `flying-draws-${Date.now()}-${++images}.png`)
+        writeFileSync(file, Buffer.from(item.data, 'base64'))
+        process.stdout.write(`[image saved] ${file}\n`)
+      }
+    }
+    return result.isError ? 1 : 0
+  } catch (err) {
+    return fail(`Flying draws error: ${err instanceof Error ? err.message : String(err)}`)
+  } finally {
+    await client.close().catch(() => undefined)
+  }
+}
 
 async function main(): Promise<void> {
   let left = false

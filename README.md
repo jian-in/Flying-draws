@@ -133,6 +133,16 @@ claude mcp add --scope user flying-draws -- node "/你的路径/out/bridge/index
 
 不用先手动打开画布，Agent 第一次调用 `canvas_open` 或 `canvas_read` 时会自动把窗口拉起来。接不上时运行 `node out/bridge/index.js doctor` 自检，它会检查 Node 版本、构建产物、桌面端位置、本地服务和内核。
 
+有些客户端的会话挂不上 MCP（比如嵌在别的应用里的聊天会话），但能跑终端命令。这时可以用 `call` 直接调用画布工具，参数是一个 JSON 对象，也可以写在文件里用 `@文件名` 传，`--as` 指定席位：
+
+```bash
+node out/bridge/index.js call canvas_wait '{"board":"default","timeout_s":40}' --as 后端
+node out/bridge/index.js call canvas_draw @ops.json --as 后端
+node out/bridge/index.js call --list
+```
+
+它和 MCP 模式用的是同一套工具，结果打印到终端，截图存成临时文件并打印路径。设了 `FLYINGDRAWS_HOME` 时会先提示连的是哪个数据目录，免得连到另一个画布实例上。
+
 想试试示例画板，把 `examples/architecture-sketch.excalidraw` 复制成 `~/.flyingdraws/boards/arch.excalidraw`，然后对 Agent 说：「用 canvas_read 看看 arch 画板上我圈的地方，再用 canvas_propose 把双 Token 刷新流程补上。」
 
 ## 数据存在哪，会发到哪
@@ -167,7 +177,7 @@ claude mcp add --scope user flying-draws -- node "/你的路径/out/bridge/index
 | `npm run fetch:fuxi` | 下载并校验预编译的 Fuxi 内核 |
 
 ```text
-src/bridge/     MCP 桥接和命令行（setup、doctor）
+src/bridge/     MCP 桥接和命令行（setup、doctor、call）
 src/main/       主进程：画板、本机服务、画布语义、提议比对、内置 Agent、改动快照、窗口吸附
 src/preload/    暴露给页面的接口
 src/renderer/   画布界面和内置 Agent 面板
