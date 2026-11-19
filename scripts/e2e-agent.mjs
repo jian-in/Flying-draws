@@ -42,7 +42,7 @@ const provider = createServer(async (req, res) => {
       send({ tool_calls: [{ index: 0, id: `call-${stage}`, type: 'function', function: { name: tool.function.name, arguments: JSON.stringify(args) } }] })
       send({}, 'tool_calls')
     } else {
-      send({ content: stage === 'plan' ? '计划：读取画布结构；在空位新增结果节点；说明完成情况，等待确认执行。' : '已完成：画布读写和内置内核已连接，结果已回到当前画板。' })
+      send({ content: stage === 'plan' ? '计划：读取画布结构；在空位新增结果节点；说明完成情况，等待确认执行。' : '## 工作区核对\n\n| 动作 | 结果 |\n|---|---|\n| `canvas_read` | **已完成** |\n\n[参考](https://example.org/) · [x](javascript:alert(1)) · <img src=x onerror=alert(1)>' })
       send({}, 'stop')
     }
     res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 100, completion_tokens: 30, total_tokens: 130 } })}\n\n`)
@@ -186,6 +186,11 @@ try {
   const first = await finished()
   assert.ok(['completed', 'unverified'].includes(first.status), first.error || first.status)
   assert.ok(requests.some(request => request.stage === 'draw' && request.images > 0), '首轮截图没有传入模型')
+  await until(() => js(`[...document.querySelectorAll('.fd-agent-reply')].some(el =>
+    el.querySelector('h2')?.textContent === '工作区核对' && el.querySelector('table td code')?.textContent === 'canvas_read'
+    && el.querySelector('td strong')?.textContent === '已完成' && !el.textContent.includes('|---|')
+    && el.querySelectorAll('a').length === 1 && el.querySelector('a[href="https://example.org/"][target="_blank"][rel="noopener noreferrer"]')
+    && !el.querySelector('img') && el.textContent.includes('[x](javascript:alert(1))'))`), '回复显示 Markdown 标题和表格')
   const board = await client.callTool({ name: 'canvas_read', arguments: { image: 'never' } })
   assert.match(JSON.stringify(board), /内核接入已通/)
   const session = (await activeItem()).sessionId

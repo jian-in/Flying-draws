@@ -66,12 +66,33 @@ body,
 .fd-agent-run-failed { color: var(--fd-danger); }
 .fd-agent-run-completed { color: var(--fd-ok); }
 .fd-agent-goal { border-left: 2px solid var(--fd-text); padding-left: 10px; margin: 0 0 17px; font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
-.fd-agent-reply { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; margin: 12px 0; font-size: 12px; }
+.fd-agent-reply { margin: 12px 0; }
 .fd-agent-draft { color: var(--fd-muted); }
 .fd-agent-caret { display: inline-block; height: 12px; width: 2px; background: currentColor; margin-left: 3px; }
 .fd-agent-plan { margin-top: 15px; padding: 12px; border: 1px solid var(--fd-border); border-radius: 3px; background: var(--fd-surface); }
 .fd-agent-plan > strong { display: block; font-size: 11px; margin-bottom: 7px; }
-.fd-agent-plan > div { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.fd-markdown { min-width: 0; max-width: 100%; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.fd-markdown :is(p, ul, ol, blockquote, pre, hr, .fd-md-table) { margin: .55em 0; }
+.fd-markdown p { white-space: pre-line; }
+.fd-markdown :is(h1, h2, h3, h4, h5, h6) { margin: 1em 0 .35em; line-height: 1.35; color: var(--fd-ink); }
+.fd-markdown h1 { font-size: 17px; }
+.fd-markdown h2 { font-size: 15px; }
+.fd-markdown h3 { font-size: 14px; }
+.fd-markdown :is(h4, h5, h6) { font-size: 12px; }
+.fd-markdown :is(ul, ol) { padding-inline-start: 1.7em; }
+.fd-markdown li > :is(p, ul, ol) { margin-block: .15em; }
+.fd-markdown blockquote { margin-inline: 0; padding-inline-start: .8em; border-inline-start: 2px solid var(--fd-muted); color: var(--fd-muted); }
+.fd-markdown code { font: .94em/1.5 Consolas, monospace; background: var(--fd-surface-hover); border-radius: 3px; padding: .05em .25em; }
+.fd-markdown pre { overflow-x: auto; padding: 8px 10px; background: var(--fd-surface); border: 1px solid var(--fd-border); border-radius: 3px; }
+.fd-markdown pre code { padding: 0; background: transparent; white-space: pre; }
+.fd-markdown a { color: var(--fd-agent); text-underline-offset: 2px; }
+.fd-markdown hr { border: 0; border-top: 1px solid var(--fd-border); }
+.fd-md-table { max-width: 100%; overflow-x: auto; }
+.fd-md-table table { border-collapse: collapse; width: 100%; }
+.fd-md-table :is(th, td) { min-width: 5em; padding: 4px 7px; border: 1px solid var(--fd-ink); vertical-align: top; }
+.fd-md-table th { background: var(--fd-surface-hover); }
+.fd-markdown > :first-child { margin-top: 0; }
+.fd-markdown > :last-child { margin-bottom: 0; }
 .fd-agent-result-image { margin: 14px 0 0; border: 1px solid var(--fd-border); border-radius: 3px; overflow: hidden; }
 .fd-agent-result-image img { display: block; width: 100%; max-height: 220px; object-fit: contain; background: #fff; cursor: zoom-in; }
 .fd-agent-result-image figcaption { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 6px 8px; font-size: 10px; color: var(--fd-muted); }

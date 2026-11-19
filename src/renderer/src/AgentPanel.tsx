@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { AgentMarkdown } from './AgentMarkdown'
 import { shouldAutoPlaceResultImage } from '../../main/lineage'
 import { pickCompareImage, toolDisplayName, traceImageGoal, type AgentCapture, type AgentResultImage, type AgentRun, type AgentState, type ImageRegionAnnotation, type ProviderDraft, type RoundFileChange } from '../../shared/agent'
 
@@ -429,9 +430,9 @@ export function AgentPanel({
               <p className="fd-agent-goal">{run.goal}</p>
               <Thinking run={run} />
               {/* A plan's text is the model's reply; show it once, inside the plan box. */}
-              {run.reply && !run.plan ? <div className="fd-agent-reply">{run.reply}</div> : null}
-              {run.draft ? <div className="fd-agent-reply fd-agent-draft">{run.draft}<span className="fd-agent-caret" /></div> : null}
-              {run.plan ? <div className="fd-agent-plan"><strong>{run.status === 'planned' ? '待确认的计划' : '本轮计划'}</strong><div>{run.reply || planBody(run.plan)}</div></div> : null}
+              {run.reply && !run.plan ? <div className="fd-agent-reply"><AgentMarkdown text={run.reply} /></div> : null}
+              {run.draft ? <div className="fd-agent-reply fd-agent-draft"><AgentMarkdown text={run.draft} draft /></div> : null}
+              {run.plan ? <div className="fd-agent-plan"><strong>{run.status === 'planned' ? '待确认的计划' : '本轮计划'}</strong><AgentMarkdown text={run.reply || planBody(run.plan)} /></div> : null}
               {run.tools.length ? <details className="fd-agent-tools"><summary>工具记录 · {run.tools.length} 项{run.tools.some(t => t.status === 'running') && run.status === 'running' ? ' · 正在执行' : ''}</summary>
                 {run.tools.map((tool, index) => <details key={`${tool.id}/${index}`}><summary><span>{tool.status === 'completed' ? '✓' : tool.status === 'failed' ? '×' : '·'}</span> {toolDisplayName(tool.name, state.toolLabels)}{tool.autoApproved ? <span className="fd-agent-small" title="按规则自动放行，没有弹窗确认"> · 自动放行（{AUTO_APPROVED[tool.autoApproved] ?? tool.autoApproved}）</span> : null}</summary><pre>{tool.input}{tool.result ? `\n\n${tool.result}` : ''}</pre></details>)}
               </details> : null}
