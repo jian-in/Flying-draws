@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { shouldAutoPlaceResultImage } from '../../main/lineage'
-import { pickCompareImage, toolDisplayName, traceImageGoal, type AgentCapture, type AgentResultImage, type AgentRun, type AgentState, type ImageRegionAnnotation, type ProviderDraft } from '../../shared/agent'
+import { pickCompareImage, toolDisplayName, traceImageGoal, type AgentCapture, type AgentResultImage, type AgentRun, type AgentState, type ImageRegionAnnotation, type ProviderDraft, type RoundFileChange } from '../../shared/agent'
 
 const LABEL: Record<AgentRun['status'], string> = {
   running: '进行中', planned: '等你确认计划', completed: '已完成', unverified: '结果待核验',
@@ -383,6 +383,7 @@ export function AgentPanel({
               {run.tools.length ? <details className="fd-agent-tools"><summary>工具记录 · {run.tools.length} 项{run.tools.some(t => t.status === 'running') && run.status === 'running' ? ' · 正在执行' : ''}</summary>
                 {run.tools.map((tool, index) => <details key={`${tool.id}/${index}`}><summary><span>{tool.status === 'completed' ? '✓' : tool.status === 'failed' ? '×' : '·'}</span> {toolDisplayName(tool.name, state.toolLabels)}{tool.autoApproved ? <span className="fd-agent-small" title="按规则自动放行，没有弹窗确认"> · 自动放行（{AUTO_APPROVED[tool.autoApproved] ?? tool.autoApproved}）</span> : null}</summary><pre>{tool.input}{tool.result ? `\n\n${tool.result}` : ''}</pre></details>)}
               </details> : null}
+              <RoundChangesView run={run} />
               {run.images?.map(image => <ResultImage key={image.id} image={image} placed={Boolean(placedImageIds?.has(image.id))} disabled={working || state.busy || active?.board !== board} onPreview={(src, alt) => setPreviewSrc({ src, alt })} onInsert={dataURL => act(() => insertImage(image, dataURL, { annotations: run.annotations }))} />)}
               {run.verificationWarning ? <p className="fd-agent-small fd-agent-warning">{run.verificationWarning}</p> : null}
               {run.status === 'unverified' && !run.verificationWarning ? <p className="fd-agent-small">本轮已结束，仍有结果未经独立检查，请结合产物确认。</p> : null}
@@ -480,6 +481,48 @@ function Thinking({ run }: { run: AgentRun }) {
   return <details className="fd-agent-thinking">
     <summary>{live ? <><span className="fd-agent-thinking-dot" />思考中…</> : '思考过程'}<span className="fd-agent-small">{text.length.toLocaleString()} 字</span></summary>
     <pre>{text}</pre>
+  </details>
+}
+
+const CHANGE_MARK: Record<RoundFileChange['status'], string> = { added: '新增', modified: '修改', deleted: '删除' }
+
+const lineCount = (file: Pick<RoundFileChange, 'additions' | 'deletions'>): string =>
+  file.additions === null || file.deletions === null ? '二进制' : `+${file.additions} −${file.deletions}`
+
+/** 本轮改动：和本轮开始前的工作区快照比，不含开始前就有的未提交改动。点文件看差异。 */
+function RoundChangesView({ run }: { run: AgentRun }) {
+  const changes = run.roundChanges
+  if (!changes) {
+    // 没有快照时只在确实改了文件的轮次说明一句，免得每轮都提示
+    return run.roundChangesNote && run.status !== 'running' && run.changedFiles?.length ? <p className="fd-agent-small">{run.roundChangesNote}</p> : null
+  }
+  return <details className="fd-agent-tools fd-agent-changes">
+    <summary>本轮改动 · {changes.total ? `${changes.total} 个文件 · +${changes.additions} −${changes.deletions}` : '没有改动文件'}</summary>
+    {changes.preexisting ? <p className="fd-agent-small">开始前工作区已有 {changes.preexisting} 个文件没提交的改动，没算在本轮里。</p> : null}
+    {changes.mode === 'plain' ? <p className="fd-agent-small">工作目录不是 git 仓库，按普通文件夹比对；依赖、构建产物、虚拟环境等目录不计入。</p> : null}
+    {changes.skippedLarge ? <p className="fd-agent-small">有 {changes.skippedLarge} 个超过 50 MB 的未跟踪文件没进快照，它们的变化这里看不到。</p> : null}
+    {changes.pruned ? <p className="fd-agent-small">这一轮的差异已按保留策略清理（每个项目保留最近 50 轮），只剩文件列表。</p> : null}
+    {changes.files.map(file => changes.pruned
+      ? <p key={file.path} className="fd-agent-change-row"><span className={`fd-agent-change-${file.status}`}>{CHANGE_MARK[file.status]}</span> {file.path} <span className="fd-agent-small">{lineCount(file)}</span></p>
+      : <FileDiff key={file.path} runId={run.id} file={file} />)}
+    {changes.total > changes.files.length ? <p className="fd-agent-small">还有 {changes.total - changes.files.length} 个文件没列出。</p> : null}
+  </details>
+}
+
+function FileDiff({ runId, file }: { runId: string; file: RoundFileChange }) {
+  const [patch, setPatch] = useState<string | null>(null)
+  return <details onToggle={event => {
+    if (!(event.currentTarget as HTMLDetailsElement).open || patch !== null) return
+    setPatch('读取中…')
+    void window.flyingdraws.agent.roundDiff(runId, file.path).then(
+      text => setPatch(text || '（没有文本差异）'),
+      error => setPatch(`差异读取失败：${error instanceof Error ? error.message : String(error)}`)
+    )
+  }}>
+    <summary><span className={`fd-agent-change-${file.status}`}>{CHANGE_MARK[file.status]}</span> {file.path} <span className="fd-agent-small">{lineCount(file)}</span></summary>
+    {patch === null ? null : <pre className="fd-agent-diff">{patch.split('\n').map((line, index) => <span key={index} className={
+      line.startsWith('+') && !line.startsWith('+++') ? 'fd-diff-add' : line.startsWith('-') && !line.startsWith('---') ? 'fd-diff-del' : line.startsWith('@@') ? 'fd-diff-hunk' : undefined
+    }>{line}{'\n'}</span>)}</pre>}
   </details>
 }
 

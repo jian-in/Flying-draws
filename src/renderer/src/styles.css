@@ -100,6 +100,21 @@ body,
 .fd-agent-review textarea { width: 100%; box-sizing: border-box; margin-top: 8px; font: inherit; font-size: 12px; resize: vertical; }
 .fd-agent-review > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 9px; }
 .fd-agent-warning { color: #c2410c; }
+.fd-agent-changes { margin-top: 9px; }
+.fd-agent-changes > p { margin: 5px 0 0 10px; }
+.fd-agent-changes summary { overflow-wrap: anywhere; }
+.fd-agent-changes details > summary > span:first-child { margin-right: 4px; }
+.fd-agent-changes details > summary > .fd-agent-small { margin-left: 6px; }
+.fd-agent-changes > p.fd-agent-change-row { margin: 5px 0 0 10px; overflow-wrap: anywhere; }
+.fd-agent-change-row > span:first-child { margin-right: 4px; }
+.fd-agent-change-row > .fd-agent-small { margin-left: 6px; }
+.fd-agent-change-added { color: var(--fd-ok); }
+.fd-agent-change-modified { color: #c2410c; }
+.fd-agent-change-deleted { color: var(--fd-danger); }
+.fd-agent-tools pre.fd-agent-diff { max-height: 320px; font-family: ui-monospace, Consolas, monospace; line-height: 1.45; }
+.fd-diff-add { color: var(--fd-ok); }
+.fd-diff-del { color: var(--fd-danger); }
+.fd-diff-hunk { color: var(--fd-muted); }
 .fd-agent-yolo { font-weight: 700; letter-spacing: 0.04em; }
 .fd-agent-yolo-on { color: #fff; background: #e03131; border-color: #e03131; }
 .fd-agent-yolo-confirm { border-left-color: #e03131; }

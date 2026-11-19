@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('flyingdraws', {
     approve: (requestId: string, approved: boolean) => ipcRenderer.invoke('agent:approve', requestId, approved),
     review: (runId: string, verdict: 'approved' | 'rejected', note?: string) => ipcRenderer.invoke('agent:review', runId, verdict, note),
     image: (id: string) => ipcRenderer.invoke('agent:image', id),
+    roundDiff: (runId: string, path?: string) => ipcRenderer.invoke('agent:round-diff', runId, path),
     onState: (fn: (state: unknown) => void) => {
       const listener = (_event: Electron.IpcRendererEvent, state: unknown) => fn(state)
       ipcRenderer.on('agent:state', listener)

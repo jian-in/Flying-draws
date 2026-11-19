@@ -7,6 +7,43 @@ import { AgentClient, type HostEvent } from './agentClient.ts'
 import { atomicWriteBytes, atomicWriteJson } from './atomicWrite.ts'
 import { parseImageBytesSize } from './imageSize.ts'
 import { extractChangedFiles, shouldAutoPlaceResultImage } from './lineage.ts'
+import { captureRoundBaseline, collectRoundChanges, pruneRoundSnapshots, roundPatch, type LiveSnapshots } from './roundBaseline.ts'
+
+/** 每个仓库保留最近多少轮的可查看差异；更早的只留文件列表 */
+export const KEEP_ROUND_DIFFS = 50
+/** 回收快照库的最短间隔（启动后会先回收一次） */
+const PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+/**
+ * 回收快照前的保留名单：每个仓库最近 keep 轮的前后两棵树，加上正在进行的轮次的起点。
+ * 更早的轮次返回在 expired 里，调用方把它们标成已清理。
+ */
+export function planSnapshotRetention(runs: readonly AgentRun[], keep = KEEP_ROUND_DIFFS): { live: LiveSnapshots[]; expired: AgentRun[] } {
+  const byRoot = new Map<string, AgentRun[]>()
+  const live = new Map<string, { mode: SnapshotMode; trees: Set<string> }>()
+  const add = (root: string, mode: SnapshotMode, ...trees: string[]) => {
+    const slot = live.get(root) ?? { mode, trees: new Set<string>() }
+    for (const tree of trees) slot.trees.add(tree)
+    live.set(root, slot)
+  }
+  for (const run of runs) {
+    if (run.roundChanges && !run.roundChanges.pruned) {
+      const list = byRoot.get(run.roundChanges.root) ?? []
+      list.push(run)
+      byRoot.set(run.roundChanges.root, list)
+    } else if (run.baseline && !run.roundChanges && (run.status === 'running' || run.status === 'planned')) {
+      add(run.baseline.root, run.baseline.mode ?? 'git', run.baseline.tree)
+    }
+  }
+  const expired: AgentRun[] = []
+  for (const [root, list] of byRoot) {
+    const time = (run: AgentRun) => Date.parse(run.endedAt ?? run.startedAt) || 0
+    list.sort((a, b) => time(b) - time(a))
+    for (const run of list.slice(0, keep)) add(root, run.roundChanges!.mode ?? 'git', run.roundChanges!.before, run.roundChanges!.after)
+    expired.push(...list.slice(keep))
+  }
+  return { live: [...live].map(([root, slot]) => ({ root, mode: slot.mode, trees: [...slot.trees] })), expired }
+}
 import { buildGraph, summarize, type SceneElement, type SceneFile, type SemanticGraph } from './semantic.ts'
 import {
   AGENT_SEAT,
@@ -21,7 +58,8 @@ import {
   type ApprovalMode,
   type ImageRegionAnnotation,
   type ImageSourceMeta,
-  type ProviderDraft
+  type ProviderDraft,
+  type SnapshotMode
 } from '../shared/agent.ts'
 
 export { extractChangedFiles, shouldAutoPlaceResultImage }
@@ -171,6 +209,11 @@ export class AgentService extends EventEmitter {
   private readonly records: string
   private recordsWritable = true
   private imageWrites = new Set<Promise<void>>()
+  /** 正在算本轮差异的任务；收尾事件等它算完再处理 */
+  private roundDiffs = new Set<Promise<void>>()
+  private readonly baselines: string
+  private lastPrune = 0
+  private pruning: Promise<void> | null = null
   private autoApproved = new Map<string, string>()
   private preparingBoard: string | null = null
   private changingBoards = new Set<string>()
@@ -181,6 +224,7 @@ export class AgentService extends EventEmitter {
     this.options = options
     this.root = join(options.home, 'agent')
     this.records = join(this.root, 'work-items.json')
+    this.baselines = join(this.root, 'baselines')
     // 审批模式是用户在 Flying draws 里的选择，存在宿主自己的设置里；内核配置文件不能开启 YOLO。
     // YOLO 只在本次运行内有效：每次启动都回到按风险询问，设置文件里留下的 full-access 不采纳，
     // 免得用户忘了开过、或者别的程序改了这个文件，就让 Agent 无审批执行。
@@ -224,6 +268,33 @@ export class AgentService extends EventEmitter {
       } else this.recordsWritable = false
       if (!this.recordsWritable) this.state.recordsWarning = `未加载任务历史：${error instanceof Error ? error.message : '读取失败'}。原文件已保留，修复记录前不会开始新任务。`
     }
+    // 启动后稍等一会儿在后台回收一次快照库，不挡启动
+    setTimeout(() => this.maybePruneSnapshots(true), 30_000).unref?.()
+  }
+  /** 按保留策略回收快照库。任务记录读不了时不回收：不知道哪些轮次还要差异。 */
+  maybePruneSnapshots(force = false): Promise<void> {
+    if (this.pruning) return this.pruning
+    if (this.closing || !this.recordsWritable || this.preparingBoard) return Promise.resolve()
+    if (!force && Date.now() - this.lastPrune < PRUNE_INTERVAL_MS) return Promise.resolve()
+    this.lastPrune = Date.now()
+    this.pruning = this.pruneSnapshots()
+      .catch(() => { /* 回收失败不影响任务，下次再试 */ })
+      .finally(() => { this.pruning = null })
+    return this.pruning
+  }
+  private async pruneSnapshots(): Promise<void> {
+    const runs = this.state.items.flatMap(item => item.runs)
+    const { live, expired } = planSnapshotRetention(runs)
+    for (const run of expired) run.roundChanges!.pruned = true
+    if (expired.length) await this.persist() // 先落盘「已清理」，再删对象，免得记录指向已删的快照
+    const result = await pruneRoundSnapshots(this.baselines, live)
+    if (result.broken.length) {
+      const broken = new Set(result.broken)
+      for (const run of runs) {
+        if (run.roundChanges && !run.roundChanges.pruned && (broken.has(run.roundChanges.before) || broken.has(run.roundChanges.after))) run.roundChanges.pruned = true
+      }
+    }
+    if (expired.length || result.broken.length) this.changed()
   }
   snapshot(): AgentState { return structuredClone(this.state) }
   private item(): AgentWorkItem | undefined { return this.state.items.find(item => item.id === this.state.activeItemId && !item.archived) }
@@ -445,6 +516,7 @@ export class AgentService extends EventEmitter {
     if (sourceImageRef) run.sourceImageRef = sourceImageRef
     const images = this.state.vision && input.capture.pngBase64 ? [{ media_type: 'image/png', data: input.capture.pngBase64 }] : []
     try {
+      if (mode !== 'plan') await this.beginBaseline(run, item.cwd)
       await this.persist()
       await this.host().request(resume ? 'run.resume' : 'run.start', {
         run_id: run.id, text, images, ...(resume ? { task_id: previous!.taskId } : { mode: input.mode })
@@ -492,6 +564,43 @@ export class AgentService extends EventEmitter {
     this.changed()
     return run
   }
+  /** 本轮开始前给工作区拍快照；拍不成不拦任务，只记下原因，改动退回按工具记录统计。 */
+  private async beginBaseline(run: AgentRun, cwd: string): Promise<void> {
+    try {
+      const baseline = await captureRoundBaseline(cwd, this.baselines)
+      if (baseline) run.baseline = baseline
+      else run.roundChangesNote = '工作目录不存在，本轮改动只按工具记录统计。'
+    } catch (error) {
+      run.roundChangesNote = `没能记下本轮开始前的快照（${error instanceof Error ? error.message : '未知错误'}），本轮改动只按工具记录统计。`
+    }
+  }
+  /** 本轮结束时和开始前的快照比，得到只属于这一轮的改动，并用它校正改动文件摘要。 */
+  private async finishBaseline(run: AgentRun): Promise<void> {
+    if (!run.baseline || run.roundChanges) return
+    try {
+      const changes = await collectRoundChanges(run.baseline, this.baselines)
+      run.roundChanges = changes
+      run.roundChangesNote = undefined
+      const names: string[] = []
+      for (const file of changes.files) {
+        const name = file.path.slice(file.path.lastIndexOf('/') + 1)
+        if (name && !names.includes(name)) names.push(name)
+        if (names.length >= 4) break
+      }
+      run.changedFiles = names.length ? names : undefined
+      setTimeout(() => void this.maybePruneSnapshots(), 5_000).unref?.()
+    } catch (error) {
+      run.roundChangesNote = `没能算出本轮差异（${error instanceof Error ? error.message : '未知错误'}），本轮改动只按工具记录统计。`
+    }
+  }
+  async roundDiff(runId: string, path?: string): Promise<string> {
+    const run = this.state.items.flatMap(item => item.runs).find(run => run.id === runId)
+    const changes = run?.roundChanges
+    if (!changes) throw new Error('这一轮没有记录改动快照')
+    if (changes.pruned) throw new Error(`这一轮的差异已按保留策略清理（每个项目保留最近 ${KEEP_ROUND_DIFFS} 轮），只剩文件列表`)
+    if (path !== undefined && !changes.files.some(file => file.path === path)) throw new Error('这个文件不在本轮改动里')
+    return roundPatch(changes, this.baselines, path)
+  }
   private failed(run: AgentRun, error: unknown): void {
     run.status = 'failed'
     run.error = error instanceof Error ? error.message : '内核请求失败'
@@ -511,6 +620,7 @@ export class AgentService extends EventEmitter {
     if (previous.sourceImageRef) run.sourceImageRef = previous.sourceImageRef
     if (previous.annotations?.length) run.annotations = previous.annotations
     try {
+      await this.beginBaseline(run, item.cwd)
       await this.persist()
       await this.host().request('run.execute_plan', { run_id: run.id, text })
     } catch (error) { this.failed(run, error); throw error }
@@ -620,8 +730,17 @@ export class AgentService extends EventEmitter {
   private deferredEvents: Promise<void> | null = null
   private onEvent(event: HostEvent): void {
     const finishing = event.event === 'run_finished' || event.event === 'done'
-    if (this.deferredEvents || (finishing && this.imageWrites.size)) {
-      const writes = finishing ? [...this.imageWrites] : []
+    if (event.event === 'run_finished') {
+      // 本轮差异要在定收尾状态之前算好：resolveVisualStatus 和改动摘要都用它
+      const run = event.run_id ? this.state.items.flatMap(item => item.runs).find(run => run.id === event.run_id) : undefined
+      if (run?.baseline && !run.roundChanges) {
+        const diff = this.finishBaseline(run).catch(error => this.report(error))
+        this.roundDiffs.add(diff)
+        void diff.finally(() => this.roundDiffs.delete(diff))
+      }
+    }
+    if (this.deferredEvents || (finishing && (this.imageWrites.size || this.roundDiffs.size))) {
+      const writes = finishing ? [...this.imageWrites, ...this.roundDiffs] : []
       const next = (this.deferredEvents ?? Promise.resolve())
         .then(() => Promise.allSettled(writes))
         .then(() => this.handleEvent(event))
@@ -731,7 +850,7 @@ export class AgentService extends EventEmitter {
     this.persistTimer = null
     this.emitTimer = null
     await this.client?.stop()
-    await Promise.allSettled(this.imageWrites)
+    await Promise.allSettled([...this.imageWrites, ...(this.pruning ? [this.pruning] : [])])
     await this.persist()
   }
 }

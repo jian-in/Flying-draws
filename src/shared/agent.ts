@@ -100,6 +100,51 @@ export interface AgentRun {
   verificationWarning?: string
   /** 用户看过对照图后的结论 */
   review?: AgentRunReview
+  /** 本轮开始前工作区的快照（git 仓库或普通文件夹；拍不成就没有） */
+  baseline?: RoundBaseline
+  /** 本轮结束时和开始前快照的差异：只算这一轮的改动，不含开始前就有的未提交改动 */
+  roundChanges?: RoundChanges
+  /** 没能按快照统计本轮改动的原因（不是 git 仓库、快照失败等） */
+  roundChangesNote?: string
+}
+/** git：工作目录在 git 仓库里；plain：普通文件夹，快照库自己当 git 目录来拍 */
+export type SnapshotMode = 'git' | 'plain'
+export interface RoundBaseline {
+  /** 仓库根目录（plain 模式是工作目录本身） */
+  root: string
+  /** 不写就是 git */
+  mode?: SnapshotMode
+  /** 开始前工作区（含未跟踪、不含被忽略文件）写成的树 */
+  tree: string
+  /** 开始前相对 HEAD 已有改动的文件数，这些不算在本轮里（plain 模式总是 0） */
+  preexisting: number
+  /** 超过 50 MB、没进快照的未跟踪文件数 */
+  skippedLarge?: number
+  capturedAt: string
+}
+export interface RoundFileChange {
+  /** 相对仓库根目录的路径，正斜杠 */
+  path: string
+  status: 'added' | 'modified' | 'deleted'
+  /** 二进制文件没有行数 */
+  additions: number | null
+  deletions: number | null
+}
+export interface RoundChanges {
+  root: string
+  mode?: SnapshotMode
+  before: string
+  after: string
+  /** 最多列 200 个，total 是实际总数 */
+  files: RoundFileChange[]
+  total: number
+  additions: number
+  deletions: number
+  preexisting: number
+  /** 超过 50 MB、没进快照的未跟踪文件数（这些文件的变化看不到） */
+  skippedLarge?: number
+  /** 按保留策略清理了快照，只剩文件列表，看不了差异 */
+  pruned?: boolean
 }
 export interface AgentWorkItem {
   id: string
@@ -156,6 +201,8 @@ export interface AgentApi {
   approve(requestId: string, approved: boolean): Promise<void>
   review(runId: string, verdict: AgentRunReview['verdict'], note?: string): Promise<void>
   image(id: string): Promise<string>
+  /** 本轮某个文件（不给就是全部）的差异文本 */
+  roundDiff(runId: string, path?: string): Promise<string>
   onState(fn: (state: AgentState) => void): () => void
 }
 

@@ -71,5 +71,9 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
   ipc.handle('agent:approve', (_event, requestId: string, approved: boolean) => service.approve(requestId, approved))
   ipc.handle('agent:review', (_event, runId: string, verdict: 'approved' | 'rejected', note?: string) => service.review(runId, verdict, note))
   ipc.handle('agent:image', (_event, id: string) => service.image(id))
+  ipc.handle('agent:round-diff', (_event, runId: string, path?: string) => {
+    if (typeof runId !== 'string' || (path !== undefined && typeof path !== 'string')) throw new Error('参数无效')
+    return service.roundDiff(runId, path)
+  })
   return service
 }
