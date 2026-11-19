@@ -9,6 +9,7 @@ import {
   LINEAGE_GAP_X,
   LINEAGE_ROW_GAP_Y,
   extractChangedFiles,
+  formatLineageEdgeLabel,
   planImageLineage,
   shouldAutoPlaceResultImage,
   type LineageCanvasElement
@@ -367,3 +368,11 @@ test('resolveSourceImageRef 优先提取批注关联图片，无批注时回退�
   assert.equal(resolveSourceImageRef(unannotatedGraph, [], ['shape_other']), undefined)
 })
 
+
+test('演进链连线写的是任务里的第几轮，和面板一致，不随版本号多算一轮', () => {
+  // 第 1 轮改出来的图是 v2（v1 是用户放的原图），连线仍写「第 1 轮」
+  assert.equal(formatLineageEdgeLabel({ naturalWidth: 1280, naturalHeight: 720, round: 1, changedFiles: ['HUDOverlay.ts'] }, 2), '第 1 轮 · HUDOverlay.ts')
+  assert.equal(formatLineageEdgeLabel({ naturalWidth: 1280, naturalHeight: 720, round: 3 }, 4), '第 3 轮结果')
+  // 没记录轮次的图才退回用版本号
+  assert.equal(formatLineageEdgeLabel({ naturalWidth: 1280, naturalHeight: 720 }, 2), '第 2 轮结果')
+})

@@ -11,7 +11,8 @@ const LABEL: Record<AgentRun['status'], string> = {
 const AUTO_APPROVED: Record<string, string> = {
   readonly_shell: '只读命令',
   task_preview: '本轮服务预览',
-  task_job_cancel: '关闭本轮服务'
+  task_job_cancel: '关闭本轮服务',
+  task_rule: '本任务内已允许'
 }
 const EMPTY: AgentState = {
   connection: 'offline', error: null, busy: false, setupNeeded: true, vision: false,
@@ -417,8 +418,16 @@ export function AgentPanel({
           {currentApproval ? <div className="fd-agent-approval" key={currentApproval.requestId} role="group" aria-label="工具审批">
             <strong><span>允许这项操作？</span>{approvals.length > 1 ? <span className="fd-agent-small">1 / {approvals.length}</span> : null}</strong>
             <span>{toolDisplayName(currentApproval.name, state.toolLabels)}</span><pre>{currentApproval.description}</pre>
-            <div><button disabled={working} onClick={() => void act(() => api.approve(currentApproval.requestId, false))}>拒绝</button><button className="fd-agent-primary" disabled={working} onClick={() => void act(() => api.approve(currentApproval.requestId, true))}>本次允许</button></div>
+            <div>
+              <button disabled={working} onClick={() => void act(() => api.approve(currentApproval.requestId, false))}>拒绝</button>
+              {currentApproval.preview ? <button disabled={working} title="之后这个任务里参数一字不差的同一调用直接执行，不再询问；可在任务里清空" onClick={() => void act(() => api.approve(currentApproval.requestId, true, true))}>本任务内都允许</button> : null}
+              <button className="fd-agent-primary" disabled={working} onClick={() => void act(() => api.approve(currentApproval.requestId, true))}>本次允许</button>
+            </div>
           </div> : null}
+          {active?.allowedCommands?.length && !currentApproval ? <p className="fd-agent-small fd-agent-allowed">
+            本任务内已允许 {active.allowedCommands.length} 条调用不再询问
+            <button className="fd-agent-link" disabled={working} title={active.allowedCommands.map(rule => `${toolDisplayName(rule.name, state.toolLabels)}：${rule.input}`).join('\n')} onClick={() => void act(() => api.clearAllowedCommands())}>清空</button>
+          </p> : null}
           {alertError ? <div className="fd-agent-error fd-agent-alert" role="alert">{alertError}</div> : null}
           <div className="fd-agent-composer">
             {state.connection !== 'ready' ? <button className="fd-agent-primary" disabled={state.connection === 'starting' || working} onClick={() => void act(() => api.connect(board))}>{state.connection === 'starting' ? '连接中…' : '重新连接内核'}</button> : <>

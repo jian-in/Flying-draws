@@ -100,6 +100,9 @@ body,
 .fd-agent-review textarea { width: 100%; box-sizing: border-box; margin-top: 8px; font: inherit; font-size: 12px; resize: vertical; }
 .fd-agent-review > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 9px; }
 .fd-agent-warning { color: #c2410c; }
+.fd-agent-allowed { flex: none; display: flex; align-items: center; gap: 8px; margin: 6px 14px 0; }
+.fd-agent .fd-agent-link { border: none; background: none; padding: 0; color: var(--fd-muted); font-size: 11px; text-decoration: underline; cursor: pointer; }
+.fd-agent .fd-agent-link:disabled { cursor: default; opacity: 0.6; }
 .fd-agent-changes { margin-top: 9px; }
 .fd-agent-changes > p { margin: 5px 0 0 10px; }
 .fd-agent-changes summary { overflow-wrap: anywhere; }

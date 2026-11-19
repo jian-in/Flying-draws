@@ -54,7 +54,18 @@ export interface ImageRegionAnnotation {
   note?: string | null
   url?: string
 }
-export interface AgentApproval { requestId: string; name: string; description: string; answered: boolean }
+export interface AgentApproval {
+  requestId: string
+  name: string
+  description: string
+  answered: boolean
+  /** 内核在描述里给出的实际参数（「操作预览」那一行），用来认出同一条命令 */
+  preview?: string
+  /** 宿主按「本任务内都允许」自动批准了，没有弹给用户 */
+  autoApproved?: boolean
+}
+/** 用户在某个任务里选了「本任务内都允许」的一条工具调用：工具名和参数要一字不差才算同一条 */
+export interface AllowedCommand { name: string; input: string }
 export interface AgentResultImage {
   id: string
   mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
@@ -154,6 +165,8 @@ export interface AgentWorkItem {
   title: string
   archived?: boolean
   runs: AgentRun[]
+  /** 本任务内已允许、不再询问的工具调用 */
+  allowedCommands?: AllowedCommand[]
 }
 export interface AgentState {
   connection: 'offline' | 'starting' | 'ready' | 'error'
@@ -198,7 +211,10 @@ export interface AgentApi {
   submit(input: AgentSubmission): Promise<void>
   execute(text: string): Promise<void>
   cancel(): Promise<void>
-  approve(requestId: string, approved: boolean): Promise<void>
+  /** remember：批准并在本任务内记住这条调用，之后一字不差的同一调用不再询问 */
+  approve(requestId: string, approved: boolean, remember?: boolean): Promise<void>
+  /** 清空当前任务里「本任务内都允许」的记录 */
+  clearAllowedCommands(): Promise<void>
   review(runId: string, verdict: AgentRunReview['verdict'], note?: string): Promise<void>
   image(id: string): Promise<string>
   /** 本轮某个文件（不给就是全部）的差异文本 */

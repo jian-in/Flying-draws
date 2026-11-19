@@ -68,7 +68,8 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
     return service.execute(text)
   })
   ipc.handle('agent:cancel', () => service.cancel())
-  ipc.handle('agent:approve', (_event, requestId: string, approved: boolean) => service.approve(requestId, approved))
+  ipc.handle('agent:approve', (_event, requestId: string, approved: boolean, remember?: boolean) => service.approve(requestId, approved, remember === true))
+  ipc.handle('agent:clear-allowed', () => service.clearAllowedCommands())
   ipc.handle('agent:review', (_event, runId: string, verdict: 'approved' | 'rejected', note?: string) => service.review(runId, verdict, note))
   ipc.handle('agent:image', (_event, id: string) => service.image(id))
   ipc.handle('agent:round-diff', (_event, runId: string, path?: string) => {

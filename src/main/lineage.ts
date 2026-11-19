@@ -254,7 +254,9 @@ export function displaySizeForImage(naturalWidth: number, naturalHeight: number)
 }
 
 export function formatLineageEdgeLabel(meta?: ImageSourceMeta, fallbackRound = 2): string {
-  const round = Math.max(meta?.round && meta.round > 0 ? meta.round : 0, fallbackRound)
+  // 轮次就是任务里的第几轮，和面板、语义层一致；只有没记录轮次的图才退回用版本号。
+  // 不能取两者较大值：第 1 轮出的是 v2（v1 是用户放的原图），那样连线会比面板多一轮。
+  const round = meta?.round && meta.round > 0 ? meta.round : fallbackRound
   const files = (meta?.changedFiles ?? []).map((f) => f.trim()).filter(Boolean).slice(0, 4)
   return files.length > 0 ? `第 ${round} 轮 · ${files.join(', ')}` : `第 ${round} 轮结果`
 }
