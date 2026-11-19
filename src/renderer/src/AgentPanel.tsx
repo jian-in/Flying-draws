@@ -91,6 +91,16 @@ export function AgentPanel({
   const [previewSrc, setPreviewSrc] = useState<{ src: string; alt: string } | null>(null)
   const [confirmYolo, setConfirmYolo] = useState(false)
   const yolo = state.approvalMode === 'full-access'
+  // 上面那块设置（模型、工作目录、任务）可以收起成一行，给对话留出空间；收起状态记在本机
+  const [contextCollapsed, setContextCollapsed] = useState<boolean>(() => {
+    try { return window.localStorage.getItem('fd:agent-context-collapsed') === '1' } catch { return false }
+  })
+  function toggleContext(collapse: boolean) {
+    setContextCollapsed(collapse)
+    try { window.localStorage.setItem('fd:agent-context-collapsed', collapse ? '1' : '0') } catch {}
+  }
+  const workspacePath = state.workspace.replace(/\\/g, '/')
+  const workspaceLabel = !state.workspace || workspacePath.includes('/agent/workspaces/') ? '应用专用目录' : workspacePath.split('/').slice(-2).join('/')
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   const [following, setFollowing] = useState(true)
@@ -318,7 +328,12 @@ export function AgentPanel({
         </form>
       ) : (
         <>
-          <div className="fd-agent-context">
+          {contextCollapsed && !state.setupNeeded ? <div className="fd-agent-context fd-agent-context-collapsed">
+            <button className="fd-agent-context-summary" title="展开模型、工作目录和任务设置" aria-expanded={false} onClick={() => toggleContext(false)}>
+              <span>{state.model || '尚未配置模型'} · {workspaceLabel} · {active?.title || '新任务'}</span><span>展开 ▾</span>
+            </button>
+            {state.workspaceWarning ? <p className="fd-agent-small" role="status">{state.workspaceWarning}</p> : null}
+          </div> : <div className="fd-agent-context">
             <div className="fd-agent-model-row">
               <select aria-label="当前模型" disabled={disabled} value={JSON.stringify([state.provider, state.model])} onChange={e => {
                 const [provider, model] = JSON.parse(e.target.value) as string[]
@@ -328,9 +343,10 @@ export function AgentPanel({
                 {state.choices.map(choice => <option key={`${choice.provider}/${choice.model}`} value={JSON.stringify([choice.provider, choice.model])}>{choice.model} · {choice.provider}</option>)}
               </select>
               <button onClick={() => void act(() => api.newTask(board))} disabled={disabled} title="在当前画板开始一项新任务">＋ 新任务</button>
+              {!state.setupNeeded ? <button className="fd-agent-context-toggle" aria-expanded={true} title="收起这块设置，给对话留出更多空间" onClick={() => toggleContext(true)}>收起 ▴</button> : null}
             </div>
             <button className="fd-agent-workspace" disabled={disabled} onClick={() => void act(() => api.chooseWorkspace(board))} title={state.workspace || '选择项目文件夹'}>
-              <span>工作目录</span><span>{!state.workspace || state.workspace.replace(/\\/g, '/').includes('/agent/workspaces/') ? '应用专用目录' : state.workspace.replace(/\\/g, '/').split('/').slice(-2).join('/')}</span><span>↗</span>
+              <span>工作目录</span><span>{workspaceLabel}</span><span>↗</span>
             </button>
             {state.workspaceWarning ? <p className="fd-agent-small" role="status">{state.workspaceWarning}</p> : null}
             {state.toolStorage?.mode === 'host' ? <p className="fd-agent-small" title={state.toolStorage.artifactsDir}>截图和运行日志存在应用数据目录，不写进项目。只读命令、本轮自己起的服务的预览和关闭不再逐次确认。</p> : null}
@@ -352,7 +368,7 @@ export function AgentPanel({
               />
               自动把页面结果图连入画布演进链
             </label>
-          </div>
+          </div>}
           <div className="fd-agent-transcript-wrap">
           <div
             className="fd-agent-transcript"

@@ -33,6 +33,13 @@ body,
 .fd-agent-model-row { display: flex; gap: 7px; align-items: center; }
 .fd-agent-model-row > select { width: 0; flex: 1; border: 0; background: transparent; text-overflow: ellipsis; font-size: 12px; }
 .fd-agent-model-row > button { padding: 3px 7px; font-size: 11px; white-space: nowrap; }
+.fd-agent .fd-agent-context-toggle { border: 0; background: transparent; color: var(--fd-muted); padding: 3px 2px; }
+.fd-agent .fd-agent-context-toggle:hover { color: var(--fd-text); background: transparent; }
+.fd-agent-context-collapsed { padding: 6px 20px; }
+.fd-agent .fd-agent-context-summary { border: 0; background: transparent; width: 100%; padding: 2px 0; display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--fd-muted); text-align: left; }
+.fd-agent .fd-agent-context-summary:hover { color: var(--fd-text); background: transparent; }
+.fd-agent-context-summary > span:first-child { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fd-agent-context-summary > span:last-child { flex: none; }
 .fd-agent .fd-agent-workspace { border: 0; background: transparent; padding: 8px 0 0; width: 100%; display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--fd-muted); text-align: left; }
 .fd-agent-workspace > span:first-child, .fd-agent-workspace > span:last-child { flex: none; }
 .fd-agent-workspace > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }

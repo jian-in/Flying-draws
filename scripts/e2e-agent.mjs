@@ -160,6 +160,16 @@ try {
   await js(`document.querySelector('.fd-agent-settings input[type=checkbox]').click()`)
   await click('保存并使用')
   await until(async () => (await state()).vision && !(await state()).setupNeeded, '模型保存与切换')
+  // 设置区（模型、工作目录、任务）能收起成一行摘要给对话让位置，状态记在本机，点摘要再展开
+  await click('收起')
+  await until(() => js(`Boolean(document.querySelector('.fd-agent-context-summary'))`), '设置区收起')
+  assert.ok((await js(`document.querySelector('.fd-agent-context-summary').textContent`)).includes('fd-mock'), '收起后的摘要里应有当前模型')
+  assert.equal(await js(`localStorage.getItem('fd:agent-context-collapsed')`), '1')
+  assert.equal(await js(`Boolean(document.querySelector('.fd-agent-model-row'))`), false)
+  await js(`document.querySelector('.fd-agent-context-summary').click()`)
+  await until(() => js(`Boolean(document.querySelector('.fd-agent-model-row'))`), '设置区展开')
+  assert.equal(await js(`localStorage.getItem('fd:agent-context-collapsed')`), '0')
+  console.log('✔ 设置区可以收起成一行摘要再展开，状态记在本机')
   const sdk = path => pathToFileURL(join(root, 'node_modules/@modelcontextprotocol/sdk/dist/esm', path)).href
   const { Client } = await import(sdk('client/index.js'))
   const { StdioClientTransport } = await import(sdk('client/stdio.js'))
