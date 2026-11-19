@@ -7,6 +7,7 @@ import { StrokeWidthSlider } from './StrokeWidthSlider'
 import { AgentPanel } from './AgentPanel'
 import { AGENT_SEAT } from '../../shared/agent'
 import { LIBRARY_CALLBACK_URL } from '../../shared/library'
+import { hasUnsafeCustomData, sanitizeElement, sanitizeScene } from '../../shared/sanitizeScene'
 import type { OnChange, SceneArgs, Api, HiddenMap, AuthorFilter, SeatEntry, SkeletonList, SceneEl, Loose } from './canvas/types'
 import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, paperOr, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
 import { extractSeats, isDynamicSeats, seatsKeyOf, applyAuthorFilter } from './canvas/filters'
@@ -95,7 +96,7 @@ export default function App() {
         setBoardInfo({ board: res.board, title: res.title })
         setBoards(res.boards)
         setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
-        const scene = res.json ? (JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }) : {}
+        const scene = res.json ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }).scene : {}
         const initTheme = scene.appState?.theme === 'dark' ? 'dark' : 'light'
         document.documentElement.dataset.fdTheme = initTheme
         window.flyingdraws.setTheme(initTheme)
@@ -177,7 +178,9 @@ export default function App() {
         clearTimeout(timer.current)
         timer.current = null
       }
-      const parsed = res.json ? (JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; files?: Record<string, unknown> }) : null
+      const parsed = res.json
+        ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; files?: Record<string, unknown> }).scene
+        : null
       const nextElements = parsed?.elements ?? []
       lastSavedVersion.current = elementsVersion(nextElements)
       latest.current = null
@@ -256,6 +259,25 @@ export default function App() {
       if (document.documentElement.dataset.fdTheme !== appState.theme) {
         document.documentElement.dataset.fdTheme = appState.theme
         window.flyingdraws.setTheme(appState.theme === 'dark' ? 'dark' : 'light')
+      }
+      // 兜底：「打开」菜单、拖入文件、粘贴、素材插入都走 Excalidraw 自己的导入，
+      // 进来的 iframe 元素可能带 customData.generationData.html（CVE-2026-97224），
+      // 在它的 srcdoc 加载之前（微任务里）就把字段剥掉。
+      if (elements !== prevElementsRef.current && elements.some(hasUnsafeCustomData)) {
+        const current = apiRef.current
+        if (current) {
+          queueMicrotask(() => {
+            const live = current.getSceneElementsIncludingDeleted()
+            if (!live.some(hasUnsafeCustomData)) return
+            current.updateScene({
+              elements: live.map((el) =>
+                hasUnsafeCustomData(el) ? newElementWith(el, { customData: sanitizeElement(el).customData } as Parameters<typeof newElementWith>[1]) : el
+              ),
+              captureUpdate: CaptureUpdateAction.NEVER
+            })
+            setToast('已移除文件里一段可执行的嵌入内容（CVE-2026-97224）')
+          })
+        }
       }
       latest.current = [elements, appState, files]
       const elementsChanged = elements !== prevElementsRef.current

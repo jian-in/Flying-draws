@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { readFile, rename } from 'node:fs/promises'
 import { atomicWriteJson } from './atomicWrite.ts'
 import { MAX_LIBRARY_BYTES } from '../shared/library.ts'
+import { sanitizeLibraryItems } from '../shared/sanitizeScene.ts'
 
 export interface PersistedLibraryFile {
   type: 'excalidrawlib'
@@ -40,7 +41,12 @@ export function parseAndValidateLibraryJson(
   if (!items) {
     throw new Error('素材库文件缺少 libraryItems 列表')
   }
-  return { json: rawText, items, itemCount: items.length }
+  // 素材插到画布上同样会渲染，先剥掉 iframe 的 generationData（CVE-2026-97224）
+  const clean = sanitizeLibraryItems(items)
+  if (clean.stripped === 0) return { json: rawText, items, itemCount: items.length }
+  const key = Array.isArray(record.libraryItems) ? 'libraryItems' : 'library'
+  const json = JSON.stringify({ ...(parsed as Record<string, unknown>), [key]: clean.items })
+  return { json, items: clean.items, itemCount: clean.items.length }
 }
 
 export class LibraryStore {
