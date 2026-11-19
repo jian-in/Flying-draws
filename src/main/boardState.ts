@@ -1,13 +1,14 @@
 // 多画板会话状态、画板读写、切换/重命名/删除，以及待确认请求的存盘恢复。
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
-import { readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
+import { readdir, readFile, rename, unlink } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import type { SceneElement } from './semantic'
 import { RequestHub, type HubState } from './requests'
 import { PendingStore } from './pending'
 import { nextSeatColor, SeatRegistry } from './seats'
 import { atomicWriteJson } from './atomicWrite'
-import { BOARD_EXT, DEFAULT_BOARD_ID, boardFilePath, emptyBoardScene, isValidBoardId, matchExistingBoardId, normalizeBoardId, normalizeBoardTitle, parseBoardMeta, pickFallbackBoard, sameBoardOnDisk, updateBoardSceneTitle, validateBoardId, type BoardMeta } from './boards'
+import { BoardMetaCache } from './boardMetaCache'
+import { BOARD_EXT, DEFAULT_BOARD_ID, boardFilePath, emptyBoardScene, isValidBoardId, matchExistingBoardId, normalizeBoardId, normalizeBoardTitle, pickFallbackBoard, sameBoardOnDisk, updateBoardSceneTitle, validateBoardId, type BoardMeta } from './boards'
 import { HOME, BOARDS_DIR, legacyM0Path, pendingPath, statePath } from './paths'
 import { win, agent, currentBoardId, setCurrentBoardId } from './context'
 import { rpc, takeSnapshot } from './rpc'
@@ -37,6 +38,7 @@ export const sessions = new Map<string, BoardSession>()
 export const seatRegistry = new SeatRegistry()
 export const requestBoard = new Map<string, string>() // request_id → boardId
 export let saveCount = 0
+const boardMetaCache = new BoardMetaCache()
 
 export function persistCurrentBoard(): void {
   try {
@@ -202,12 +204,14 @@ export async function listBoards(): Promise<BoardInfo[]> {
     seen.add(id)
     const active = sameBoardOnDisk(id, currentBoardId)
     if (active && id !== currentBoardId) setCurrentBoardId(id)
-    const file = boardFilePath(BOARDS_DIR, id)
-    try {
-      const [json, st] = await Promise.all([readFile(file, 'utf8'), stat(file)])
-      items.push({ ...parseBoardMeta(id, json, st.mtime.toISOString()), active: id === currentBoardId })
-    } catch {}
   }
+  // 并行读，没改过的画板直接用缓存，不再整份读出来解析
+  const files = diskIds.map((id) => boardFilePath(BOARDS_DIR, id))
+  const metas = await Promise.all(diskIds.map((id, i) => boardMetaCache.read(id, files[i]).catch(() => null)))
+  boardMetaCache.retain(files)
+  metas.forEach((meta, i) => {
+    if (meta) items.push({ ...meta, active: diskIds[i] === currentBoardId })
+  })
   if (![...seen].some((id) => sameBoardOnDisk(id, currentBoardId))) {
     const s = getSession(currentBoardId)
     items.push({
