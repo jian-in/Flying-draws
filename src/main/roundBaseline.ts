@@ -101,7 +101,9 @@ async function ensureStore(store: string, mode: SnapshotMode, root: string, alte
   if (alternates) await writeFile(join(store, 'objects', 'info', 'alternates'), `${alternates}\n`)
   if (mode === 'plain') {
     const excludes = [...PLAIN_DEFAULT_EXCLUDES]
-    const inside = relative(root, store)
+    // root 已经解析过真实路径；快照库也要解析，否则经过 8.3 短名、目录联接或符号链接时两边对不上，
+    // 会误判快照库不在工作区里，把它自己也拍进去
+    const inside = relative(root, await realpath(store).catch(() => store))
     if (inside && !inside.startsWith('..') && !isAbsolute(inside)) {
       // 快照库在工作区里面：排除到数据目录那一层，免得拍快照把快照库自己也拍进去
       const parts = inside.split(/[\\/]+/)

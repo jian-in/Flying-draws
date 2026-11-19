@@ -212,15 +212,16 @@ test('快照库回收：只留名单里的树，过期轮次独有的内容被�
     const second = await captureRoundBaseline(repo, store)
     await writeFile(join(repo, 'src', 'a.ts'), 'export const a = 42\n')
     const secondChanges = await collectRoundChanges(second!, store)
-    const dirOf = join(store, storeKey(repo))
+    // 快照库按 git 解析出的仓库根目录建（可能和传入的路径写法不同，比如 8.3 短名或目录联接）
+    const dirOf = join(store, storeKey(secondChanges.root))
     const oldBlob = blobOf(repo, 'OLD-ONLY-IN-ROUND-1\n')
     assert.equal(await withoutAlternates(dirOf, () => ownObjectExists(dirOf, oldBlob)), true)
 
     // 默认宽限期内：刚写的对象不动
-    await pruneRoundSnapshots(store, [{ root: repo, trees: [secondChanges.before, secondChanges.after] }])
+    await pruneRoundSnapshots(store, [{ root: secondChanges.root, trees: [secondChanges.before, secondChanges.after] }])
     assert.equal(await withoutAlternates(dirOf, () => ownObjectExists(dirOf, oldBlob)), true)
 
-    const result = await pruneRoundSnapshots(store, [{ root: repo, trees: [secondChanges.before, secondChanges.after] }], { graceMs: 0 })
+    const result = await pruneRoundSnapshots(store, [{ root: secondChanges.root, trees: [secondChanges.before, secondChanges.after] }], { graceMs: 0 })
     assert.deepEqual(result, { removedStores: 0, collected: 1, broken: [] })
     assert.equal(await withoutAlternates(dirOf, () => ownObjectExists(dirOf, oldBlob)), false, '过期轮次独有的内容应被删掉')
     assert.equal(await withoutAlternates(dirOf, () => ownObjectExists(dirOf, firstChanges.after)), false)
@@ -239,8 +240,8 @@ test('快照库回收：只留名单里的树，过期轮次独有的内容被�
 test('快照库回收：没有轮次还要的库整个删掉，刚有动静的先留着', async () => {
   const { dir, repo, store } = await makeRepo()
   try {
-    await captureRoundBaseline(repo, store)
-    const dirOf = join(store, storeKey(repo))
+    const baseline = await captureRoundBaseline(repo, store)
+    const dirOf = join(store, storeKey(baseline!.root))
     assert.deepEqual(await pruneRoundSnapshots(store, []), { removedStores: 0, collected: 0, broken: [] })
     assert.ok(existsSync(dirOf), '刚建的库可能正在拍快照，宽限期内不删')
     assert.equal((await pruneRoundSnapshots(store, [], { graceMs: 0 })).removedStores, 1)
