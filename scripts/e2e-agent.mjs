@@ -4,6 +4,7 @@ import { createServer } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
 import { execFile, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -28,7 +29,7 @@ const provider = createServer(async (req, res) => {
     for await (const chunk of req) chunks.push(chunk)
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
     const images = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : []).filter(block => block.type === 'image_url').length
-    requests.push({ stage, images })
+    requests.push({ stage, images, text: JSON.stringify(body) })
     calls++
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })
     if (stage === 'hang') { res.write(': waiting\n\n'); return }
@@ -272,6 +273,15 @@ try {
   assert.ok(['completed', 'unverified'].includes((await finished(yoloRun.id)).status))
   console.log('✔ YOLO 开启后整轮无审批，关闭后恢复询问')
   await js(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`)
+  // 本机 Fuxi 的全机规则（%APPDATA%\fuxi\AGENTS.md，供用户单独使用的 Fuxi）不能带进 Flying draws 的会话
+  const machineRule = process.platform === 'win32' && process.env.APPDATA ? join(process.env.APPDATA, 'fuxi', 'AGENTS.md') : null
+  if (machineRule && existsSync(machineRule)) {
+    const probes = readFileSync(machineRule, 'utf8').split(/\r?\n/).map(line => line.trim()).filter(line => line.length >= 12 && !/["\\<>`]/.test(line)).slice(0, 5).map(line => line.slice(0, 40))
+    assert.ok(probes.length, '全机规则里找不到可用来比对的行')
+    const leaked = requests.filter(request => probes.some(probe => request.text.includes(probe)))
+    assert.equal(leaked.length, 0, `全机规则被带进了 ${leaked.length} 次模型请求`)
+    console.log(`✔ 本机 Fuxi 全机规则没有进入会话（比对 ${probes.length} 行 × ${requests.length} 次请求）`)
+  }
   const shot = await js('window.flyingdraws.captureWindow()')
   await writeFile(join(output, 'agent.png'), Buffer.from(shot, 'base64'))
   await js(`window.__flyingdrawsApi.updateScene({appState:{theme:'dark'}})`)

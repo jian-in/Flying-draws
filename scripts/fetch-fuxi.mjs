@@ -12,11 +12,11 @@ import { gunzipSync } from 'node:zlib'
 const execFileAsync = promisify(execFile)
 
 const REPO = 'jian-in/Flying-draws'
-const RELEASE_TAG = 'fuxi-kernel-0.3.0'
+const RELEASE_TAG = 'fuxi-kernel-0.4.0'
 const ASSET_NAME = 'fuxi-win32-x64.exe.gz'
 const DEFAULT_URL = `https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${ASSET_NAME}`
-const SOURCE_COMMIT = 'cdf23f0a35cbb479b8cdabf0d800e2db936f87c9'
-const DEFAULT_EXE_SHA256 = '57d4c2a80e27d9150e3119d60ba68382780a390e604cd12c13712d41388b0245'
+const SOURCE_COMMIT = '441f3bd9e6c6aa33d7696ce561d6587d09c9daad'
+const DEFAULT_EXE_SHA256 = 'f20ad6a8d837ed8283940dccc6f34ceccbee26348c4a1424f9365fb0c805190b'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const rawArgs = process.argv.slice(2)
