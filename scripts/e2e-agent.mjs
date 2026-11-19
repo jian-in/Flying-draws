@@ -134,6 +134,25 @@ try {
   assert.equal((await state()).activeItemId, null)
   console.log('✔ Electron 与内置 Fuxi 初始化完成')
   await click('模型设置')
+  const settingsField = label => `[...document.querySelectorAll('.fd-agent-settings label')].find(l=>l.textContent.trim().startsWith(${JSON.stringify(label)}))`
+  const visionChecked = `document.querySelector('.fd-agent-settings input[type=checkbox]').checked`
+  // 默认是已实测的 deepseek-flash 预设：只差密钥，看图默认打开
+  await until(() => js(`Boolean(${settingsField('服务商')})`), '模型设置表单')
+  assert.deepEqual(await js(`({ url: ${settingsField('服务地址')}.querySelector('input').value, model: ${settingsField('模型 ID')}.querySelector('input').value, vision: ${visionChecked} })`),
+    { url: 'https://api.deepseek.com/v1', model: 'deepseek-flash', vision: true })
+  const keyValue = `${settingsField('API Key')}.querySelector('input').value`
+  const presetValue = `${settingsField('服务商')}.querySelector('select').value`
+  const selectPreset = id => js(`(() => { const s=${settingsField('服务商')}.querySelector('select'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(s,${JSON.stringify(id)}); s.dispatchEvent(new Event('change',{bubbles:true})); })()`)
+  // 预设下把服务地址改到别的主机：已填的密钥清空，服务商不再显示为预设
+  await fill('API Key', 'fd-should-be-cleared')
+  await fill('服务地址', 'https://example.invalid/v1')
+  await until(() => js(`${keyValue}==='' && ${presetValue}==='custom'`), '改主机后清空密钥')
+  // 切回预设、填上密钥，再换成自定义：密钥和表单都清空，看图要用户自己勾
+  await selectPreset('deepseek-flash')
+  await fill('API Key', 'fd-should-be-cleared')
+  await selectPreset('custom')
+  await until(() => js(`!${visionChecked} && ${settingsField('模型 ID')}.querySelector('input').value==='' && ${keyValue}===''`), '切到自定义服务商')
+  console.log('✔ 模型设置默认是 deepseek-flash 预设；换服务商或改主机都会清空密钥')
   await fill('配置名称', 'fd-test')
   await fill('服务地址', `http://127.0.0.1:${providerPort}/v1`)
   await fill('API Key', 'fd-e2e-not-a-real-key')
@@ -147,6 +166,8 @@ try {
   client = new Client({ name: 'fd-agent-test', version: '1' })
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(bridgeRoot, 'out/bridge/index.js')], env, stderr: 'pipe' }))
   await client.callTool({ name: 'canvas_draw', arguments: { board: 'default', ops: [{ op: 'add_node', id: 'idea', label: '想法' }] } })
+  await until(() => js(`Boolean(document.querySelector('.fd-agent-composer input[type=checkbox]'))`), '规划开关出现')
+  assert.equal(await js(`document.querySelector('.fd-agent-composer input[type=checkbox]').checked`), false, '新打开时应默认直接执行，不先拟计划')
   await setPlanFirst(false)
   await goal('请在画布上新增一个结果节点')
   await click('开始执行')

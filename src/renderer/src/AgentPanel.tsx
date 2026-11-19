@@ -18,9 +18,28 @@ const EMPTY: AgentState = {
   connection: 'offline', error: null, busy: false, setupNeeded: true, vision: false,
   provider: '', model: '', choices: [], workspace: '', activeItemId: null, items: [], approvalMode: 'auto-safe'
 }
-const DEFAULT_PROVIDER: ProviderDraft = {
-  protocol: 'openai-compatible', name: 'my-model', base_url: '', credential: '', model: '',
-  context_window: 128000, max_tokens: 8192, vision: false
+// 模型设置的预设：已实测过的服务商只需填密钥；「自定义」要用户自己确认模型是否支持看图
+const PROVIDER_PRESETS = {
+  'deepseek-flash': {
+    label: 'DeepSeek · deepseek-flash（已实测，支持看图）',
+    draft: {
+      protocol: 'openai-compatible', name: 'deepseek', base_url: 'https://api.deepseek.com/v1', credential: '', model: 'deepseek-flash',
+      context_window: 1000000, max_tokens: 25400, vision: true
+    }
+  },
+  custom: {
+    label: '自定义',
+    draft: {
+      protocol: 'openai-compatible', name: 'my-model', base_url: '', credential: '', model: '',
+      context_window: 128000, max_tokens: 8192, vision: false
+    }
+  }
+} satisfies Record<string, { label: string; draft: ProviderDraft }>
+type PresetId = keyof typeof PROVIDER_PRESETS
+const DEFAULT_PRESET: PresetId = 'deepseek-flash'
+/** 地址的协议 + 主机 + 端口；还没写成合法地址时返回 null */
+function urlOrigin(value: string): string | null {
+  try { return new URL(value).origin } catch { return null }
 }
 
 const BASE_URL_PLACEHOLDER: Record<ProviderDraft['protocol'], string> = {
@@ -58,7 +77,8 @@ export function AgentPanel({
 }) {
   const [state, setState] = useState<AgentState>(EMPTY)
   const [goal, setGoal] = useState('')
-  const [planFirst, setPlanFirst] = useState(true)
+  // 默认直接执行；需要先看计划时再勾上「先拟计划」
+  const [planFirst, setPlanFirst] = useState(false)
   const [autoLineage, setAutoLineage] = useState<boolean>(() => {
     try { return window.localStorage.getItem('fd:auto-lineage') !== '0' } catch { return true }
   })
@@ -66,7 +86,8 @@ export function AgentPanel({
   const [working, setWorking] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [settings, setSettings] = useState(false)
-  const [provider, setProvider] = useState(DEFAULT_PROVIDER)
+  const [preset, setPreset] = useState<PresetId>(DEFAULT_PRESET)
+  const [provider, setProvider] = useState<ProviderDraft>(PROVIDER_PRESETS[DEFAULT_PRESET].draft)
   const [previewSrc, setPreviewSrc] = useState<{ src: string; alt: string } | null>(null)
   const [confirmYolo, setConfirmYolo] = useState(false)
   const yolo = state.approvalMode === 'full-access'
@@ -265,11 +286,25 @@ export function AgentPanel({
               </button>
             </div>
           ) : null}
+          <label>服务商<select value={preset} onChange={e => {
+            const id = e.target.value as PresetId
+            setPreset(id)
+            // 换服务商时清掉已填的密钥，免得把一家的密钥发给另一家的地址
+            setProvider({ ...PROVIDER_PRESETS[id].draft })
+          }}>
+            {(Object.keys(PROVIDER_PRESETS) as PresetId[]).map(id => <option key={id} value={id}>{PROVIDER_PRESETS[id].label}</option>)}
+          </select></label>
           <label>接口协议<select value={provider.protocol} onChange={e => setProvider({ ...provider, protocol: e.target.value as ProviderDraft['protocol'] })}>
             <option value="openai-compatible">OpenAI 兼容</option><option value="anthropic-messages">Anthropic Messages</option><option value="gemini">Gemini</option>
           </select></label>
           <label>配置名称（英文）<input required value={provider.name} pattern="[A-Za-z0-9_-]+" maxLength={64} onChange={e => setProvider({ ...provider, name: e.target.value })} /></label>
-          <label>服务地址<input required type="url" placeholder={BASE_URL_PLACEHOLDER[provider.protocol]} value={provider.base_url} onChange={e => setProvider({ ...provider, base_url: e.target.value })} /></label>
+          <label>服务地址<input required type="url" placeholder={BASE_URL_PLACEHOLDER[provider.protocol]} value={provider.base_url} onChange={e => {
+            const base_url = e.target.value
+            // 服务地址换了主机就清掉已填的密钥（并不再显示为预设），免得把一家的密钥发到另一家的地址
+            if (urlOrigin(base_url) === urlOrigin(provider.base_url)) { setProvider({ ...provider, base_url }); return }
+            setProvider({ ...provider, base_url, credential: '' })
+            setPreset('custom')
+          }} /></label>
           <label>API Key<input required type="password" autoComplete="off" spellCheck={false} placeholder="密钥，或 env:变量名" value={provider.credential} onChange={e => setProvider({ ...provider, credential: e.target.value })} /></label>
           <label>模型 ID<input required placeholder="服务商提供的模型 ID" value={provider.model} onChange={e => setProvider({ ...provider, model: e.target.value })} /></label>
           <label className="fd-agent-check"><input type="checkbox" checked={provider.vision} onChange={e => setProvider({ ...provider, vision: e.target.checked })} />该模型支持图片输入</label>
