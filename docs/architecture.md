@@ -18,7 +18,7 @@ flowchart LR
 
   subgraph App["Flying draws 桌面端 (Electron)"]
     DM["Local HTTP Daemon (src/main/daemon.ts)"]
-    CORE["BoardSession + Write Queue (src/main/index.ts)"]
+    CORE["BoardSession (src/main/boardState.ts) + 写队列 serialized() (src/main/draw.ts)"]
     SEM["空间语义与像素逆映射 (semantic.ts / imageSize.ts)"]
     OPS["排版、Rebase 与提议转换 (ops.ts / diff.ts / lineage.ts)"]
     DOCK["Win32 物理像素吸附 (dock.ts / koffi)"]

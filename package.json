@@ -48,6 +48,7 @@
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --test \"test/*.test.ts\"",
+    "test:fast": "node scripts/test-fast.mjs",
     "e2e": "node scripts/e2e.mjs",
     "e2e:draw": "node scripts/e2e-draw.mjs",
     "e2e:agent": "node scripts/e2e-agent.mjs",
