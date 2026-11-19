@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { CaptureUpdateAction, convertToExcalidrawElements, Excalidraw, MainMenu, newElementWith, serializeAsJSON, useHandleLibrary } from '@excalidraw/excalidraw'
+import { CaptureUpdateAction, convertToExcalidrawElements, Excalidraw, loadFromBlob, MainMenu, newElementWith, serializeAsJSON, useHandleLibrary } from '@excalidraw/excalidraw'
 import { displaySizeForImage, planImageLineage, type LineageCanvasElement } from '../../main/lineage'
 import type { DrawPlan, PendingChanges } from '../../main/ops'
 import { StrokeWidthSlider } from './StrokeWidthSlider'
 import { AgentPanel } from './AgentPanel'
 import { AGENT_SEAT } from '../../shared/agent'
 import { LIBRARY_CALLBACK_URL } from '../../shared/library'
+import { hasUnsafeCustomData, sanitizeElement, sanitizeScene } from '../../shared/sanitizeScene'
 import type { OnChange, SceneArgs, Api, HiddenMap, AuthorFilter, SeatEntry, SkeletonList, SceneEl, Loose } from './canvas/types'
 import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, paperOr, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
 import { extractSeats, isDynamicSeats, seatsKeyOf, applyAuthorFilter } from './canvas/filters'
@@ -19,6 +20,8 @@ type Status =
   | { kind: 'idle' }
   | { kind: 'saved'; path: string; version: number; savedAt: string }
   | { kind: 'error'; message: string }
+
+const EXCALIDRAW_UI_OPTIONS = { canvasActions: { loadScene: false } } // 打开文件由 importSceneFile 接管（CVE-2026-97224）
 
 export default function App() {
   const [agentOpen, setAgentOpen] = useState(false)
@@ -95,7 +98,7 @@ export default function App() {
         setBoardInfo({ board: res.board, title: res.title })
         setBoards(res.boards)
         setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
-        const scene = res.json ? (JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }) : {}
+        const scene = res.json ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }).scene : {}
         const initTheme = scene.appState?.theme === 'dark' ? 'dark' : 'light'
         document.documentElement.dataset.fdTheme = initTheme
         window.flyingdraws.setTheme(initTheme)
@@ -177,7 +180,9 @@ export default function App() {
         clearTimeout(timer.current)
         timer.current = null
       }
-      const parsed = res.json ? (JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; files?: Record<string, unknown> }) : null
+      const parsed = res.json
+        ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; files?: Record<string, unknown> }).scene
+        : null
       const nextElements = parsed?.elements ?? []
       lastSavedVersion.current = elementsVersion(nextElements)
       latest.current = null
@@ -250,12 +255,90 @@ export default function App() {
     }
   }, [])
 
+  // 自己接管「打开」和拖入 .excalidraw：先过 sanitizeScene 再进画布（CVE-2026-97224），
+  // 不让 Excalidraw 自带的导入把 generationData 先渲染一遍。
+  const importSceneFile = useCallback(async (file: File) => {
+    const current = apiRef.current
+    if (!current) return
+    const hasContent = current.getSceneElements().length > 0
+    if (hasContent && !window.confirm('打开文件会替换当前画布内容，继续吗？')) return
+    try {
+      const data = await loadFromBlob(file, null, null)
+      const { scene, stripped } = sanitizeScene(data)
+      if (scene.files && Object.keys(scene.files).length > 0) {
+        current.addFiles(Object.values(scene.files))
+      }
+      const { viewBackgroundColor, theme, gridModeEnabled, name } = scene.appState
+      current.updateScene({
+        elements: scene.elements,
+        appState: { viewBackgroundColor: paperOr(viewBackgroundColor), theme, gridModeEnabled, name },
+        captureUpdate: CaptureUpdateAction.IMMEDIATELY
+      })
+      current.scrollToContent(undefined, { fitToContent: true })
+      if (stripped > 0) setToast('已移除文件里一段可执行的嵌入内容（CVE-2026-97224）')
+    } catch (err) {
+      setToast(`打开失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }, [])
+  const isSceneFile = (file: File): boolean =>
+    /\.excalidraw$/i.test(file.name) || file.type === 'application/vnd.excalidraw+json' || /\.json$/i.test(file.name)
+  const openSceneFile = useCallback(() => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.excalidraw,.json,application/json,application/vnd.excalidraw+json'
+    input.onchange = () => {
+      const file = input.files?.[0]
+      if (file) void importSceneFile(file)
+    }
+    input.click()
+  }, [importSceneFile])
+  useEffect(() => {
+    // 自带的 loadScene 动作已在 UIOptions 里关掉，Ctrl/Cmd+O 改走自己的打开
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'o') {
+        e.preventDefault()
+        openSceneFile()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [openSceneFile])
+  const onCanvasDropCapture = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      const file = e.dataTransfer?.files?.[0]
+      if (!file || !isSceneFile(file)) return // 图片、素材库等交回 Excalidraw
+      e.preventDefault()
+      e.stopPropagation()
+      void importSceneFile(file)
+    },
+    [importSceneFile]
+  )
+
   const onChange = useCallback<OnChange>(
     (elements, appState, files) => {
       // 横幅和弹窗画在 Excalidraw 外面，要自己跟着它的深浅色走
       if (document.documentElement.dataset.fdTheme !== appState.theme) {
         document.documentElement.dataset.fdTheme = appState.theme
         window.flyingdraws.setTheme(appState.theme === 'dark' ? 'dark' : 'light')
+      }
+      // 兜底：「打开」菜单、拖入文件、粘贴、素材插入都走 Excalidraw 自己的导入，
+      // 进来的 iframe 元素可能带 customData.generationData.html（CVE-2026-97224），
+      // 在它的 srcdoc 加载之前（微任务里）就把字段剥掉。
+      if (elements !== prevElementsRef.current && elements.some(hasUnsafeCustomData)) {
+        const current = apiRef.current
+        if (current) {
+          queueMicrotask(() => {
+            const live = current.getSceneElementsIncludingDeleted()
+            if (!live.some(hasUnsafeCustomData)) return
+            current.updateScene({
+              elements: live.map((el) =>
+                hasUnsafeCustomData(el) ? newElementWith(el, { customData: sanitizeElement(el).customData } as Parameters<typeof newElementWith>[1]) : el
+              ),
+              captureUpdate: CaptureUpdateAction.NEVER
+            })
+            setToast('已移除文件里一段可执行的嵌入内容（CVE-2026-97224）')
+          })
+        }
       }
       latest.current = [elements, appState, files]
       const elementsChanged = elements !== prevElementsRef.current
@@ -661,12 +744,13 @@ export default function App() {
         </div>
       </div>
       <div className="fd-workspace">
-      <div className={`fd-canvas${request || composing || hub.agentWaiting || hub.handoff || hub.inbox > 0 || deferredDraw ? ' fd-has-notice' : ''}`}>
+      <div onDropCapture={onCanvasDropCapture} className={`fd-canvas${request || composing || hub.agentWaiting || hub.handoff || hub.inbox > 0 || deferredDraw ? ' fd-has-notice' : ''}`}>
       <Excalidraw
         excalidrawAPI={setApi}
         initialData={initialData}
         onChange={onChange}
         langCode="zh-CN"
+        UIOptions={EXCALIDRAW_UI_OPTIONS}
         libraryReturnUrl={LIBRARY_CALLBACK_URL}
         renderTopRightUI={() => (
           <div className="fd-status">
@@ -677,7 +761,9 @@ export default function App() {
         )}
       >
         <MainMenu>
-          <MainMenu.DefaultItems.LoadScene />
+          <MainMenu.Item onSelect={openSceneFile} shortcut="Ctrl+O">
+            打开
+          </MainMenu.Item>
           <MainMenu.DefaultItems.SaveToActiveFile />
           <MainMenu.DefaultItems.Export />
           <MainMenu.DefaultItems.SaveAsImage />
