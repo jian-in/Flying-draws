@@ -1,11 +1,11 @@
 // 主进程各模块共用的状态：主窗口、IPC 守卫、内置 Agent、当前画板、退出标记。
 // 只有这里能改这些变量，别的模块通过 set* 函数改。
 import { BrowserWindow } from 'electron'
-import { readFileSync } from 'node:fs'
 import { registerAgent } from './agentIpc'
 import { createIpcGuard } from './ipcGuard'
 import { DEFAULT_BOARD_ID, isValidBoardId } from './boards'
 import { HOME, statePath, RENDERER_FILE } from './paths'
+import { readAppStateFile, type Theme } from './appStateFile'
 
 export let win: BrowserWindow | null = null
 export function setWin(next: BrowserWindow | null): void {
@@ -22,11 +22,14 @@ export function setQuitting(next: boolean): void {
 }
 
 export function readSavedBoardId(): string {
-  try {
-    const raw = JSON.parse(readFileSync(statePath, 'utf8')) as { currentBoard?: unknown }
-    if (typeof raw.currentBoard === 'string' && isValidBoardId(raw.currentBoard)) return raw.currentBoard
-  } catch {}
-  return DEFAULT_BOARD_ID
+  const saved = readAppStateFile(statePath).currentBoard
+  return saved && isValidBoardId(saved) ? saved : DEFAULT_BOARD_ID
+}
+
+// 上次的深浅色：Excalidraw 存 .excalidraw 时不写 theme，所以由主进程记在 state.json
+export let savedTheme: Theme = readAppStateFile(statePath).theme ?? 'light'
+export function setSavedTheme(next: Theme): void {
+  savedTheme = next
 }
 
 export let currentBoardId = readSavedBoardId()

@@ -10,8 +10,9 @@ import { freshApprovals, hasPendingApprovals, trayTooltip } from './agentNotice'
 import { AGENT_SEAT, type AgentState } from '../shared/agent'
 import { isExcalidrawLibraryBrowseUrl, MAX_LIBRARY_BYTES, parseLibraryInstallNavigation } from '../shared/library'
 import { parseAndValidateLibraryJson } from './library'
-import { BACKGROUND_ARG, TEST_INSTANCE, RENDERER_FILE } from './paths'
-import { win, setWin, ipc, agent, quitting, setQuitting, setWindowReady } from './context'
+import { BACKGROUND_ARG, TEST_INSTANCE, RENDERER_FILE, statePath } from './paths'
+import { win, setWin, ipc, agent, quitting, setQuitting, setWindowReady, savedTheme, setSavedTheme } from './context'
+import { patchAppStateFile } from './appStateFile'
 import { rejectPendingRpcs } from './rpc'
 import { updateWindowTitle } from './boardState'
 
@@ -136,8 +137,9 @@ export function createWindow(): void {
     title: 'Flying draws',
     // 不用系统自带的标题栏和菜单栏：顶上那一条由页面自己画成纸色，只留系统的最小化/最大化/关闭按钮
     titleBarStyle: 'hidden',
-    titleBarOverlay: { ...TITLEBAR_COLORS.light, height: TITLEBAR_HEIGHT },
-    backgroundColor: TITLEBAR_COLORS.light.color,
+    // 按上次的深浅色起窗口，深色用户启动时不会先闪一下浅色
+    titleBarOverlay: { ...TITLEBAR_COLORS[savedTheme], height: TITLEBAR_HEIGHT },
+    backgroundColor: TITLEBAR_COLORS[savedTheme].color,
     autoHideMenuBar: true,
     webPreferences: {
       backgroundThrottling: !(process.env['FLYINGDRAWS_HOME'] && process.env['FLYINGDRAWS_DEBUG_PORT']),
@@ -157,7 +159,16 @@ export function createWindow(): void {
   ipcMain.removeAllListeners('window:theme')
   ipc.on('window:theme', (_e, theme: unknown) => {
     if (overlayTarget.isDestroyed()) return
-    const colors = theme === 'dark' ? TITLEBAR_COLORS.dark : TITLEBAR_COLORS.light
+    const next = theme === 'dark' ? 'dark' : 'light'
+    if (next !== savedTheme) {
+      setSavedTheme(next)
+      try {
+        patchAppStateFile(statePath, { theme: next })
+      } catch (err) {
+        console.error('[flyingdraws] could not save theme:', err)
+      }
+    }
+    const colors = TITLEBAR_COLORS[next]
     // 只有 Windows 和 Linux 上能改这几个按钮的颜色
     if (process.platform !== 'darwin') overlayTarget.setTitleBarOverlay({ ...colors, height: TITLEBAR_HEIGHT })
     overlayTarget.setBackgroundColor(colors.color)

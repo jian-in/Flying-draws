@@ -6,14 +6,14 @@ import { diffProposal, type DiffElement, type ProposalBaseline } from './diff'
 import type { DockState } from './dock'
 import { boardFilePath, isValidBoardId } from './boards'
 import { BOARDS_DIR, libraryStore, TEST_INSTANCE } from './paths'
-import { ipc, currentBoardId } from './context'
+import { ipc, currentBoardId, savedTheme } from './context'
 import { requestBoard, saveCount, getSession, buildHubState, loadBoard, acceptScene, resolveExistingBoardId, listBoards, switchBoard, renameBoard, deleteBoard } from './boardState'
 import { dock } from './window'
 import { serialized } from './draw'
 
 ipc.handle('board:load', async () => {
   const loaded = await loadBoard(currentBoardId)
-  return { ...loaded, boards: await listBoards() }
+  return { ...loaded, boards: await listBoards(), theme: savedTheme }
 })
 ipc.handle('board:list', async () => ({ current: currentBoardId, boards: await listBoards() }))
 // 页面带上这份内容属于哪块画板：自动保存是延时触发的，可能在 agent 切换、重命名或删除画板之后才到，

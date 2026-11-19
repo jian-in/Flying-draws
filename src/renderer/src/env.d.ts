@@ -45,6 +45,7 @@ declare global {
     hubState?: HubState
     oldBoard?: string
     deleted?: string
+    theme?: 'light' | 'dark'
   }
 
   interface Window {

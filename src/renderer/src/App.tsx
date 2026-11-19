@@ -8,6 +8,7 @@ import { AgentPanel } from './AgentPanel'
 import { AGENT_SEAT } from '../../shared/agent'
 import { LIBRARY_CALLBACK_URL } from '../../shared/library'
 import { hasUnsafeCustomData, sanitizeElement, sanitizeScene } from '../../shared/sanitizeScene'
+import { scenePrefsKey } from '../../shared/scenePrefs'
 import type { OnChange, SceneArgs, Api, HiddenMap, AuthorFilter, SeatEntry, SkeletonList, SceneEl, Loose } from './canvas/types'
 import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, paperOr, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
 import { extractSeats, isDynamicSeats, seatsKeyOf, applyAuthorFilter } from './canvas/filters'
@@ -99,7 +100,8 @@ export default function App() {
         setBoards(res.boards)
         setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
         const scene = res.json ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }).scene : {}
-        const initTheme = scene.appState?.theme === 'dark' ? 'dark' : 'light'
+        // .excalidraw 里不存 theme，以主进程记下的为准
+        const initTheme = res.theme ?? (scene.appState?.theme === 'dark' ? 'dark' : 'light')
         document.documentElement.dataset.fdTheme = initTheme
         window.flyingdraws.setTheme(initTheme)
         const info = extractSeats(scene.elements ?? [])
@@ -108,7 +110,7 @@ export default function App() {
         const initPlaced = extractPlacedResults(scene.elements ?? [])
         lastPlacedKeyRef.current = initPlaced.join('|')
         setPlacedResultIds(new Set(initPlaced))
-        return { ...scene, appState: { ...scene.appState, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
+        return { ...scene, appState: { ...scene.appState, theme: initTheme, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
       })
       .catch((err) => {
         setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
@@ -118,6 +120,7 @@ export default function App() {
 
   const latest = useRef<SceneArgs | null>(null)
   const lastSavedVersion = useRef<number | null>(null)
+  const lastSavedPrefs = useRef<string | null>(null) // 背景色、网格这类不改元素版本的设置
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const apiRef = useRef<Api | null>(null)
   apiRef.current = api
@@ -185,6 +188,7 @@ export default function App() {
         : null
       const nextElements = parsed?.elements ?? []
       lastSavedVersion.current = elementsVersion(nextElements)
+      lastSavedPrefs.current = null
       latest.current = null
       boardIdRef.current = res.board
       sceneEpoch.current += 1
@@ -249,6 +253,7 @@ export default function App() {
         return
       }
       lastSavedVersion.current = elementsVersion(elements)
+      lastSavedPrefs.current = scenePrefsKey(appState)
       setStatus({ kind: 'saved', path: res.path, version: res.version, savedAt: res.savedAt })
     } catch (err) {
       setStatus({ kind: 'error', message: String(err) })
@@ -341,6 +346,10 @@ export default function App() {
         }
       }
       latest.current = [elements, appState, files]
+      // 只换了背景色、开关了网格：元素版本不变，下面那条路径认不出来，单独排一次保存
+      const prefs = scenePrefsKey(appState)
+      if (lastSavedPrefs.current === null) lastSavedPrefs.current = prefs
+      else if (prefs !== lastSavedPrefs.current && !timer.current) timer.current = setTimeout(() => void save(), SAVE_DELAY_MS)
       const elementsChanged = elements !== prevElementsRef.current
       const selectionChanged = appState.selectedElementIds !== prevSelectedIdsRef.current
       prevElementsRef.current = elements
