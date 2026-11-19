@@ -4,7 +4,7 @@ import type { SceneElement } from './semantic'
 import type { WaitResult } from './requests'
 import { captureBaseline, type DiffElement } from './diff'
 import { validateBoardId } from './boards'
-import { WAIT_MAX_S, WAIT_DEFAULT_S } from './paths'
+import { WAIT_MAX_S, WAIT_DEFAULT_S, HOME } from './paths'
 import { win, agent, currentBoardId, windowReady } from './context'
 import { takeSnapshot } from './rpc'
 import { seatRegistry, requestBoard, getSession, buildHubState, acceptScene, resolveExistingBoardId, listBoards, switchBoard, renameBoard, deleteBoard } from './boardState'
@@ -180,17 +180,20 @@ export const routes = {
     })
   },
 
-  '/wait': async (body: Record<string, unknown>) => {
+  '/wait': async (body: Record<string, unknown>, ctx?: { signal: AbortSignal }) => {
     touchSeat(body)
     const seconds = Math.min(Math.max(Number(body.timeout_s) || WAIT_DEFAULT_S, 1), WAIT_MAX_S)
     const requestId = typeof body.request_id === 'string' && body.request_id ? body.request_id : null
     const viewer = actorOf(body)
-    const boardId = requestId
-      ? (requestBoard.get(requestId) ?? currentBoardId)
-      : typeof body.board === 'string' && body.board.trim()
-        ? ((await resolveExistingBoardId(validateBoardId(body.board))) ?? validateBoardId(body.board))
-        : currentBoardId
-    const result: WaitResult = await getSession(boardId).hub.wait(requestId ? { requestId } : { inbox: true, agent: viewer }, seconds * 1000)
+    let boardId = currentBoardId
+    if (requestId) boardId = requestBoard.get(requestId) ?? currentBoardId
+    else if (typeof body.board === 'string' && body.board.trim()) {
+      const existing = await resolveExistingBoardId(validateBoardId(body.board))
+      // 等一块不存在的画板永远等不到东西：直接说清楚，并带上数据目录，方便发现连错了实例（比如残留的 FLYINGDRAWS_HOME）
+      if (!existing) throw new Error(`board "${body.board.trim()}" does not exist in the canvas whose data directory is ${HOME}. Check the board name with canvas_list; if that directory is unexpected, the FLYINGDRAWS_HOME environment variable may be pointing to another canvas instance.`)
+      boardId = existing
+    }
+    const result: WaitResult = await getSession(boardId).hub.wait(requestId ? { requestId } : { inbox: true, agent: viewer }, seconds * 1000, ctx?.signal)
     touchSeat(body)
     if (result.status === 'handoff') {
       const h = result.handoff

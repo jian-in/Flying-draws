@@ -112,6 +112,36 @@ test('passBaton 立即唤醒正在等待的目标席位，并阻止发送方自�
   assert.equal(selfRes.status, 'waiting')
 })
 
+test('等待被中止（调用方断开或取消）后立即撤下：之后递来的画笔和用户发的画留在队列里，不交给已经走掉的等待', async () => {
+  const hub = new RequestHub()
+  const abort = new AbortController()
+  const gone = hub.wait({ inbox: true, agent: '后端' }, 5000, abort.signal)
+  assert.deepEqual(hub.state().waitingAgents, ['后端'])
+
+  abort.abort()
+  assert.equal((await gone).status, 'waiting')
+  assert.deepEqual(hub.state().waitingAgents, [])
+
+  // 中止之后递来的画笔进队列，而不是被那个已经走掉的等待接走
+  assert.equal(hub.passBaton(sampleHandoff()), false)
+  const next = await hub.wait({ inbox: true, agent: '后端' }, 50)
+  assert.equal(next.status, 'handoff')
+
+  // 用户点「发给 agent」也一样：留在收件箱里
+  const abort2 = new AbortController()
+  const gone2 = hub.wait({ inbox: true, agent: null }, 5000, abort2.signal)
+  abort2.abort()
+  await gone2
+  assert.equal(hub.submit({ requestId: null, sceneJson: '{}', pngBase64: null, version: 3, note: '', at: new Date().toISOString() }), false)
+  assert.equal(hub.takeInbox().length, 1)
+
+  // 已经中止的信号直接返回，不登记等待
+  const pre = new AbortController()
+  pre.abort()
+  assert.equal((await hub.wait({ inbox: true, agent: '后端' }, 5000, pre.signal)).status, 'waiting')
+  assert.deepEqual(hub.state().waitingAgents, [])
+})
+
 test('passBaton 未立即送达时入队并可通过 takeHandoffs / wait / restore 接手', async () => {
   const hub = new RequestHub()
   const h1 = sampleHandoff({ from: '前端', to: '后端', note: '给后端的一棒' })

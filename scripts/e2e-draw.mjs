@@ -806,6 +806,31 @@ try {
       /Agent "后端" passed the brush to you: "接口补好了，请核对"/.test(readTaken) && !handoffCleared,
       '目标席位调用 canvas_read 时自动接走画笔并清除顶部交接提示'
     )
+
+    // 递画笔场景三：后端的 canvas_wait 被取消（比如在客户端按了 Esc），画布要撤下这次等待；
+    // 之后递来的画笔不能交给已经走掉的等待，要留在画板上，等后端下次来取
+    const waitingText = () => user3.js(`document.querySelector('.fd-waiting')?.textContent ?? ''`)
+    const abortWait = new AbortController()
+    const cancelledWait = client2
+      .callTool({ name: 'canvas_wait', arguments: { board: 'collab', as: '后端', timeout_s: 30, image: 'never' } }, undefined, { timeout: 120000, signal: abortWait.signal })
+      .then(() => 'finished', () => 'aborted')
+    await until(async () => /正在等你（后端）/.test((await waitingText()) ?? ''))
+    abortWait.abort()
+    const waitOutcome = await cancelledWait
+    const waiterGone = await until(async () => !/正在等你（后端）/.test((await waitingText()) ?? ''))
+    const passAfterCancel = textOf(await call('canvas_pass', { board: 'collab', as: '前端', to: '后端', note: '取消之后再递一次' }))
+    const retaken = textOf(await call2('canvas_wait', { board: 'collab', as: '后端', timeout_s: 5, image: 'never' }))
+    check(
+      waitOutcome === 'aborted' && waiterGone && /queued/.test(passAfterCancel) && /取消之后再递一次/.test(retaken),
+      'canvas_wait 被取消后画布撤下等待：之后递来的画笔留在画板上，下次等待能接到'
+    )
+
+    // 等一块不存在的画板不会无声地一直等：直接报错，并带上数据目录，方便发现连错了实例
+    const missingBoard = textOf(await call2('canvas_wait', { board: 'no-such-board-e2e', as: '后端', timeout_s: 3, image: 'never' }))
+    check(
+      /does not exist in the canvas whose data directory is .*e2e-home/.test(missingBoard),
+      'canvas_wait 等一块不存在的画板时直接报错并说明数据目录'
+    )
   } finally {
     await client2.close()
   }

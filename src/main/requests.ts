@@ -58,6 +58,7 @@ interface Waiter {
   target: WaitTarget
   resolve: (r: WaitResult) => void
   timer: ReturnType<typeof setTimeout>
+  detach: () => void // 摘掉中止监听
 }
 
 export interface HubState {
@@ -311,7 +312,9 @@ export class RequestHub {
     if (changed) this.emit()
   }
 
-  wait(target: WaitTarget, timeoutMs: number): Promise<WaitResult> {
+  // signal 中止表示等的人已经走了（连接断开或工具调用被取消）：立刻撤下，后来的画和接力棒留在队列里等下一次来取
+  wait(target: WaitTarget, timeoutMs: number, signal?: AbortSignal): Promise<WaitResult> {
+    if (signal?.aborted) return Promise.resolve({ status: 'waiting', waitingFor: 'user' })
     if ('requestId' in target) {
       const req = this.requests.get(target.requestId)
       if (!req) return Promise.resolve({ status: 'unknown_request', requestId: target.requestId })
@@ -333,15 +336,24 @@ export class RequestHub {
     }
 
     return new Promise((resolve) => {
+      const onAbort = () => {
+        if (!this.waiters.delete(waiter)) return
+        clearTimeout(waiter.timer)
+        resolve({ status: 'waiting', waitingFor: 'user' })
+        this.emit()
+      }
       const waiter: Waiter = {
         target,
         resolve,
         timer: setTimeout(() => {
           this.waiters.delete(waiter)
+          waiter.detach()
           resolve({ status: 'waiting', waitingFor: 'user' })
           this.emit()
-        }, timeoutMs)
+        }, timeoutMs),
+        detach: () => signal?.removeEventListener('abort', onAbort)
       }
+      signal?.addEventListener('abort', onAbort, { once: true })
       this.waiters.add(waiter)
       this.emit()
     })
@@ -353,6 +365,7 @@ export class RequestHub {
     for (const w of [...this.waiters]) {
       if (!match(w.target)) continue
       clearTimeout(w.timer)
+      w.detach()
       this.waiters.delete(w)
       w.resolve(result)
       woke = true

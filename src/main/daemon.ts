@@ -5,7 +5,8 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
-export type Handler = (body: Record<string, unknown>) => Promise<unknown>
+// signal 在调用方断开连接（还没收到回复就走了）时中止：长轮询靠它撤下等待，免得结果交给已经不在的人
+export type Handler = (body: Record<string, unknown>, ctx: { signal: AbortSignal }) => Promise<unknown>
 
 export interface DaemonInfo {
   port: number
@@ -88,7 +89,11 @@ export async function startDaemon(
       const handler = routes[url.pathname]
       if (!handler) throw new HttpError(404, `no route ${url.pathname}`)
       const body = await readBody(req)
-      send(200, await handler(body))
+      const aborter = new AbortController()
+      res.once('close', () => {
+        if (!res.writableFinished) aborter.abort()
+      })
+      send(200, await handler(body, { signal: aborter.signal }))
     } catch (err) {
       const status = err instanceof HttpError ? err.status : 500
       if (status === 413) res.once('finish', () => req.destroy())

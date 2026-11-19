@@ -72,7 +72,7 @@ function readInfo(): DaemonInfo | null {
 }
 
 // 用 node:http 而不是 fetch：fetch 在某些环境会读代理变量，本机请求不该走代理
-function call(info: DaemonInfo, path: string, body: unknown, timeoutMs: number): Promise<Record<string, unknown>> {
+function call(info: DaemonInfo, path: string, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<Record<string, unknown>> {
   return new Promise((resolvePromise, reject) => {
     const isGet = path === '/health'
     const data = Buffer.from(JSON.stringify(body ?? {}))
@@ -83,7 +83,8 @@ function call(info: DaemonInfo, path: string, body: unknown, timeoutMs: number):
       headers['content-length'] = data.length
     }
     const req = http.request(
-      { host: '127.0.0.1', port: info.port, path, method: isGet ? 'GET' : 'POST', headers, timeout: timeoutMs },
+      // signal：工具调用被取消时中止请求，画布那边看到连接断开就撤下这次等待
+      { host: '127.0.0.1', port: info.port, path, method: isGet ? 'GET' : 'POST', headers, timeout: timeoutMs, signal },
       (res) => {
         const chunks: Buffer[] = []
         res.on('data', (c: Buffer) => chunks.push(c))
@@ -531,7 +532,7 @@ async function ensureDaemon(): Promise<DaemonInfo> {
 
 const BRIDGE_ID = randomUUID()
 
-async function daemon(path: string, body: unknown, timeoutMs = 15_000): Promise<Record<string, unknown>> {
+async function daemon(path: string, body: unknown, timeoutMs = 15_000, signal?: AbortSignal): Promise<Record<string, unknown>> {
   const info = await ensureDaemon()
   const agent = clientAgentName()
   const payload =
@@ -543,7 +544,7 @@ async function daemon(path: string, body: unknown, timeoutMs = 15_000): Promise<
           ...(body as Record<string, unknown>)
         }
       : body
-  return call(info, path, payload, timeoutMs)
+  return call(info, path, payload, timeoutMs, signal)
 }
 
 type Content = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
@@ -776,9 +777,9 @@ server.registerTool(
       image: imageSchema
     }
   },
-  ({ request_id, board, as, timeout_s, format, image }) => guarded(async () => {
+  ({ request_id, board, as, timeout_s, format, image }, extra) => guarded(async () => {
     const wait = timeout_s ?? 40
-    const res = await daemon('/wait', { request_id, board, as: rememberSeat(as), timeout_s: wait, format: format ?? 'summary', image: image ?? 'auto' }, (wait + 10) * 1000)
+    const res = await daemon('/wait', { request_id, board, as: rememberSeat(as), timeout_s: wait, format: format ?? 'summary', image: image ?? 'auto' }, (wait + 10) * 1000, extra.signal)
     switch (res.status) {
       case 'submitted': {
         const note = res.note ? `The user's note: "${res.note}"` : 'The user added no note.'
