@@ -59,6 +59,9 @@ export default function App() {
   const [creating, setCreating] = useState(false)
   const [renaming, setRenaming] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  // Excalidraw 的查看模式（右键菜单可开关）：自己的「重置画布」菜单项和自带的一样，查看模式下不显示
+  const [viewMode, setViewMode] = useState(false)
+  const viewModeRef = useRef(false)
   const [hub, setHub] = useState<HubState>({ pending: [], agentWaiting: false, waitingAgents: [], inbox: 0, inboxTargets: [], handoff: null })
   const [toast, setToast] = useState<string | null>(null)
   const [filter, setFilter] = useState<AuthorFilter>('all')
@@ -323,6 +326,9 @@ export default function App() {
   const clearCanvas = useCallback(() => {
     const current = apiRef.current
     if (!current) return
+    // 和自带的清空一样：查看模式下、正在选元素链接时不能重置
+    const state = current.getAppState()
+    if (state.viewModeEnabled || state.openDialog?.name === 'elementLinkSelector') return
     if (!window.confirm('重置画布会清空所有内容，背景回到默认的纸色（可以撤销）。继续吗？')) return
     current.updateScene({
       elements: current.getSceneElementsIncludingDeleted().map((el) => (el.isDeleted ? el : newElementWith(el, { isDeleted: true }))),
@@ -380,6 +386,10 @@ export default function App() {
     (elements, appState, files) => {
       // Excalidraw 载入完成后才会调 onChange：这时把载入前藏起的画布放出来
       if ('fdLoading' in document.documentElement.dataset) revealCanvas()
+      if (appState.viewModeEnabled !== viewModeRef.current) {
+        viewModeRef.current = appState.viewModeEnabled
+        setViewMode(appState.viewModeEnabled)
+      }
       // 横幅和弹窗画在 Excalidraw 外面，要自己跟着它的深浅色走
       if (document.documentElement.dataset.fdTheme !== appState.theme) {
         document.documentElement.dataset.fdTheme = appState.theme
@@ -837,7 +847,7 @@ export default function App() {
           <MainMenu.DefaultItems.SaveAsImage />
           <MainMenu.DefaultItems.SearchMenu />
           <MainMenu.DefaultItems.Help />
-          <MainMenu.Item onSelect={clearCanvas}>重置画布</MainMenu.Item>
+          {viewMode ? null : <MainMenu.Item onSelect={clearCanvas}>重置画布</MainMenu.Item>}
           <MainMenu.Separator />
           <MainMenu.DefaultItems.ToggleTheme />
           <MainMenu.DefaultItems.ChangeCanvasBackground />
