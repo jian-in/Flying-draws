@@ -139,11 +139,8 @@ export async function snapshot(
   return { sceneJson, pngBase64, view: visibleArea(appState), selectedIds }
 }
 
-// 画布默认是淡黄的纸色。用户自己换过背景色的画板不动，只把还是默认白底的换掉。
-export const PAPER_COLOR = '#fffbe6'
-
-export const paperOr = (color: unknown): string =>
-  typeof color === 'string' && color && color.toLowerCase() !== '#ffffff' ? color : PAPER_COLOR
+// 纸色和背景色的恢复规则放在 shared/paper.ts，主进程新建画板时也要用
+export { PAPER_COLOR, paperOr, boardBackground } from '../../../shared/paper'
 
 export const USER_BUSY_WAIT_MS = 10_000
 

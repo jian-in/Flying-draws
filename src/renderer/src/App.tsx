@@ -10,7 +10,7 @@ import { LIBRARY_CALLBACK_URL } from '../../shared/library'
 import { hasUnsafeCustomData, sanitizeElement, sanitizeScene } from '../../shared/sanitizeScene'
 import { scenePrefsKey } from '../../shared/scenePrefs'
 import type { OnChange, SceneArgs, Api, HiddenMap, AuthorFilter, SeatEntry, SkeletonList, SceneEl, Loose } from './canvas/types'
-import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, paperOr, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
+import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, paperOr, boardBackground, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
 import { extractSeats, isDynamicSeats, seatsKeyOf, applyAuthorFilter } from './canvas/filters'
 import { applyPlan } from './canvas/applyPlan'
 import { resolveProposal } from './canvas/proposal'
@@ -22,7 +22,8 @@ type Status =
   | { kind: 'saved'; path: string; version: number; savedAt: string }
   | { kind: 'error'; message: string }
 
-const EXCALIDRAW_UI_OPTIONS = { canvasActions: { loadScene: false } } // 打开文件由 importSceneFile 接管（CVE-2026-97224）
+// 打开文件由 importSceneFile 接管（CVE-2026-97224）；重置画布由 clearCanvas 接管（背景回到纸色，而不是 Excalidraw 默认的纯白）
+const EXCALIDRAW_UI_OPTIONS = { canvasActions: { loadScene: false, clearCanvas: false } }
 // 摘掉 public/theme-boot.js 标上的 data-fd-loading，放出载入前藏起的画布
 const revealCanvas = (): void => {
   delete document.documentElement.dataset.fdLoading
@@ -103,7 +104,9 @@ export default function App() {
         setBoardInfo({ board: res.board, title: res.title })
         setBoards(res.boards)
         setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
-        const scene = res.json ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }).scene : {}
+        const scene = res.json
+          ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; flyingdraws?: unknown }).scene
+          : {}
         // .excalidraw 里不存 theme，以主进程记下的为准
         const initTheme = res.theme ?? (scene.appState?.theme === 'dark' ? 'dark' : 'light')
         document.documentElement.dataset.fdTheme = initTheme
@@ -114,7 +117,8 @@ export default function App() {
         const initPlaced = extractPlacedResults(scene.elements ?? [])
         lastPlacedKeyRef.current = initPlaced.join('|')
         setPlacedResultIds(new Set(initPlaced))
-        return { ...scene, appState: { ...scene.appState, theme: initTheme, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
+        const viewBackgroundColor = boardBackground(scene.appState?.viewBackgroundColor, 'flyingdraws' in scene ? scene.flyingdraws : undefined)
+        return { ...scene, appState: { ...scene.appState, theme: initTheme, viewBackgroundColor } }
       })
       .catch((err) => {
         setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
@@ -192,7 +196,9 @@ export default function App() {
         timer.current = null
       }
       const parsed = res.json
-        ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; files?: Record<string, unknown> }).scene
+        ? sanitizeScene(
+            JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; files?: Record<string, unknown>; flyingdraws?: unknown }
+          ).scene
         : null
       const nextElements = parsed?.elements ?? []
       lastSavedVersion.current = elementsVersion(nextElements)
@@ -215,7 +221,7 @@ export default function App() {
       }
       const nextAppState: Record<string, unknown> = { ...parsed?.appState }
       delete nextAppState.collaborators
-      nextAppState.viewBackgroundColor = paperOr(nextAppState.viewBackgroundColor)
+      nextAppState.viewBackgroundColor = boardBackground(nextAppState.viewBackgroundColor, parsed?.flyingdraws)
       currentApi.updateScene({
         elements: nextElements,
         appState: nextAppState as unknown as Parameters<Api['updateScene']>[0]['appState'],
@@ -296,6 +302,18 @@ export default function App() {
   }, [])
   const isSceneFile = (file: File): boolean =>
     /\.excalidraw$/i.test(file.name) || file.type === 'application/vnd.excalidraw+json' || /\.json$/i.test(file.name)
+  // 自己接管「重置画布」：Excalidraw 自带的会把背景重置成纯白，而存下来的纯白现在会原样恢复，
+  // 重置一次就再也回不到默认的纸色。这里删掉所有元素、背景回到纸色，和自带的一样可以撤销。
+  const clearCanvas = useCallback(() => {
+    const current = apiRef.current
+    if (!current) return
+    if (!window.confirm('重置画布会清空所有内容，背景回到默认的纸色（可以撤销）。继续吗？')) return
+    current.updateScene({
+      elements: current.getSceneElementsIncludingDeleted().map((el) => (el.isDeleted ? el : newElementWith(el, { isDeleted: true }))),
+      appState: { viewBackgroundColor: PAPER_COLOR, selectedElementIds: {} },
+      captureUpdate: CaptureUpdateAction.IMMEDIATELY
+    })
+  }, [])
   const openSceneFile = useCallback(() => {
     const input = document.createElement('input')
     input.type = 'file'
@@ -789,7 +807,7 @@ export default function App() {
           <MainMenu.DefaultItems.SaveAsImage />
           <MainMenu.DefaultItems.SearchMenu />
           <MainMenu.DefaultItems.Help />
-          <MainMenu.DefaultItems.ClearCanvas />
+          <MainMenu.Item onSelect={clearCanvas}>重置画布</MainMenu.Item>
           <MainMenu.Separator />
           <MainMenu.DefaultItems.ToggleTheme />
           <MainMenu.DefaultItems.ChangeCanvasBackground />
