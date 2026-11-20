@@ -12,6 +12,12 @@ export interface ProviderDraft {
   max_tokens: number
   vision: boolean
 }
+/** 设置面板拉取模型列表用：只带端点需要的字段，不带其它设置 */
+export interface ProviderModelQuery {
+  protocol: ProviderDraft['protocol']
+  base_url: string
+  credential: string
+}
 export interface AgentCapture {
   sceneJson: string
   pngBase64: string | null
@@ -203,6 +209,8 @@ export interface AgentApi {
   state(): Promise<AgentState>
   connect(board: string): Promise<void>
   configure(draft: ProviderDraft): Promise<void>
+  /** 从服务商拉取可选模型 ID；只读请求，不发任务 */
+  models(query: ProviderModelQuery): Promise<string[]>
   selectModel(provider: string, model: string): Promise<void>
   setApprovalMode(mode: ApprovalMode): Promise<void>
   chooseWorkspace(board: string): Promise<string | null>

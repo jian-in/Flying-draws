@@ -3,6 +3,7 @@ import type { IpcGuard } from './ipcGuard'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { AgentService } from './agent'
+import { listProviderModels, type CatalogDraft } from './modelCatalog'
 import { AGENT_SEAT, type AgentSubmission, type ProviderDraft } from '../shared/agent'
 
 export function registerAgent(home: string, window: () => BrowserWindow | null, board: () => string, ipc: IpcGuard): AgentService {
@@ -37,6 +38,13 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
     return service.connect(requestedBoard)
   })
   ipc.handle('agent:configure', (_event, draft: ProviderDraft) => service.configure(draft))
+  // 设置面板「拉取模型」用：只读一次服务商的模型列表，不经内核、不发任务
+  ipc.handle('agent:models', (_event, query: CatalogDraft) => {
+    if (!query || typeof query !== 'object') throw new Error('参数无效')
+    if (typeof query.base_url !== 'string' || query.base_url.length > 2048) throw new Error('服务地址无效')
+    if (typeof query.credential !== 'string' || query.credential.length > 4096) throw new Error('凭据无效')
+    return listProviderModels(query)
+  })
   ipc.handle('agent:model', (_event, provider: string, model: string) => service.selectModel(provider, model))
   ipc.handle('agent:approval-mode', (_event, mode: 'auto-safe' | 'full-access') => service.setApprovalMode(mode))
   ipc.handle('agent:workspace', async (_event, requestedBoard: string) => {

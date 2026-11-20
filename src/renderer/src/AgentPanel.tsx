@@ -42,6 +42,12 @@ const DEFAULT_PRESET: PresetId = 'deepseek-flash'
 function urlOrigin(value: string): string | null {
   try { return new URL(value).origin } catch { return null }
 }
+/** Electron 的 invoke 失败会把「Error invoking remote method …」前缀带进来，面板只显示正文 */
+function readableIpcError(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error)
+  const tail = text.replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, '').trim()
+  return tail || '拉取失败'
+}
 
 const BASE_URL_PLACEHOLDER: Record<ProviderDraft['protocol'], string> = {
   'openai-compatible': 'https://api.deepseek.com/v1',
@@ -89,6 +95,10 @@ export function AgentPanel({
   const [settings, setSettings] = useState(false)
   const [preset, setPreset] = useState<PresetId>(DEFAULT_PRESET)
   const [provider, setProvider] = useState<ProviderDraft>(PROVIDER_PRESETS[DEFAULT_PRESET].draft)
+  // 设置面板里「拉取模型列表」的结果：只用于把服务商返回的 ID 填进模型输入框
+  const [modelList, setModelList] = useState<string[]>([])
+  const [modelsBusy, setModelsBusy] = useState(false)
+  const [modelsError, setModelsError] = useState<string | null>(null)
   const [previewSrc, setPreviewSrc] = useState<{ src: string; alt: string } | null>(null)
   const [confirmYolo, setConfirmYolo] = useState(false)
   const yolo = state.approvalMode === 'full-access'
@@ -230,6 +240,29 @@ export function AgentPanel({
     catch (error) { setError(error instanceof Error ? error.message : '操作失败'); return false }
     finally { setWorking(false) }
   }
+  async function fetchModels() {
+    if (!provider.base_url.trim() || !provider.credential.trim()) {
+      setModelsError('先填服务地址和 API Key，再拉取模型列表')
+      return
+    }
+    setModelsBusy(true)
+    setModelsError(null)
+    try {
+      const list = await api.models({
+        protocol: provider.protocol,
+        base_url: provider.base_url.trim(),
+        credential: provider.credential.trim()
+      })
+      setModelList(list)
+      setModelsError(list.length ? null : '服务商没有返回任何模型，模型 ID 需要手填')
+    } catch (error) {
+      setModelList([])
+      setModelsError(readableIpcError(error))
+    } finally {
+      setModelsBusy(false)
+    }
+  }
+
   async function send() {
     if (!goal.trim() || disabled) return
     const text = goal
@@ -302,6 +335,8 @@ export function AgentPanel({
             setPreset(id)
             // 换服务商时清掉已填的密钥，免得把一家的密钥发给另一家的地址
             setProvider({ ...PROVIDER_PRESETS[id].draft })
+            setModelList([])
+            setModelsError(null)
           }}>
             {(Object.keys(PROVIDER_PRESETS) as PresetId[]).map(id => <option key={id} value={id}>{PROVIDER_PRESETS[id].label}</option>)}
           </select></label>
@@ -315,9 +350,22 @@ export function AgentPanel({
             if (urlOrigin(base_url) === urlOrigin(provider.base_url)) { setProvider({ ...provider, base_url }); return }
             setProvider({ ...provider, base_url, credential: '' })
             setPreset('custom')
+            setModelList([])
+            setModelsError(null)
           }} /></label>
           <label>API Key<input required type="password" autoComplete="off" spellCheck={false} placeholder="密钥，或 env:变量名" value={provider.credential} onChange={e => setProvider({ ...provider, credential: e.target.value })} /></label>
           <label>模型 ID<input required placeholder="服务商提供的模型 ID" value={provider.model} onChange={e => setProvider({ ...provider, model: e.target.value })} /></label>
+          <div className="fd-agent-models">
+            <button type="button" disabled={modelsBusy} onClick={() => void fetchModels()}>{modelsBusy ? '拉取中…' : '拉取模型列表'}</button>
+            {modelList.length ? <select aria-label="服务商返回的模型" value={modelList.includes(provider.model) ? provider.model : ''} onChange={e => {
+              const id = e.target.value
+              if (id) setProvider({ ...provider, model: id })
+            }}>
+              <option value="">选一个填进模型 ID（共 {modelList.length} 个）</option>
+              {modelList.map(id => <option key={id} value={id}>{id}</option>)}
+            </select> : null}
+            {modelsError ? <p className="fd-agent-error" role="alert">{modelsError}</p> : null}
+          </div>
           <label className="fd-agent-check"><input type="checkbox" checked={provider.vision} onChange={e => setProvider({ ...provider, vision: e.target.checked })} />该模型支持图片输入</label>
           <details><summary>上下文与输出上限</summary><div className="fd-agent-limits">
             <label>上下文 tokens<input type="number" min={4096} max={2000000} value={provider.context_window} onChange={e => setProvider({ ...provider, context_window: Number(e.target.value) })} /></label>
