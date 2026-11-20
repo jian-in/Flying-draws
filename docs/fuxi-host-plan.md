@@ -17,20 +17,21 @@
 
 响应：`{ id, result }` 或 `{ id, error: { code: string, message: string } }`。
 
-事件：`{ type: 'event', seq, run_id: string|null, req: number|null, schema_version, event, data }`。`event/data` 复用 Fuxi `event_json`。启动失败可发 `{type:'fatal',message}` 后退出。
+事件：`{ type: 'event', seq, run_id: string|null, req: number|null, schema_version, event, data }`。`event/data` 复用 Fuxi `event_json`。启动失败可发 `{type:'fatal',message}` 后退出。`schema_version` 是保留字段：客户端不校验它，协议版本只认 `initialize` 返回的 `protocol`。
 
 | 方法 | params / result |
 | --- | --- |
 | `initialize` | `{protocol:1,client:{name,version}}` → `{protocol:1,fuxi_version,schema_version,capabilities:{images:true,plan:true,resume:true}}` |
-| `workspace.open` | `{cwd,session_id?,new_session?,mcp_servers?}` → `{session_id,provider,model,choices,setup_needed,vision,approval_mode,history_len,tools}`；MCP map 与 `McpServerConfig` 同形，只在当前宿主运行中生效。`tools` 为 `[{name,label}]`，只列内核里编号命名的工具（MCP 为 `server/原名`），供界面显示可读名称。MCP 工具声明 `annotations.readOnlyHint: true` 时，规划等只读模式也可调用，但仍需逐次审批；画布桥接的 `canvas_read`、`canvas_list` 带此标记 |
+| `workspace.open` | `{cwd,session_id?,new_session?,mcp_servers?,approval_mode?}` → `{session_id,provider,model,choices,setup_needed,vision,approval_mode,history_len,tools}`；`approval_mode` 为 `'auto-safe'\|'full-access'`，客户端开会话时带上当前选择，内核据此决定哪些工具调用需要逐次审批。MCP map 与 `McpServerConfig` 同形，只在当前宿主运行中生效。`tools` 为 `[{name,label}]`，只列内核里编号命名的工具（MCP 为 `server/原名`），供界面显示可读名称。MCP 工具声明 `annotations.readOnlyHint: true` 时，规划等只读模式也可调用，但仍需逐次审批；画布桥接的 `canvas_read`、`canvas_list` 带此标记 |
 | `provider.add` | 原 `ProviderRegistration` 字段，协议用配置名字符串 → accepted，实际结果 `provider_setup` 事件 |
 | `provider.switch` | `{provider,model?}` → accepted，实际结果 `provider_switched` / `provider_switch_failed` |
-| `session.list/open/new` | 原 AgentCommand，切会话回执沿原事件；`session.open` 用 `{session_id}` |
-| `run.start` | `{run_id,mode:'direct'|'plan',text,images:[{media_type,data}]}` → 立即 `{accepted:true}` |
+| `session.set_approval_mode` | `{mode:'auto-safe'\|'full-access'}` → `{mode}`；内核已连上时当场生效，进行中的任务从下一个工具调用起生效，结果另回 `approval_mode_changed` 事件 |
+| 会话切换 | 客户端不调用 `session.list/open/new`；切会话统一走 `workspace.open`：带 `session_id` 续用已有会话，带 `new_session:true` 新建 |
+| `run.start` | `{run_id,mode:'direct'\|'plan',text,images:[{media_type,data}]}` → 立即 `{accepted:true}` |
 | `run.execute_plan` | `{run_id,text}` → 立即 accepted；执行控制器持有的原计划，text 仅作用户补充 |
 | `run.resume` | `{run_id,task_id,text,images?}` → 立即 accepted；只恢复未完成 task |
 | `run.cancel` | `{run_id}` → `{cancelled:true}` |
-| `approval.respond` | `{request_id,decision:'approve'|'reject',reason?}` → `{delivered:true}`，必须按 request_id scoped |
+| `approval.respond` | `{request_id,decision:'approve'\|'reject',reason?}` → `{delivered:true}`，必须按 request_id scoped |
 | `shutdown` | 取消活动任务、尽力落盘并退出 |
 
 单 Agent 忙时拒绝其它任务和配置请求，`run.cancel` / `approval.respond` 走旁路。所有 MCP 工具首版沿原审批，不根据可伪造文字自动放行。首轮图片直接附加，不依赖先调 MCP。
@@ -43,7 +44,7 @@
 
 画板改名迁移工作项并作废计划，删除画板归档工作项；重建同名画板不复用历史会话。历史工作目录丢失时保留记录，回退到应用工作区并新建会话，界面显示提示。结果图片以哈希命名、原子写入，放回画布时保留作者筛选和删除标记。
 
-输入绑定画板版本、选中元素的稳定 ID、结构摘要和 PNG。无选区时使用当前画板。模型不支持视觉时明确显示只发送结构。隐藏作者筛选不改变真实上下文。原画布 MCP 保留，内置 Agent 通过同一通路读写和提议。
+输入不声明画板版本——结构摘要里的版本号恒为 v0，不绑定真实画板版本，只绑定选中元素的稳定 ID、结构摘要和 PNG；agent 需要版本时用 `canvas_read` 取当前 `base_version`。无选区时使用当前画板。模型不支持视觉时明确显示只发送结构。隐藏作者筛选不改变真实上下文。原画布 MCP 保留，内置 Agent 通过同一通路读写和提议。
 
 ## 可检查交付
 
