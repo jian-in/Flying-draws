@@ -205,10 +205,8 @@ export async function listBoards(): Promise<BoardInfo[]> {
     const active = sameBoardOnDisk(id, currentBoardId)
     if (active && id !== currentBoardId) setCurrentBoardId(id)
   }
-  // 并行读，没改过的画板直接用缓存，不再整份读出来解析
-  const files = diskIds.map((id) => boardFilePath(BOARDS_DIR, id))
-  const metas = await Promise.all(diskIds.map((id, i) => boardMetaCache.read(id, files[i]).catch(() => null)))
-  boardMetaCache.retain(files)
+  // 限并发地读，没改过的画板直接用缓存，不再整份读出来解析
+  const metas = await boardMetaCache.readAll(diskIds.map((id) => ({ id, file: boardFilePath(BOARDS_DIR, id) })))
   metas.forEach((meta, i) => {
     if (meta) items.push({ ...meta, active: diskIds[i] === currentBoardId })
   })
