@@ -1,5 +1,5 @@
 // 多画板会话状态、画板读写、切换/重命名/删除，以及待确认请求的存盘恢复。
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { readdir, readFile, rename, unlink } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import type { SceneElement } from './semantic'
@@ -9,7 +9,9 @@ import { nextSeatColor, SeatRegistry } from './seats'
 import { atomicWriteJson } from './atomicWrite'
 import { BoardMetaCache } from './boardMetaCache'
 import { BOARD_EXT, DEFAULT_BOARD_ID, boardFilePath, emptyBoardScene, isValidBoardId, matchExistingBoardId, normalizeBoardId, normalizeBoardTitle, pickFallbackBoard, sameBoardOnDisk, updateBoardSceneTitle, validateBoardId, type BoardMeta } from './boards'
-import { HOME, BOARDS_DIR, legacyM0Path, pendingPath, statePath } from './paths'
+import { BOARDS_DIR, legacyM0Path, pendingPath, statePath } from './paths'
+import { patchAppStateFile } from './appStateFile'
+import { scenePrefsKey } from '../shared/scenePrefs'
 import { win, agent, currentBoardId, setCurrentBoardId } from './context'
 import { rpc, takeSnapshot } from './rpc'
 
@@ -24,6 +26,7 @@ export interface BoardSession {
   title: string | null
   version: number
   lastElementsKey: string | null
+  lastPrefsKey: string | null
   hub: RequestHub
   history: Map<number, VersionRecord>
   seats: Map<string, string>
@@ -42,8 +45,7 @@ const boardMetaCache = new BoardMetaCache()
 
 export function persistCurrentBoard(): void {
   try {
-    mkdirSync(HOME, { recursive: true })
-    writeFileSync(statePath, JSON.stringify({ currentBoard: currentBoardId }), 'utf8')
+    patchAppStateFile(statePath, { currentBoard: currentBoardId })
   } catch (err) {
     console.error('[flyingdraws] could not save active board:', err)
   }
@@ -58,6 +60,7 @@ export function getSession(id: string): BoardSession {
       title: null,
       version: 0,
       lastElementsKey: null,
+      lastPrefsKey: null,
       hub,
       history: new Map(),
       seats: new Map(),
@@ -144,12 +147,14 @@ export async function loadBoard(id = currentBoardId): Promise<{ board: string; t
     session.version = Number(scene?.flyingdraws?.version) || 1
     session.title = typeof scene?.flyingdraws?.title === 'string' && scene.flyingdraws.title.trim() ? scene.flyingdraws.title.trim() : null
     session.lastElementsKey = elementsKey(scene.elements ?? [])
+    session.lastPrefsKey = scenePrefsKey(scene.appState)
     syncBoardSeats(id, (scene.elements ?? []) as SceneElement[])
     return { board: id, title: session.title, version: session.version, json, path }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       session.version = 0
       session.lastElementsKey = null
+      session.lastPrefsKey = null
       session.drawnAgents = new Set()
       return { board: id, title: session.title, version: session.version, json: null, path }
     }
@@ -164,11 +169,25 @@ export async function acceptScene(json: string, id = currentBoardId): Promise<nu
   const scene = JSON.parse(json)
   syncBoardSeats(id, (scene.elements ?? []) as SceneElement[])
   const key = elementsKey(scene.elements ?? [])
-  if (key === session.lastElementsKey) return session.version
-  session.lastElementsKey = key
-  session.version += 1
-  scene.flyingdraws = { version: session.version, ...(session.title ? { title: session.title } : {}) }
+  const prefs = scenePrefsKey(scene.appState)
+  if (key === session.lastElementsKey) {
+    if (prefs === session.lastPrefsKey) return session.version
+    // 只改了背景色、网格这类画布设置：照样落盘，但不升版本号，免得 agent 手里的 base_version 白白失效
+    scene.flyingdraws = { version: session.version, ...(session.title ? { title: session.title } : {}) }
+    await atomicWriteJson(path, scene)
+    // 写成功才记下；写失败时下一次同样的设置还会再存，不会被当成已存过跳掉
+    session.lastPrefsKey = prefs
+    saveCount += 1
+    return session.version
+  }
+  // 版本号和两个指纹都等写盘成功再提交：写失败时内存和磁盘保持一致，下一次同样的内容照样落盘。
+  // 各个写入口都在 serialized() 里排队，这里不会有两次 acceptScene 交错。
+  const nextVersion = session.version + 1
+  scene.flyingdraws = { version: nextVersion, ...(session.title ? { title: session.title } : {}) }
   await atomicWriteJson(path, scene)
+  session.version = nextVersion
+  session.lastElementsKey = key
+  session.lastPrefsKey = prefs
   saveCount += 1
   if (id === currentBoardId) pushHubState()
   return session.version

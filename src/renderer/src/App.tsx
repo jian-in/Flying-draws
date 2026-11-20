@@ -8,6 +8,7 @@ import { AgentPanel } from './AgentPanel'
 import { AGENT_SEAT } from '../../shared/agent'
 import { LIBRARY_CALLBACK_URL } from '../../shared/library'
 import { hasUnsafeCustomData, sanitizeElement, sanitizeScene } from '../../shared/sanitizeScene'
+import { scenePrefsKey } from '../../shared/scenePrefs'
 import type { OnChange, SceneArgs, Api, HiddenMap, AuthorFilter, SeatEntry, SkeletonList, SceneEl, Loose } from './canvas/types'
 import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, paperOr, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
 import { extractSeats, isDynamicSeats, seatsKeyOf, applyAuthorFilter } from './canvas/filters'
@@ -22,6 +23,10 @@ type Status =
   | { kind: 'error'; message: string }
 
 const EXCALIDRAW_UI_OPTIONS = { canvasActions: { loadScene: false } } // 打开文件由 importSceneFile 接管（CVE-2026-97224）
+// 摘掉 public/theme-boot.js 标上的 data-fd-loading，放出载入前藏起的画布
+const revealCanvas = (): void => {
+  delete document.documentElement.dataset.fdLoading
+}
 
 export default function App() {
   const [agentOpen, setAgentOpen] = useState(false)
@@ -99,7 +104,8 @@ export default function App() {
         setBoards(res.boards)
         setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
         const scene = res.json ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }).scene : {}
-        const initTheme = scene.appState?.theme === 'dark' ? 'dark' : 'light'
+        // .excalidraw 里不存 theme，以主进程记下的为准
+        const initTheme = res.theme ?? (scene.appState?.theme === 'dark' ? 'dark' : 'light')
         document.documentElement.dataset.fdTheme = initTheme
         window.flyingdraws.setTheme(initTheme)
         const info = extractSeats(scene.elements ?? [])
@@ -108,16 +114,21 @@ export default function App() {
         const initPlaced = extractPlacedResults(scene.elements ?? [])
         lastPlacedKeyRef.current = initPlaced.join('|')
         setPlacedResultIds(new Set(initPlaced))
-        return { ...scene, appState: { ...scene.appState, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
+        return { ...scene, appState: { ...scene.appState, theme: initTheme, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
       })
       .catch((err) => {
         setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
-        return { elements: [], appState: { viewBackgroundColor: PAPER_COLOR } }
+        // 载入失败也沿用 index.html 按地址设好的深浅色，别让默认的浅色经 onChange 写回 state.json
+        const theme: 'dark' | 'light' = document.documentElement.dataset.fdTheme === 'dark' ? 'dark' : 'light'
+        return { elements: [], appState: { theme, viewBackgroundColor: PAPER_COLOR } }
       })
+      // 兜底：万一载入后迟迟没有 onChange，也别让画布一直藏着
+      .finally(() => setTimeout(revealCanvas, 1000))
   )
 
   const latest = useRef<SceneArgs | null>(null)
   const lastSavedVersion = useRef<number | null>(null)
+  const lastSavedPrefs = useRef<string | null>(null) // 背景色、网格这类不改元素版本的设置
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const apiRef = useRef<Api | null>(null)
   apiRef.current = api
@@ -185,6 +196,7 @@ export default function App() {
         : null
       const nextElements = parsed?.elements ?? []
       lastSavedVersion.current = elementsVersion(nextElements)
+      lastSavedPrefs.current = null
       latest.current = null
       boardIdRef.current = res.board
       sceneEpoch.current += 1
@@ -249,6 +261,7 @@ export default function App() {
         return
       }
       lastSavedVersion.current = elementsVersion(elements)
+      lastSavedPrefs.current = scenePrefsKey(appState)
       setStatus({ kind: 'saved', path: res.path, version: res.version, savedAt: res.savedAt })
     } catch (err) {
       setStatus({ kind: 'error', message: String(err) })
@@ -268,10 +281,11 @@ export default function App() {
       if (scene.files && Object.keys(scene.files).length > 0) {
         current.addFiles(Object.values(scene.files))
       }
-      const { viewBackgroundColor, theme, gridModeEnabled, name } = scene.appState
+      // 不带 theme：.excalidraw 里不存深浅色，导入恢复出来的总是 light，带上会把用户的深色冲掉并记进 state.json
+      const { viewBackgroundColor, gridModeEnabled, name } = scene.appState
       current.updateScene({
         elements: scene.elements,
-        appState: { viewBackgroundColor: paperOr(viewBackgroundColor), theme, gridModeEnabled, name },
+        appState: { viewBackgroundColor: paperOr(viewBackgroundColor), gridModeEnabled, name },
         captureUpdate: CaptureUpdateAction.IMMEDIATELY
       })
       current.scrollToContent(undefined, { fitToContent: true })
@@ -316,6 +330,8 @@ export default function App() {
 
   const onChange = useCallback<OnChange>(
     (elements, appState, files) => {
+      // Excalidraw 载入完成后才会调 onChange：这时把载入前藏起的画布放出来
+      if ('fdLoading' in document.documentElement.dataset) revealCanvas()
       // 横幅和弹窗画在 Excalidraw 外面，要自己跟着它的深浅色走
       if (document.documentElement.dataset.fdTheme !== appState.theme) {
         document.documentElement.dataset.fdTheme = appState.theme
@@ -341,6 +357,10 @@ export default function App() {
         }
       }
       latest.current = [elements, appState, files]
+      // 只换了背景色、开关了网格：元素版本不变，下面那条路径认不出来，单独排一次保存
+      const prefs = scenePrefsKey(appState)
+      if (lastSavedPrefs.current === null) lastSavedPrefs.current = prefs
+      else if (prefs !== lastSavedPrefs.current && !timer.current) timer.current = setTimeout(() => void save(), SAVE_DELAY_MS)
       const elementsChanged = elements !== prevElementsRef.current
       const selectionChanged = appState.selectedElementIds !== prevSelectedIdsRef.current
       prevElementsRef.current = elements
