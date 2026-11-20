@@ -89,7 +89,15 @@ Agent 想改画布时，可以先用 `canvas_propose` 把改动画成半透明�
 
 ## 安装和运行
 
-还没有打包好的桌面版可以下载，目前需要从源码运行。
+### 下载桌面版（Windows x64）
+
+到 [Releases](https://github.com/jian-in/Flying-draws/releases/latest) 下载 `Flying-draws-win32-x64.zip`，解压到任意目录，运行里面的 `Flying draws.exe`。包里已带 Electron 和 Fuxi 内核，不用装 Node.js。
+
+- exe 没有代码签名，第一次运行时 Windows 可能提示「Windows 已保护你的电脑」，点「更多信息」→「仍要运行」。
+- 内置 Agent 用 git 记录每一轮的改动；没装 git 的话，改动只能按工具记录粗略统计。
+- 接入外部 Agent 时仍需要本机装 Node.js，见下面的[接入外部 Agent](#接入外部-agent)。
+
+### 从源码运行
 
 需要：
 
@@ -113,11 +121,17 @@ ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
 
 ### 接入外部 Agent
 
-构建后运行向导，它会打印各个客户端的接入命令，路径已经替你填好：
+MCP 桥接是一个 Node 脚本，需要本机装 Node.js 20.19 或更高。运行向导，它会打印各个客户端的接入命令，路径已经替你填好：
 
 ```bash
+# 从源码运行：先构建，再在仓库根目录执行
 node out/bridge/index.js setup
+
+# 用下载的桌面版：桥接在解压目录里，会自动找到同一个包里的 Flying draws.exe
+node "<解压目录>\resources\app\out\bridge\index.js" setup
 ```
+
+下面的命令都以源码目录为例，用桌面版时把 `out/bridge/index.js` 换成解压目录里的那个路径。
 
 只看某一个客户端（`claude`、`cursor`、`codex`、`antigravity`）：
 
