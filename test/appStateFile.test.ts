@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -17,6 +17,7 @@ test('state.json 合并写入：写当前画板不会冲掉深浅色，反之亦
     assert.equal(patchAppStateFile(path, { theme: 'dark' }), false, '没变就不写')
     assert.equal(patchAppStateFile(path, { currentBoard: 'default' }), true)
     assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), { theme: 'dark', currentBoard: 'default' })
+    assert.deepEqual(readdirSync(join(dir, 'nested')), ['state.json'], '先写临时文件再改名，不留临时文件')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

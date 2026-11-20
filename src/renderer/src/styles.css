@@ -347,6 +347,11 @@ body {
   --fd-backdrop: rgba(70, 58, 20, 0.28);
 }
 
+/* 画板载入前先藏起 Excalidraw：它会先按默认白底画一帧（public/theme-boot.js 标上，App.tsx 载入完摘掉） */
+:root[data-fd-loading] .excalidraw {
+  visibility: hidden;
+}
+
 :root[data-fd-theme='dark'] {
   color-scheme: dark;
   --fd-ink: #e9e2c8;

@@ -160,13 +160,12 @@ export function createWindow(): void {
   ipc.on('window:theme', (_e, theme: unknown) => {
     if (overlayTarget.isDestroyed()) return
     const next = theme === 'dark' ? 'dark' : 'light'
-    if (next !== savedTheme) {
-      setSavedTheme(next)
-      try {
-        patchAppStateFile(statePath, { theme: next })
-      } catch (err) {
-        console.error('[flyingdraws] could not save theme:', err)
-      }
+    setSavedTheme(next)
+    // 去重交给 patchAppStateFile 按文件内容判断：上次写失败的话，同样的值这次还会再写
+    try {
+      patchAppStateFile(statePath, { theme: next })
+    } catch (err) {
+      console.error('[flyingdraws] could not save theme:', err)
     }
     const colors = TITLEBAR_COLORS[next]
     // 只有 Windows 和 Linux 上能改这几个按钮的颜色
@@ -183,7 +182,8 @@ export function createWindow(): void {
     if (!overlayTarget.isDestroyed()) {
       rejectPendingRpcs('canvas window reloaded')
       armWindowReady()
-      overlayTarget.webContents.reload()
+      // 不用 webContents.reload()：地址上的深浅色可能是启动时的旧值，按现在的重新载入
+      loadRenderer(overlayTarget)
     }
   })
   ipcMain.removeAllListeners('window:devtools')
@@ -232,9 +232,25 @@ export function createWindow(): void {
     setQuitting(true)
   })
 
+  loadRenderer(win)
+}
+
+// 地址上带着上次的深浅色，index.html 在样式生效前就用它设好 data-fd-theme
+function loadRenderer(target: BrowserWindow): void {
   const devUrl = process.env['ELECTRON_RENDERER_URL']
-  if (devUrl) void win.loadURL(devUrl)
-  else void win.loadFile(RENDERER_FILE)
+  if (!devUrl) {
+    void target.loadFile(RENDERER_FILE, { query: { theme: savedTheme } })
+    return
+  }
+  let url = devUrl
+  try {
+    const parsed = new URL(devUrl)
+    parsed.searchParams.set('theme', savedTheme)
+    url = parsed.href
+  } catch {
+    // dev 地址写坏了就原样加载
+  }
+  void target.loadURL(url)
 }
 
 export async function fetchAndInstallRemoteLibrary(libraryUrl: string): Promise<void> {

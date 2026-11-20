@@ -23,6 +23,10 @@ type Status =
   | { kind: 'error'; message: string }
 
 const EXCALIDRAW_UI_OPTIONS = { canvasActions: { loadScene: false } } // 打开文件由 importSceneFile 接管（CVE-2026-97224）
+// 摘掉 public/theme-boot.js 标上的 data-fd-loading，放出载入前藏起的画布
+const revealCanvas = (): void => {
+  delete document.documentElement.dataset.fdLoading
+}
 
 export default function App() {
   const [agentOpen, setAgentOpen] = useState(false)
@@ -114,8 +118,12 @@ export default function App() {
       })
       .catch((err) => {
         setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
-        return { elements: [], appState: { viewBackgroundColor: PAPER_COLOR } }
+        // 载入失败也沿用 index.html 按地址设好的深浅色，别让默认的浅色经 onChange 写回 state.json
+        const theme: 'dark' | 'light' = document.documentElement.dataset.fdTheme === 'dark' ? 'dark' : 'light'
+        return { elements: [], appState: { theme, viewBackgroundColor: PAPER_COLOR } }
       })
+      // 兜底：万一载入后迟迟没有 onChange，也别让画布一直藏着
+      .finally(() => setTimeout(revealCanvas, 1000))
   )
 
   const latest = useRef<SceneArgs | null>(null)
@@ -273,10 +281,11 @@ export default function App() {
       if (scene.files && Object.keys(scene.files).length > 0) {
         current.addFiles(Object.values(scene.files))
       }
-      const { viewBackgroundColor, theme, gridModeEnabled, name } = scene.appState
+      // 不带 theme：.excalidraw 里不存深浅色，导入恢复出来的总是 light，带上会把用户的深色冲掉并记进 state.json
+      const { viewBackgroundColor, gridModeEnabled, name } = scene.appState
       current.updateScene({
         elements: scene.elements,
-        appState: { viewBackgroundColor: paperOr(viewBackgroundColor), theme, gridModeEnabled, name },
+        appState: { viewBackgroundColor: paperOr(viewBackgroundColor), gridModeEnabled, name },
         captureUpdate: CaptureUpdateAction.IMMEDIATELY
       })
       current.scrollToContent(undefined, { fitToContent: true })
@@ -321,6 +330,8 @@ export default function App() {
 
   const onChange = useCallback<OnChange>(
     (elements, appState, files) => {
+      // Excalidraw 载入完成后才会调 onChange：这时把载入前藏起的画布放出来
+      if ('fdLoading' in document.documentElement.dataset) revealCanvas()
       // 横幅和弹窗画在 Excalidraw 外面，要自己跟着它的深浅色走
       if (document.documentElement.dataset.fdTheme !== appState.theme) {
         document.documentElement.dataset.fdTheme = appState.theme

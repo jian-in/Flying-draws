@@ -171,17 +171,21 @@ export async function acceptScene(json: string, id = currentBoardId): Promise<nu
   if (key === session.lastElementsKey) {
     if (prefs === session.lastPrefsKey) return session.version
     // 只改了背景色、网格这类画布设置：照样落盘，但不升版本号，免得 agent 手里的 base_version 白白失效
-    session.lastPrefsKey = prefs
     scene.flyingdraws = { version: session.version, ...(session.title ? { title: session.title } : {}) }
     await atomicWriteJson(path, scene)
+    // 写成功才记下；写失败时下一次同样的设置还会再存，不会被当成已存过跳掉
+    session.lastPrefsKey = prefs
     saveCount += 1
     return session.version
   }
+  // 版本号和两个指纹都等写盘成功再提交：写失败时内存和磁盘保持一致，下一次同样的内容照样落盘。
+  // 各个写入口都在 serialized() 里排队，这里不会有两次 acceptScene 交错。
+  const nextVersion = session.version + 1
+  scene.flyingdraws = { version: nextVersion, ...(session.title ? { title: session.title } : {}) }
+  await atomicWriteJson(path, scene)
+  session.version = nextVersion
   session.lastElementsKey = key
   session.lastPrefsKey = prefs
-  session.version += 1
-  scene.flyingdraws = { version: session.version, ...(session.title ? { title: session.title } : {}) }
-  await atomicWriteJson(path, scene)
   saveCount += 1
   if (id === currentBoardId) pushHubState()
   return session.version
