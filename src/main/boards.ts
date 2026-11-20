@@ -1,5 +1,6 @@
 // 画板标识校验、文件名映射与元数据解析（纯函数，不依赖 Electron）
 import { join, resolve } from 'node:path'
+import { PAPER_COLOR } from '../shared/paper.ts'
 
 export const DEFAULT_BOARD_ID = 'default'
 export const BOARD_EXT = '.excalidraw'
@@ -72,19 +73,23 @@ export function normalizeBoardTitle(raw: unknown): string | null {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : null
 }
 
+/**
+ * 画板文件里的 flyingdraws 字段：版本号、标题，以及 exactBackground 标记——
+ * 这份文件的背景色就是用户看到的，载入时原样恢复（见 shared/paper.ts）。
+ */
+export function boardSceneMeta(version: number, title?: string | null): Record<string, unknown> {
+  return { version, ...(title ? { title } : {}), exactBackground: true }
+}
+
 export function emptyBoardScene(opts?: { title?: string | null }): Record<string, unknown> {
-  const title = normalizeBoardTitle(opts?.title)
   return {
     type: 'excalidraw',
     version: 2,
     source: 'flyingdraws',
     elements: [],
-    appState: { viewBackgroundColor: '#ffffff' },
+    appState: { viewBackgroundColor: PAPER_COLOR },
     files: {},
-    flyingdraws: {
-      version: 1,
-      ...(title ? { title } : {})
-    }
+    flyingdraws: boardSceneMeta(1, normalizeBoardTitle(opts?.title))
   }
 }
 

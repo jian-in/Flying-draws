@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { join, resolve } from 'node:path'
+import { PAPER_COLOR } from '../src/shared/paper.ts'
 import {
   boardFilePath,
   emptyBoardScene,
@@ -44,10 +45,12 @@ test('emptyBoardScene 生成标准 Excalidraw 场景并保留可选标题', () =
   const plain = emptyBoardScene()
   assert.equal(plain.type, 'excalidraw')
   assert.deepEqual(plain.elements, [])
-  assert.deepEqual(plain.flyingdraws, { version: 1 })
+  // 新建画板直接写纸色，并标上 exactBackground：背景色按原样恢复
+  assert.deepEqual(plain.appState, { viewBackgroundColor: PAPER_COLOR })
+  assert.deepEqual(plain.flyingdraws, { version: 1, exactBackground: true })
 
   const titled = emptyBoardScene({ title: '  登录流程  ' })
-  assert.deepEqual(titled.flyingdraws, { version: 1, title: '登录流程' })
+  assert.deepEqual(titled.flyingdraws, { version: 1, title: '登录流程', exactBackground: true })
 })
 
 test('parseBoardMeta 统计未删除元素、版本号和标题', () => {

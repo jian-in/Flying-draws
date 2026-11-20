@@ -10,7 +10,7 @@ import { LIBRARY_CALLBACK_URL } from '../../shared/library'
 import { hasUnsafeCustomData, sanitizeElement, sanitizeScene } from '../../shared/sanitizeScene'
 import { scenePrefsKey } from '../../shared/scenePrefs'
 import type { OnChange, SceneArgs, Api, HiddenMap, AuthorFilter, SeatEntry, SkeletonList, SceneEl, Loose } from './canvas/types'
-import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, paperOr, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
+import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, boardBackground, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
 import { extractSeats, isDynamicSeats, seatsKeyOf, applyAuthorFilter } from './canvas/filters'
 import { applyPlan } from './canvas/applyPlan'
 import { resolveProposal } from './canvas/proposal'
@@ -22,7 +22,22 @@ type Status =
   | { kind: 'saved'; path: string; version: number; savedAt: string }
   | { kind: 'error'; message: string }
 
-const EXCALIDRAW_UI_OPTIONS = { canvasActions: { loadScene: false } } // 打开文件由 importSceneFile 接管（CVE-2026-97224）
+// 打开文件由 importSceneFile 接管（CVE-2026-97224）；重置画布由 clearCanvas 接管（背景回到纸色，而不是 Excalidraw 默认的纯白）
+const EXCALIDRAW_UI_OPTIONS = { canvasActions: { loadScene: false, clearCanvas: false } }
+// 读 .excalidraw 文件顶层的 flyingdraws 字段（背景色标记在这里）；读不出来就当没有
+const readBoardMeta = async (file: Blob): Promise<unknown> => {
+  try {
+    return (JSON.parse(await file.text()) as { flyingdraws?: unknown } | null)?.flyingdraws
+  } catch {
+    return undefined
+  }
+}
+// Excalidraw 的 isWritableElement：正在输入文字时快捷键不管
+const isTypingTarget = (target: EventTarget | null): boolean =>
+  (target instanceof HTMLElement && target.dataset.type === 'wysiwyg') ||
+  target instanceof HTMLTextAreaElement ||
+  (target instanceof HTMLInputElement && ['text', 'number', 'password', 'search'].includes(target.type)) ||
+  (target instanceof HTMLElement && target.isContentEditable)
 // 摘掉 public/theme-boot.js 标上的 data-fd-loading，放出载入前藏起的画布
 const revealCanvas = (): void => {
   delete document.documentElement.dataset.fdLoading
@@ -44,6 +59,9 @@ export default function App() {
   const [creating, setCreating] = useState(false)
   const [renaming, setRenaming] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  // Excalidraw 的查看模式（右键菜单可开关）：自己的「重置画布」菜单项和自带的一样，查看模式下不显示
+  const [viewMode, setViewMode] = useState(false)
+  const viewModeRef = useRef(false)
   const [hub, setHub] = useState<HubState>({ pending: [], agentWaiting: false, waitingAgents: [], inbox: 0, inboxTargets: [], handoff: null })
   const [toast, setToast] = useState<string | null>(null)
   const [filter, setFilter] = useState<AuthorFilter>('all')
@@ -103,7 +121,9 @@ export default function App() {
         setBoardInfo({ board: res.board, title: res.title })
         setBoards(res.boards)
         setStatus(res.json ? { kind: 'saved', path: res.path, version: res.version, savedAt: new Date().toISOString() } : { kind: 'idle' })
-        const scene = res.json ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown> }).scene : {}
+        const scene = res.json
+          ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; flyingdraws?: unknown }).scene
+          : {}
         // .excalidraw 里不存 theme，以主进程记下的为准
         const initTheme = res.theme ?? (scene.appState?.theme === 'dark' ? 'dark' : 'light')
         document.documentElement.dataset.fdTheme = initTheme
@@ -114,7 +134,8 @@ export default function App() {
         const initPlaced = extractPlacedResults(scene.elements ?? [])
         lastPlacedKeyRef.current = initPlaced.join('|')
         setPlacedResultIds(new Set(initPlaced))
-        return { ...scene, appState: { ...scene.appState, theme: initTheme, viewBackgroundColor: paperOr(scene.appState?.viewBackgroundColor) } }
+        const viewBackgroundColor = boardBackground(scene.appState?.viewBackgroundColor, 'flyingdraws' in scene ? scene.flyingdraws : undefined)
+        return { ...scene, appState: { ...scene.appState, theme: initTheme, viewBackgroundColor } }
       })
       .catch((err) => {
         setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
@@ -192,7 +213,9 @@ export default function App() {
         timer.current = null
       }
       const parsed = res.json
-        ? sanitizeScene(JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; files?: Record<string, unknown> }).scene
+        ? sanitizeScene(
+            JSON.parse(res.json) as { elements?: SceneEl[]; appState?: Record<string, unknown>; files?: Record<string, unknown>; flyingdraws?: unknown }
+          ).scene
         : null
       const nextElements = parsed?.elements ?? []
       lastSavedVersion.current = elementsVersion(nextElements)
@@ -215,7 +238,7 @@ export default function App() {
       }
       const nextAppState: Record<string, unknown> = { ...parsed?.appState }
       delete nextAppState.collaborators
-      nextAppState.viewBackgroundColor = paperOr(nextAppState.viewBackgroundColor)
+      nextAppState.viewBackgroundColor = boardBackground(nextAppState.viewBackgroundColor, parsed?.flyingdraws)
       currentApi.updateScene({
         elements: nextElements,
         appState: nextAppState as unknown as Parameters<Api['updateScene']>[0]['appState'],
@@ -278,6 +301,8 @@ export default function App() {
     try {
       const data = await loadFromBlob(file, null, null)
       const { scene, stripped } = sanitizeScene(data)
+      // loadFromBlob 会丢掉顶层的 flyingdraws：自己读一下背景色标记，导入本应用存的画板文件时背景色原样恢复
+      const meta = await readBoardMeta(file)
       if (scene.files && Object.keys(scene.files).length > 0) {
         current.addFiles(Object.values(scene.files))
       }
@@ -285,7 +310,7 @@ export default function App() {
       const { viewBackgroundColor, gridModeEnabled, name } = scene.appState
       current.updateScene({
         elements: scene.elements,
-        appState: { viewBackgroundColor: paperOr(viewBackgroundColor), gridModeEnabled, name },
+        appState: { viewBackgroundColor: boardBackground(viewBackgroundColor, meta), gridModeEnabled, name },
         captureUpdate: CaptureUpdateAction.IMMEDIATELY
       })
       current.scrollToContent(undefined, { fitToContent: true })
@@ -296,6 +321,35 @@ export default function App() {
   }, [])
   const isSceneFile = (file: File): boolean =>
     /\.excalidraw$/i.test(file.name) || file.type === 'application/vnd.excalidraw+json' || /\.json$/i.test(file.name)
+  // 自己接管「重置画布」：Excalidraw 自带的会把背景重置成纯白，而存下来的纯白现在会原样恢复，
+  // 重置一次就再也回不到默认的纸色。这里删掉所有元素、背景回到纸色，和自带的一样可以撤销。
+  const clearCanvas = useCallback(() => {
+    const current = apiRef.current
+    if (!current) return
+    // 和自带的清空一样：查看模式下、正在选元素链接时不能重置
+    const state = current.getAppState()
+    if (state.viewModeEnabled || state.openDialog?.name === 'elementLinkSelector') return
+    if (!window.confirm('重置画布会清空所有内容，背景回到默认的纸色（可以撤销）。继续吗？')) return
+    current.updateScene({
+      elements: current.getSceneElementsIncludingDeleted().map((el) => (el.isDeleted ? el : newElementWith(el, { isDeleted: true }))),
+      appState: { viewBackgroundColor: PAPER_COLOR, selectedElementIds: {} },
+      captureUpdate: CaptureUpdateAction.IMMEDIATELY
+    })
+  }, [])
+  useEffect(() => {
+    // Excalidraw 把 Ctrl/Cmd+Delete、Ctrl/Cmd+Backspace 写死成打开自带的清空确认框，确认后绕过 UIOptions 的开关
+    // 直接执行自带的清空（背景重置成纯白）。在它之前（捕获阶段）截住，改走 clearCanvas。
+    // 和它一样只管焦点在画布里的按键，正在输入文字时不管（Ctrl+Backspace 还是删一个词）。
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || (e.key !== 'Delete' && e.key !== 'Backspace')) return
+      if (isTypingTarget(e.target) || !(e.target instanceof Element) || !e.target.closest('.excalidraw')) return
+      e.preventDefault()
+      e.stopPropagation()
+      clearCanvas()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [clearCanvas])
   const openSceneFile = useCallback(() => {
     const input = document.createElement('input')
     input.type = 'file'
@@ -332,6 +386,10 @@ export default function App() {
     (elements, appState, files) => {
       // Excalidraw 载入完成后才会调 onChange：这时把载入前藏起的画布放出来
       if ('fdLoading' in document.documentElement.dataset) revealCanvas()
+      if (appState.viewModeEnabled !== viewModeRef.current) {
+        viewModeRef.current = appState.viewModeEnabled
+        setViewMode(appState.viewModeEnabled)
+      }
       // 横幅和弹窗画在 Excalidraw 外面，要自己跟着它的深浅色走
       if (document.documentElement.dataset.fdTheme !== appState.theme) {
         document.documentElement.dataset.fdTheme = appState.theme
@@ -789,7 +847,7 @@ export default function App() {
           <MainMenu.DefaultItems.SaveAsImage />
           <MainMenu.DefaultItems.SearchMenu />
           <MainMenu.DefaultItems.Help />
-          <MainMenu.DefaultItems.ClearCanvas />
+          {viewMode ? null : <MainMenu.Item onSelect={clearCanvas}>重置画布</MainMenu.Item>}
           <MainMenu.Separator />
           <MainMenu.DefaultItems.ToggleTheme />
           <MainMenu.DefaultItems.ChangeCanvasBackground />
