@@ -140,7 +140,7 @@ export async function snapshot(
 }
 
 // 纸色和背景色的恢复规则放在 shared/paper.ts，主进程新建画板时也要用
-export { PAPER_COLOR, paperOr, boardBackground } from '../../../shared/paper'
+export { PAPER_COLOR, boardBackground } from '../../../shared/paper'
 
 export const USER_BUSY_WAIT_MS = 10_000
 

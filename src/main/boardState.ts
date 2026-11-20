@@ -12,6 +12,7 @@ import { BOARD_EXT, DEFAULT_BOARD_ID, boardFilePath, boardSceneMeta, emptyBoardS
 import { BOARDS_DIR, legacyM0Path, pendingPath, statePath } from './paths'
 import { patchAppStateFile } from './appStateFile'
 import { scenePrefsKey } from '../shared/scenePrefs'
+import { hasExactBackground } from '../shared/paper'
 import { win, agent, currentBoardId, setCurrentBoardId } from './context'
 import { rpc, takeSnapshot } from './rpc'
 
@@ -27,6 +28,8 @@ export interface BoardSession {
   version: number
   lastElementsKey: string | null
   lastPrefsKey: string | null
+  /** 磁盘上的画板文件带没带 exactBackground 标记；没带的老画板下一次存盘要补上（见 shared/paper.ts） */
+  backgroundMarked: boolean
   hub: RequestHub
   history: Map<number, VersionRecord>
   seats: Map<string, string>
@@ -61,6 +64,7 @@ export function getSession(id: string): BoardSession {
       version: 0,
       lastElementsKey: null,
       lastPrefsKey: null,
+      backgroundMarked: false,
       hub,
       history: new Map(),
       seats: new Map(),
@@ -148,6 +152,7 @@ export async function loadBoard(id = currentBoardId): Promise<{ board: string; t
     session.title = typeof scene?.flyingdraws?.title === 'string' && scene.flyingdraws.title.trim() ? scene.flyingdraws.title.trim() : null
     session.lastElementsKey = elementsKey(scene.elements ?? [])
     session.lastPrefsKey = scenePrefsKey(scene.appState)
+    session.backgroundMarked = hasExactBackground(scene?.flyingdraws)
     syncBoardSeats(id, (scene.elements ?? []) as SceneElement[])
     return { board: id, title: session.title, version: session.version, json, path }
   } catch (err) {
@@ -155,6 +160,7 @@ export async function loadBoard(id = currentBoardId): Promise<{ board: string; t
       session.version = 0
       session.lastElementsKey = null
       session.lastPrefsKey = null
+      session.backgroundMarked = false
       session.drawnAgents = new Set()
       return { board: id, title: session.title, version: session.version, json: null, path }
     }
@@ -171,12 +177,15 @@ export async function acceptScene(json: string, id = currentBoardId): Promise<nu
   const key = elementsKey(scene.elements ?? [])
   const prefs = scenePrefsKey(scene.appState)
   if (key === session.lastElementsKey) {
-    if (prefs === session.lastPrefsKey) return session.version
+    // 老画板（没有 exactBackground 标记）就算设置看着没变也要写一次：磁盘上是未标记的纯白时，
+    // 页面显示的是纸色，用户这时再选纯白，设置指纹和磁盘一样，不写的话下次打开又变回纸色
+    if (prefs === session.lastPrefsKey && session.backgroundMarked) return session.version
     // 只改了背景色、网格这类画布设置：照样落盘，但不升版本号，免得 agent 手里的 base_version 白白失效
     scene.flyingdraws = boardSceneMeta(session.version, session.title)
     await atomicWriteJson(path, scene)
     // 写成功才记下；写失败时下一次同样的设置还会再存，不会被当成已存过跳掉
     session.lastPrefsKey = prefs
+    session.backgroundMarked = true
     saveCount += 1
     return session.version
   }
@@ -189,6 +198,7 @@ export async function acceptScene(json: string, id = currentBoardId): Promise<nu
   session.version = nextVersion
   session.lastElementsKey = key
   session.lastPrefsKey = prefs
+  session.backgroundMarked = true
   saveCount += 1
   if (id === currentBoardId) pushHubState()
   return session.version

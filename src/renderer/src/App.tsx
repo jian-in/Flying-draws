@@ -10,7 +10,7 @@ import { LIBRARY_CALLBACK_URL } from '../../shared/library'
 import { hasUnsafeCustomData, sanitizeElement, sanitizeScene } from '../../shared/sanitizeScene'
 import { scenePrefsKey } from '../../shared/scenePrefs'
 import type { OnChange, SceneArgs, Api, HiddenMap, AuthorFilter, SeatEntry, SkeletonList, SceneEl, Loose } from './canvas/types'
-import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, paperOr, boardBackground, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
+import { SAVE_DELAY_MS, elementsVersion, extractPlacedResults, unmaskElements, visibleArea, snapshot, PAPER_COLOR, boardBackground, USER_BUSY_WAIT_MS, DEFERRED_NOTICE_MS, sleep, originalImage, userIsBusy, showElements, AGENT_COLOR } from './canvas/scene'
 import { extractSeats, isDynamicSeats, seatsKeyOf, applyAuthorFilter } from './canvas/filters'
 import { applyPlan } from './canvas/applyPlan'
 import { resolveProposal } from './canvas/proposal'
@@ -24,6 +24,20 @@ type Status =
 
 // 打开文件由 importSceneFile 接管（CVE-2026-97224）；重置画布由 clearCanvas 接管（背景回到纸色，而不是 Excalidraw 默认的纯白）
 const EXCALIDRAW_UI_OPTIONS = { canvasActions: { loadScene: false, clearCanvas: false } }
+// 读 .excalidraw 文件顶层的 flyingdraws 字段（背景色标记在这里）；读不出来就当没有
+const readBoardMeta = async (file: Blob): Promise<unknown> => {
+  try {
+    return (JSON.parse(await file.text()) as { flyingdraws?: unknown } | null)?.flyingdraws
+  } catch {
+    return undefined
+  }
+}
+// Excalidraw 的 isWritableElement：正在输入文字时快捷键不管
+const isTypingTarget = (target: EventTarget | null): boolean =>
+  (target instanceof HTMLElement && target.dataset.type === 'wysiwyg') ||
+  target instanceof HTMLTextAreaElement ||
+  (target instanceof HTMLInputElement && ['text', 'number', 'password', 'search'].includes(target.type)) ||
+  (target instanceof HTMLElement && target.isContentEditable)
 // 摘掉 public/theme-boot.js 标上的 data-fd-loading，放出载入前藏起的画布
 const revealCanvas = (): void => {
   delete document.documentElement.dataset.fdLoading
@@ -284,6 +298,8 @@ export default function App() {
     try {
       const data = await loadFromBlob(file, null, null)
       const { scene, stripped } = sanitizeScene(data)
+      // loadFromBlob 会丢掉顶层的 flyingdraws：自己读一下背景色标记，导入本应用存的画板文件时背景色原样恢复
+      const meta = await readBoardMeta(file)
       if (scene.files && Object.keys(scene.files).length > 0) {
         current.addFiles(Object.values(scene.files))
       }
@@ -291,7 +307,7 @@ export default function App() {
       const { viewBackgroundColor, gridModeEnabled, name } = scene.appState
       current.updateScene({
         elements: scene.elements,
-        appState: { viewBackgroundColor: paperOr(viewBackgroundColor), gridModeEnabled, name },
+        appState: { viewBackgroundColor: boardBackground(viewBackgroundColor, meta), gridModeEnabled, name },
         captureUpdate: CaptureUpdateAction.IMMEDIATELY
       })
       current.scrollToContent(undefined, { fitToContent: true })
@@ -314,6 +330,20 @@ export default function App() {
       captureUpdate: CaptureUpdateAction.IMMEDIATELY
     })
   }, [])
+  useEffect(() => {
+    // Excalidraw 把 Ctrl/Cmd+Delete、Ctrl/Cmd+Backspace 写死成打开自带的清空确认框，确认后绕过 UIOptions 的开关
+    // 直接执行自带的清空（背景重置成纯白）。在它之前（捕获阶段）截住，改走 clearCanvas。
+    // 和它一样只管焦点在画布里的按键，正在输入文字时不管（Ctrl+Backspace 还是删一个词）。
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || (e.key !== 'Delete' && e.key !== 'Backspace')) return
+      if (isTypingTarget(e.target) || !(e.target instanceof Element) || !e.target.closest('.excalidraw')) return
+      e.preventDefault()
+      e.stopPropagation()
+      clearCanvas()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [clearCanvas])
   const openSceneFile = useCallback(() => {
     const input = document.createElement('input')
     input.type = 'file'
