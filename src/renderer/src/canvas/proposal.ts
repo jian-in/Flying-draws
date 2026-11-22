@@ -126,6 +126,7 @@ export function resolveProposal(api: Api, proposalId: string, accept: boolean, p
   }
   const settled = working.map((el) => {
     if (isProposed(el)) {
+      hidden.delete(el.id)
       if (!accept || isHelperEl(el)) return newElementWith(el, { isDeleted: true })
       const prevMark = el.customData?.flyingdraws
       return newElementWith(el, {
@@ -152,6 +153,7 @@ export function resolveProposal(api: Api, proposalId: string, accept: boolean, p
   // 以及用户在提议挂起期间自己删掉的提议元素）的反向记录和箭头端点都要去掉。
   // 转正的提议元素也要过这一遍，例如用户只删了提议里的新节点、保留了连向它的提议连线。
   const dead = new Set(settled.filter((el) => el.isDeleted).map((el) => el.id))
+  for (const id of dead) hidden.delete(id)
   const elements = settled.map((el) => {
     if (el.isDeleted || !dead.size) return el
     const changes: Record<string, unknown> = {}

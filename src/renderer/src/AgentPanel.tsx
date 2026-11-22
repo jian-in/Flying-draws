@@ -150,8 +150,8 @@ export function AgentPanel({
 
   useEffect(() => {
     let live = true
-    void api.state().then(value => {
-      if (!live) return
+    let receivedPush = false
+    const seedAndApply = (value: AgentState) => {
       if (!initialSeeded.current) {
         initialSeeded.current = true
         trackedItemRef.current = value.activeItemId
@@ -164,11 +164,20 @@ export function AgentPanel({
         }
       }
       setState(value)
-    })
+    }
+    void api
+      .state()
+      .then(value => {
+        if (!live || receivedPush) return
+        seedAndApply(value)
+      })
+      .catch(err => {
+        if (live) setError(readableIpcError(err))
+      })
     const off = api.onState(value => {
       if (!live) return
-      initialSeeded.current = true
-      setState(value)
+      receivedPush = true
+      seedAndApply(value)
     })
     return () => { live = false; off() }
   }, [])
@@ -285,6 +294,7 @@ export function AgentPanel({
     if (success) { updateFollow(true); scrollToBottom() }
   }
   async function execute() {
+    if (disabled) return
     if (await act(() => api.execute(goal.trim()))) { setGoal(''); updateFollow(true); scrollToBottom() }
   }
   async function saveModel() {

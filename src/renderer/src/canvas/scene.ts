@@ -37,8 +37,9 @@ export function unmaskElements(elements: readonly SceneEl[], hidden: HiddenMap):
   return elements.map((el) => {
     const saved = hidden.get(el.id)
     if (!saved) return el
-    // 读快照和存盘时把筛选隐藏掉的元素还原，不动 version，避免污染画板文件
-    return { ...el, opacity: saved.opacity, locked: saved.locked }
+    // 读快照和存盘时把筛选隐藏掉的元素还原，不动 version，避免污染画板文件；
+    // 更新 versionNonce 让 Excalidraw 的 Snapshot.detectChangedElements 能感知变化
+    return { ...el, opacity: saved.opacity, locked: saved.locked, versionNonce: Math.floor(Math.random() * 1e9) }
   })
 }
 

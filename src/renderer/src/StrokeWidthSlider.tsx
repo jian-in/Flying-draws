@@ -122,6 +122,31 @@ export function StrokeWidthSlider({ api }: { api: Api }) {
     [api, setWidths]
   )
 
+  const latestValueRef = useRef(value)
+  latestValueRef.current = value
+  const dragCleanupRef = useRef<(() => void) | null>(null)
+
+  const finishDrag = useCallback(
+    (nextValue?: number) => {
+      dragCleanupRef.current?.()
+      dragCleanupRef.current = null
+      const originals = dragging.current
+      if (!originals) return
+      dragging.current = null
+      const next = nextValue ?? (rangeRef.current ? Number(rangeRef.current.value) : latestValueRef.current)
+      commit(next, originals)
+    },
+    [commit]
+  )
+
+  useEffect(() => {
+    return () => {
+      dragCleanupRef.current?.()
+      dragCleanupRef.current = null
+      dragging.current = null
+    }
+  }, [])
+
   if (!host) return null
   return createPortal(
     <div className="range-wrapper">
@@ -135,13 +160,28 @@ export function StrokeWidthSlider({ api }: { api: Api }) {
         value={value}
         aria-label="描边宽度"
         data-testid="fd-stroke-width"
-        onPointerDown={() => {
+        onPointerDown={(event) => {
+          try {
+            event.currentTarget.setPointerCapture(event.pointerId)
+          } catch {
+            // 合成事件或指针已失效时忽略
+          }
           const selected = api.getAppState().selectedElementIds ?? {}
           const originals = new Map<string, number>()
           for (const el of api.getSceneElements()) {
             if (selected[el.id] && typeof el.strokeWidth === 'number') originals.set(el.id, el.strokeWidth)
           }
           dragging.current = originals
+          dragCleanupRef.current?.()
+          const onEnd = () => finishDrag()
+          window.addEventListener('pointerup', onEnd)
+          window.addEventListener('pointercancel', onEnd)
+          window.addEventListener('blur', onEnd)
+          dragCleanupRef.current = () => {
+            window.removeEventListener('pointerup', onEnd)
+            window.removeEventListener('pointercancel', onEnd)
+            window.removeEventListener('blur', onEnd)
+          }
         }}
         onChange={(event) => {
           const next = Number(event.target.value)
@@ -150,18 +190,8 @@ export function StrokeWidthSlider({ api }: { api: Api }) {
           if (dragging.current) preview(next)
           else commit(next, null)
         }}
-        onPointerUp={(event) => {
-          const originals = dragging.current
-          if (!originals) return
-          dragging.current = null
-          commit(Number(event.currentTarget.value), originals)
-        }}
-        onPointerCancel={(event) => {
-          const originals = dragging.current
-          if (!originals) return
-          dragging.current = null
-          commit(Number(event.currentTarget.value), originals)
-        }}
+        onPointerUp={(event) => finishDrag(Number(event.currentTarget.value))}
+        onPointerCancel={(event) => finishDrag(Number(event.currentTarget.value))}
       />
       <div className="value-bubble" ref={bubbleRef}>
         {value !== 0 ? value : null}

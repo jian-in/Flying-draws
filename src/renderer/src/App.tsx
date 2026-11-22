@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { createPortal } from 'react-dom'
+import { createPortal, flushSync } from 'react-dom'
 import { CaptureUpdateAction, convertToExcalidrawElements, Excalidraw, loadFromBlob, MainMenu, newElementWith, serializeAsJSON, useHandleLibrary } from '@excalidraw/excalidraw'
 import { displaySizeForImage, planImageLineage, type LineageCanvasElement } from '../../main/lineage'
 import type { DrawPlan, PendingChanges } from '../../main/ops'
@@ -109,7 +109,7 @@ export default function App() {
   const [composing, setComposing] = useState(false)
   const [dock, setDock] = useState<DockState>({ docked: false, side: null, title: null }) // 画布窗口贴在哪个窗口旁边
   useEffect(() => {
-    void window.flyingdraws.getDockState().then(setDock)
+    void window.flyingdraws.getDockState().then(setDock).catch(() => undefined)
     return window.flyingdraws.onDockState(setDock)
   }, [])
   const [sendTo, setSendTo] = useState<string | null>(null) // 「发给 agent」时点选的席位，null 是所有 agent
@@ -247,7 +247,7 @@ export default function App() {
       currentApi.history.clear()
       setBoardInfo({ board: res.board, title: res.title })
       if (res.boards) setBoards(res.boards)
-      else void window.flyingdraws.listBoards().then((list) => setBoards(list.boards))
+      else void window.flyingdraws.listBoards().then((list) => setBoards(list.boards)).catch(() => undefined)
       if (res.hubState) {
         lastInbox.current = res.hubState.inbox
         hadHandoff.current = Boolean(res.hubState.handoff)
@@ -263,31 +263,33 @@ export default function App() {
     []
   )
 
-  const save = useCallback(async () => {
+  const save = useCallback(async (): Promise<boolean> => {
     if (timer.current) {
       clearTimeout(timer.current)
       timer.current = null
     }
     const scene = latest.current
-    if (!scene) return
+    if (!scene) return true
     const [elements, appState, files] = scene
     const epoch = sceneEpoch.current
     try {
       const json = serializeAsJSON(unmaskElements(elements, hiddenStateRef.current), appState, files, 'local')
       const res = await window.flyingdraws.saveBoard(json, boardIdRef.current ?? undefined)
       // 存的过程中画布已经换成另一块画板：这次的结果和现在的画面无关，不动它的保存状态
-      if (epoch !== sceneEpoch.current) return
+      if (epoch !== sceneEpoch.current) return false
       if (res.skipped) {
         // 画板在存盘途中被改了名（内容没换）：等页面拿到新名字后再存一次
         if (timer.current) clearTimeout(timer.current)
         timer.current = setTimeout(() => void save(), SAVE_DELAY_MS)
-        return
+        return false
       }
       lastSavedVersion.current = elementsVersion(elements)
       lastSavedPrefs.current = scenePrefsKey(appState)
       setStatus({ kind: 'saved', path: res.path, version: res.version, savedAt: res.savedAt })
+      return true
     } catch (err) {
       setStatus({ kind: 'error', message: String(err) })
+      return false
     }
   }, [])
 
@@ -303,6 +305,16 @@ export default function App() {
       const { scene, stripped } = sanitizeScene(data)
       // loadFromBlob 会丢掉顶层的 flyingdraws：自己读一下背景色标记，导入本应用存的画板文件时背景色原样恢复
       const meta = await readBoardMeta(file)
+      sceneEpoch.current += 1
+      if (hiddenStateRef.current.size > 0) {
+        const unmasked = unmaskElements(current.getSceneElementsIncludingDeleted(), hiddenStateRef.current)
+        hiddenStateRef.current.clear()
+        flushSync(() => {
+          current.updateScene({ elements: unmasked, captureUpdate: CaptureUpdateAction.NEVER })
+        })
+      }
+      filterRef.current = 'all'
+      setFilter('all')
       if (scene.files && Object.keys(scene.files).length > 0) {
         current.addFiles(Object.values(scene.files))
       }
@@ -320,7 +332,7 @@ export default function App() {
     }
   }, [])
   const isSceneFile = (file: File): boolean =>
-    /\.excalidraw$/i.test(file.name) || file.type === 'application/vnd.excalidraw+json' || /\.json$/i.test(file.name)
+    /\.excalidraw(\.(png|svg))?$/i.test(file.name) || file.type === 'application/vnd.excalidraw+json' || /\.json$/i.test(file.name)
   // 自己接管「重置画布」：Excalidraw 自带的会把背景重置成纯白，而存下来的纯白现在会原样恢复，
   // 重置一次就再也回不到默认的纸色。这里删掉所有元素、背景回到纸色，和自带的一样可以撤销。
   const clearCanvas = useCallback(() => {
@@ -330,6 +342,16 @@ export default function App() {
     const state = current.getAppState()
     if (state.viewModeEnabled || state.openDialog?.name === 'elementLinkSelector') return
     if (!window.confirm('重置画布会清空所有内容，背景回到默认的纸色（可以撤销）。继续吗？')) return
+    sceneEpoch.current += 1
+    if (hiddenStateRef.current.size > 0) {
+      const unmasked = unmaskElements(current.getSceneElementsIncludingDeleted(), hiddenStateRef.current)
+      hiddenStateRef.current.clear()
+      flushSync(() => {
+        current.updateScene({ elements: unmasked, captureUpdate: CaptureUpdateAction.NEVER })
+      })
+    }
+    filterRef.current = 'all'
+    setFilter('all')
     current.updateScene({
       elements: current.getSceneElementsIncludingDeleted().map((el) => (el.isDeleted ? el : newElementWith(el, { isDeleted: true }))),
       appState: { viewBackgroundColor: PAPER_COLOR, selectedElementIds: {} },
@@ -477,7 +499,7 @@ export default function App() {
   // 订阅 agent 请求的状态
   useEffect(() => {
     const off = window.flyingdraws.onHubState(setHub)
-    void window.flyingdraws.getHubState().then(setHub)
+    void window.flyingdraws.getHubState().then(setHub).catch(() => undefined)
     return off
   }, [])
 
@@ -502,6 +524,8 @@ export default function App() {
           }
           const agentName = typeof agent === 'string' && agent.trim() ? agent.trim() : null
           if (agentName) primaryAgentRef.current = agentName
+          const targetBoard = boardIdRef.current
+          const targetEpoch = sceneEpoch.current
           window.flyingdraws.rpcReply(
             id,
             await applyPlan(
@@ -512,8 +536,9 @@ export default function App() {
               Boolean(seat),
               color ?? null,
               hiddenStateRef.current,
-              filterRef.current,
+              () => filterRef.current,
               primaryAgentRef.current,
+              () => boardIdRef.current !== targetBoard || sceneEpoch.current !== targetEpoch,
               setDeferredDraw
             )
           )
@@ -621,15 +646,16 @@ export default function App() {
 
   const submit = useCallback(
     async (requestId: string | null, note: string, to: string | null = null) => {
-      if (!apiRef.current) return
+      const current = apiRef.current
+      if (!current) return
       const targetBoard = boardIdRef.current ?? undefined
-      const snap = await snapshot(apiRef.current, true, hiddenStateRef.current)
+      const snap = await snapshot(current, true, hiddenStateRef.current)
       // 有 agent 正等着（或者这是在回应它的请求）时，画会直接交到它手上；否则先放进收件箱，
       // 主进程同时把一句取画的话放进剪贴板
       const res = await window.flyingdraws.submit({ board: targetBoard, requestId, note, to, ...snap })
       if (res.delivered) setToast(`${to ?? 'agent'} 已经收到你的画`)
       else if (res.hint) setToast(`已复制一句话，去${to ? `「${to}」的` : ''}聊天里粘贴，它就会来取`)
-      lastSavedVersion.current = elementsVersion(apiRef.current.getSceneElements())
+      lastSavedVersion.current = elementsVersion(current.getSceneElementsIncludingDeleted())
       setComposing(false)
     },
     []
@@ -640,13 +666,26 @@ export default function App() {
     const current = apiRef.current
     if (!current) return
     const targetBoard = boardIdRef.current ?? undefined
-    const skipped = resolveProposal(current, proposalId, accept, (pending as PendingChanges | null | undefined) ?? null, hiddenStateRef.current)
+    if (hiddenStateRef.current.size > 0) {
+      const unmasked = unmaskElements(current.getSceneElementsIncludingDeleted(), hiddenStateRef.current)
+      hiddenStateRef.current.clear()
+      flushSync(() => {
+        current.updateScene({ elements: unmasked, captureUpdate: CaptureUpdateAction.NEVER })
+      })
+    }
+    let skipped: string[] = []
     if (filterRef.current !== 'all') {
-      applyAuthorFilter(current, filterRef.current, hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(seatInfoRef.current))
+      flushSync(() => {
+        skipped = resolveProposal(current, proposalId, accept, (pending as PendingChanges | null | undefined) ?? null, hiddenStateRef.current)
+      })
+      const afterResolve = current.getSceneElementsIncludingDeleted()
+      applyAuthorFilter(current, filterRef.current, hiddenStateRef.current, primaryAgentRef.current, isDynamicSeats(extractSeats(afterResolve)))
+    } else {
+      skipped = resolveProposal(current, proposalId, accept, (pending as PendingChanges | null | undefined) ?? null, hiddenStateRef.current)
     }
     const snap = await snapshot(current, true, hiddenStateRef.current)
     await window.flyingdraws.submit({ board: targetBoard, requestId, note, decision: accept ? 'accepted' : 'rejected', skipped, ...snap })
-    lastSavedVersion.current = elementsVersion(current.getSceneElements())
+    lastSavedVersion.current = elementsVersion(current.getSceneElementsIncludingDeleted())
   }, [])
 
   const selectFilter = useCallback((next: AuthorFilter) => {
@@ -756,13 +795,14 @@ export default function App() {
               {
                 label: '打开文件位置',
                 title: '在资源管理器中显示画板文件',
-                onSelect: () => void window.flyingdraws.revealBoard()
+                onSelect: () =>
+                  void window.flyingdraws.revealBoard().catch((err) => setToast(`打开文件位置失败：${err instanceof Error ? err.message : String(err)}`))
               },
               {
                 label: '重新加载',
                 title: '重新载入页面（没存盘的修改会先保存）',
                 sepBefore: true,
-                onSelect: () => void save().then(() => window.flyingdraws.reloadWindow())
+                onSelect: () => void save().then((ok) => { if (ok) window.flyingdraws.reloadWindow() })
               },
               { label: '开发者工具', title: '打开或关闭开发者工具', onSelect: () => window.flyingdraws.toggleDevTools() },
               {
@@ -871,7 +911,7 @@ export default function App() {
           prompt={request.prompt}
           queued={queued}
           onSend={(note) => submit(request.id, note)}
-          onCancel={() => void window.flyingdraws.cancel(request.id)}
+          onCancel={() => window.flyingdraws.cancel(request.id)}
           cancelLabel="不画了"
         />
       ) : composing ? (
@@ -926,7 +966,7 @@ export default function App() {
             type="button"
             className="fd-waiting-action"
             title="把那句取画的话再复制一次，粘贴到 agent 的聊天里"
-            onClick={() => void window.flyingdraws.copyHint().then((hint) => hint && setToast('已复制，去聊天里粘贴'))}
+            onClick={() => void window.flyingdraws.copyHint().then((hint) => hint && setToast('已复制，去聊天里粘贴')).catch(() => undefined)}
           >
             复制这句话
           </button>
@@ -1011,12 +1051,16 @@ export default function App() {
           current.updateScene({ appState: { selectedElementIds: {} }, captureUpdate: CaptureUpdateAction.NEVER })
         }}
         insertImage={(image, dataURL, opts) => {
+          const targetBoard = boardIdRef.current
           const runInsert = async () => {
             const current = apiRef.current
-            const targetBoard = boardIdRef.current
             if (!current) {
               if (opts?.auto) return
               throw new Error('画布还没准备好')
+            }
+            if (boardIdRef.current !== targetBoard) {
+              if (opts?.auto) return
+              throw new Error('画板已切换，请回到原画板再放入图片')
             }
             if (opts?.auto) {
               const startedAt = Date.now()
@@ -1199,7 +1243,19 @@ export default function App() {
                 : elements
 
             const nextAll = [...updatedExisting, ...added]
-            current.updateScene({ elements: nextAll, captureUpdate: CaptureUpdateAction.IMMEDIATELY })
+            if (hiddenStateRef.current.size > 0) {
+              hiddenStateRef.current.clear()
+              flushSync(() => {
+                current.updateScene({ elements, captureUpdate: CaptureUpdateAction.NEVER })
+              })
+            }
+            if (filterRef.current !== 'all') {
+              flushSync(() => {
+                current.updateScene({ elements: nextAll, captureUpdate: CaptureUpdateAction.IMMEDIATELY })
+              })
+            } else {
+              current.updateScene({ elements: nextAll, captureUpdate: CaptureUpdateAction.IMMEDIATELY })
+            }
             const nextPlaced = extractPlacedResults(nextAll)
             lastPlacedKeyRef.current = nextPlaced.join('|')
             setPlacedResultIds(new Set(nextPlaced))
@@ -1299,6 +1355,7 @@ function BoardNameModal(props: {
       await props.onSubmit(name)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+    } finally {
       setBusy(false)
     }
   }
@@ -1350,6 +1407,7 @@ function ConfirmModal(props: {
       await props.onConfirm()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+    } finally {
       setBusy(false)
     }
   }
@@ -1387,7 +1445,7 @@ function Banner(props: {
   queued?: number // 这个请求后面还排着几个
   onSend: (note: string) => Promise<void>
   sendLabel?: string
-  onCancel: (note: string) => void | Promise<void>
+  onCancel: (note: string) => void | boolean | Promise<void | boolean>
   cancelLabel: string
   children?: ReactNode // 提示语和附言之间的额外内容，比如点选发给哪个席位
   keyboard?: boolean // 用户自己打开的横幅：一出来就把光标放进附言框，Enter 发送、Esc 取消
@@ -1395,13 +1453,15 @@ function Banner(props: {
   const [note, setNote] = useState('')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const run = async (action: (note: string) => void | Promise<void>) => {
+  const run = async (action: (note: string) => void | boolean | Promise<void | boolean>) => {
     setSending(true)
     setError(null)
     try {
-      await action(note)
+      const result = await action(note)
+      if (result === false) setError('操作未生效，请重试')
     } catch (err) {
-      setError(String(err))
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
       setSending(false)
     }
   }

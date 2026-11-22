@@ -1,4 +1,5 @@
 // 把主进程算好的绘图计划落到 Excalidraw 场景上。
+import { flushSync } from 'react-dom'
 import { CaptureUpdateAction, convertToExcalidrawElements, newElementWith } from '@excalidraw/excalidraw'
 import { AUTO_TEXT_MAX_W, containerWidthFor, exitPoint, polylineMidpoint, type ShapeBox } from '../../../main/geometry'
 import type { DrawPlan, PlannedMove, PlannedReroute } from '../../../main/ops'
@@ -169,10 +170,20 @@ export function applyChanges(
 
   // 3. 修改独立文字的内容并重算宽高
   for (const te of plan.textEdits) {
-    const target = current(te.elementId)
+    const target = current(te.elementId) as (Loose & { fontSize?: number; fontFamily?: number }) | undefined
     if (!target || target.isDeleted || gone.has(target.id)) continue
     const made = convertToExcalidrawElements(
-      [{ type: 'text', id: 'sl_tmp', x: target.x, y: target.y, text: te.text }] as unknown as SkeletonList,
+      [
+        {
+          type: 'text',
+          id: 'sl_tmp',
+          x: target.x,
+          y: target.y,
+          text: te.text,
+          ...(target.fontSize ? { fontSize: target.fontSize } : {}),
+          ...(target.fontFamily ? { fontFamily: target.fontFamily } : {})
+        }
+      ] as unknown as SkeletonList,
       { regenerateIds: false }
     )
     const measured = made[0]
@@ -425,8 +436,9 @@ export async function applyPlan(
   seat: boolean,
   color: string | null,
   hidden: HiddenMap,
-  filter: AuthorFilter,
+  getFilter: () => AuthorFilter,
   preferredAgent: string | null,
+  isStale: () => boolean,
   onDeferredChange?: (state: { agent: string | null; editingText: boolean } | null) => void
 ): Promise<{ sceneJson: string }> {
   // 用户优先：等用户手上的动作做完再画；等超过 400ms 才显示等待提示
@@ -445,6 +457,7 @@ export async function applyPlan(
   )
   try {
     while (userIsBusy(api)) {
+      if (isStale()) throw new Error('the active board or scene changed while waiting; call canvas_read and try again')
       waited = true
       if (Date.now() > deadline) throw new Error('the user is in the middle of drawing; wait a moment and call canvas_draw again')
       if (!notified && Date.now() - startedAt >= DEFERRED_NOTICE_MS) {
@@ -456,6 +469,8 @@ export async function applyPlan(
   } finally {
     if (notified) onDeferredChange?.(null)
   }
+
+  if (isStale()) throw new Error('the active board or scene changed while waiting; call canvas_read and try again')
 
   if (waited && before.size) {
     const now = new Map(api.getSceneElementsIncludingDeleted().map((el) => [el.id, el]))
@@ -642,11 +657,27 @@ export async function applyPlan(
     ? [...kept, ...freshWithArrows]
     : resnapArrowsToElements([...kept, ...freshWithArrows], plan.edges.map((e) => e.elementId))
   const nextAll = [...settledScene, ...markerElements, ...ghostElements]
-  api.updateScene({
-    elements: nextAll,
-    captureUpdate: CaptureUpdateAction.IMMEDIATELY // 用户可以用撤销去掉 agent 画的这一批
-  })
-  if (filter !== 'all') applyAuthorFilter(api, filter, hidden, preferredAgent, isDynamicSeats(extractSeats(nextAll)))
+  if (hidden.size > 0) {
+    hidden.clear()
+    flushSync(() => {
+      api.updateScene({ elements: current, captureUpdate: CaptureUpdateAction.NEVER })
+    })
+  }
+  const filter = getFilter()
+  if (filter !== 'all') {
+    flushSync(() => {
+      api.updateScene({
+        elements: nextAll,
+        captureUpdate: CaptureUpdateAction.IMMEDIATELY // 用户可以用撤销去掉 agent 画的这一批
+      })
+    })
+    applyAuthorFilter(api, filter, hidden, preferredAgent, isDynamicSeats(extractSeats(nextAll)))
+  } else {
+    api.updateScene({
+      elements: nextAll,
+      captureUpdate: CaptureUpdateAction.IMMEDIATELY // 用户可以用撤销去掉 agent 画的这一批
+    })
+  }
   showElements(api, [...fresh, ...markerElements, ...ghostElements], Boolean(proposalId))
   return { sceneJson: (await snapshot(api, false, hidden)).sceneJson }
 }
