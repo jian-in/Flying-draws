@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { bboxOf, buildGraph, canvasRectToImagePixels, summarize, type SceneElement } from '../src/main/semantic.ts'
+import { bboxOf, buildGraph, canvasRectToImagePixels, readingOrder, summarize, type Bbox, type SceneElement } from '../src/main/semantic.ts'
 
 const fixture = (name: string): SceneElement[] =>
   JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')).elements
@@ -372,4 +372,39 @@ test('提议层的 move-ghost 落点预览框不会被语义层识别为真实�
   assert.equal(g.nodes.length, 1)
   assert.equal(g.nodes[0].ref, 'n1')
   assert.equal(g.notes.length, 0)
+})
+
+test('readingOrder 满足严格弱序（自反性、反对称性与传递性），输入顺序不影响节点排序', () => {
+  // 旧实现在 |a.y - b.y| <= 40 时按 x 比较，会导致 (100,0)、(50,30)、(0,60) 形成比较环
+  const boxes: Bbox[] = [
+    { x: 100, y: 0, w: 40, h: 40 },
+    { x: 50, y: 30, w: 40, h: 40 },
+    { x: 0, y: 60, w: 40, h: 40 },
+    { x: 0, y: 0, w: 40, h: 40 },
+    { x: 0, y: 20, w: 40, h: 40 },
+    { x: 200, y: 39, w: 40, h: 40 },
+    { x: -10, y: 40, w: 40, h: 40 },
+    { x: 50, y: 79, w: 40, h: 40 }
+  ]
+
+  for (const a of boxes) {
+    assert.equal(readingOrder(a, a), 0)
+    for (const b of boxes) {
+      assert.equal(Math.sign(readingOrder(a, b)) + Math.sign(readingOrder(b, a)), 0)
+      for (const c of boxes) {
+        if (readingOrder(a, b) < 0 && readingOrder(b, c) < 0) {
+          assert.ok(readingOrder(a, c) < 0, `transitivity violated for ${JSON.stringify([a, b, c])}`)
+        }
+        if (readingOrder(a, b) === 0 && readingOrder(b, c) === 0) {
+          assert.equal(readingOrder(a, c), 0)
+        }
+      }
+    }
+  }
+
+  // 同一组节点无论以什么顺序传入 buildGraph，排序结果应一致
+  const els = boxes.map((b, i) => rect(b.x, b.y, b.w, b.h, { id: `ord_${i}` }))
+  const forward = buildGraph(els).nodes.map((n) => n.ref)
+  const reversed = buildGraph([...els].reverse()).nodes.map((n) => n.ref)
+  assert.deepEqual(reversed, forward)
 })

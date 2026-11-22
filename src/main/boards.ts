@@ -6,7 +6,7 @@ export const DEFAULT_BOARD_ID = 'default'
 export const BOARD_EXT = '.excalidraw'
 
 const INVALID_ID_RE = /[\\/:*?"<>|\x00-\x1f]/
-const WIN_RESERVED_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
+const WIN_RESERVED_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i
 const MAX_BOARD_ID_LEN = 64
 const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin'
 

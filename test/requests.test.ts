@@ -79,6 +79,24 @@ test('cancelAll 取消等待请求并清空收件箱，同时唤醒正在等待�
   assert.equal(hub.state().inbox, 0)
 })
 
+test('cancelAll 同样唤醒并清理所有正在等待收件箱的 /wait 调用方，不留下悬挂等待', async () => {
+  const hub = new RequestHub()
+  const ac1 = new AbortController()
+  const ac2 = new AbortController()
+  const w1 = hub.wait({ inbox: true, agent: '前端' }, 60_000, ac1.signal)
+  const w2 = hub.wait({ inbox: true, agent: null }, 60_000, ac2.signal)
+  assert.equal(hub.state().agentWaiting, true)
+  assert.deepEqual(hub.state().waitingAgents, ['前端'])
+
+  hub.cancelAll()
+
+  const [r1, r2] = await Promise.all([w1, w2])
+  assert.deepEqual(r1, { status: 'waiting', waitingFor: 'user' })
+  assert.deepEqual(r2, { status: 'waiting', waitingFor: 'user' })
+  assert.equal(hub.state().agentWaiting, false)
+  assert.deepEqual(hub.state().waitingAgents, [])
+})
+
 function sampleHandoff(overrides: Partial<Handoff> = {}): Handoff {
   return {
     from: '前端',

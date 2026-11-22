@@ -113,10 +113,13 @@ test('pickFallbackBoard 优先回退到 default，否则选第一块剩余画板
   assert.equal(pickFallbackBoard([]), null)
 })
 
-test('拒绝 Windows 保留设备名，并在大小写不敏感磁盘上对齐已有画板名', () => {
-  for (const reserved of ['con', 'CON', 'prn', 'aux', 'nul', 'com1', 'LPT9']) {
-    assert.equal(isValidBoardId(reserved), false)
+test('拒绝 Windows 保留设备名（含带后缀的变体），并在大小写不敏感磁盘上对齐已有画板名', () => {
+  for (const reserved of ['con', 'CON', 'prn', 'aux', 'nul', 'com1', 'LPT9', 'nul.test', 'con.v1', 'COM1.txt', 'lpt9.backup', 'PRN.a.b']) {
+    assert.equal(isValidBoardId(reserved), false, `should reject ${reserved}`)
     assert.throws(() => validateBoardId(reserved))
+  }
+  for (const allowed of ['config', 'console.v1', 'null', 'com10']) {
+    assert.equal(isValidBoardId(allowed), true, `should allow ${allowed}`)
   }
   if (process.platform === 'win32' || process.platform === 'darwin') {
     assert.equal(sameBoardOnDisk('Default', 'default'), true)

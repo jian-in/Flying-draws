@@ -97,10 +97,11 @@ export const routes = {
           : currentBoardId
       // 先不要图，算完语义发现需要时再要，省一次导出；全程处于 serialized() 内避免并发切画板串写
       let snap = await takeSnapshot(image === 'always')
-      const ver = await acceptScene(snap.sceneJson, boardId)
+      let ver = await acceptScene(snap.sceneJson, boardId)
       let res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId, viewer)
       if (image === 'auto' && res.needs_image && !snap.pngBase64) {
         snap = await takeSnapshot(true)
+        ver = await acceptScene(snap.sceneJson, boardId)
         res = describe(snap.sceneJson, ver, { format: String(body.format ?? 'summary'), image }, snap.pngBase64, boardId, viewer)
       }
       const hub = getSession(boardId).hub
@@ -127,6 +128,7 @@ export const routes = {
     return serialized(async () => {
       const question = String(body.question ?? '').trim()
       if (!question) throw new Error('question is required')
+      if (!win || win.isDestroyed() || win.isMinimized()) bringToFront()
       const proposalId = `prop_${randomBytes(6).toString('hex')}`
       const res = await drawOps(body, proposalId)
       if (!res.ok) return res.result
@@ -193,7 +195,8 @@ export const routes = {
       if (!existing) throw new Error(`board "${body.board.trim()}" does not exist in the canvas whose data directory is ${HOME}. Check the board name with canvas_list; if that directory is unexpected, the FLYINGDRAWS_HOME environment variable may be pointing to another canvas instance.`)
       boardId = existing
     }
-    const result: WaitResult = await getSession(boardId).hub.wait(requestId ? { requestId } : { inbox: true, agent: viewer }, seconds * 1000, ctx?.signal)
+    const session = getSession(boardId)
+    const result: WaitResult = await session.hub.wait(requestId ? { requestId } : { inbox: true, agent: viewer }, seconds * 1000, ctx?.signal)
     touchSeat(body)
     if (result.status === 'handoff') {
       const h = result.handoff
@@ -203,7 +206,7 @@ export const routes = {
         to: h.to,
         note: h.note,
         submitted_at: h.at,
-        ...describe(h.sceneJson, h.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, h.pngBase64, boardId, viewer)
+        ...describe(h.sceneJson, h.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, h.pngBase64, session.id, viewer)
       }
     }
     // 请求已经被清掉了（或从来不存在）：它属于哪块画板的记录也不用留
@@ -217,7 +220,7 @@ export const routes = {
       changes: sub.changes ?? null,
       note: sub.note,
       submitted_at: sub.at,
-      ...describe(sub.sceneJson, sub.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, sub.pngBase64, boardId, viewer)
+      ...describe(sub.sceneJson, sub.version, { format: String(body.format ?? 'summary'), image: imageMode(body.image) }, sub.pngBase64, session.id, viewer)
     }
   }
 }

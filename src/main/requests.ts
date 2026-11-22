@@ -301,6 +301,9 @@ export class RequestHub {
       this.settle((t) => 'requestId' in t && t.requestId === req.id, { status: 'cancelled', requestId: req.id })
       changed = true
     }
+    if (this.settle((t) => 'inbox' in t, { status: 'waiting', waitingFor: 'user' })) {
+      changed = true
+    }
     if (this.inbox.length) {
       this.inbox = []
       changed = true

@@ -8,7 +8,7 @@ import { isAppRendererUrl } from './ipcGuard'
 import { trayRepresentations } from './trayIcon'
 import { freshApprovals, hasPendingApprovals, trayTooltip } from './agentNotice'
 import { AGENT_SEAT, type AgentState } from '../shared/agent'
-import { isExcalidrawLibraryBrowseUrl, MAX_LIBRARY_BYTES, parseLibraryInstallNavigation } from '../shared/library'
+import { isExcalidrawLibraryBrowseUrl, MAX_LIBRARY_BYTES, parseLibraryInstallNavigation, validateRemoteLibraryUrl } from '../shared/library'
 import { parseAndValidateLibraryJson } from './library'
 import { BACKGROUND_ARG, TEST_INSTANCE, RENDERER_FILE, statePath } from './paths'
 import { win, setWin, ipc, agent, quitting, setQuitting, setWindowReady, savedTheme, setSavedTheme } from './context'
@@ -253,10 +253,25 @@ function loadRenderer(target: BrowserWindow): void {
   void target.loadURL(url)
 }
 
+const MAX_LIBRARY_REDIRECTS = 5
+
 export async function fetchAndInstallRemoteLibrary(libraryUrl: string): Promise<void> {
   bringToFront()
   try {
-    const res = await net.fetch(libraryUrl, { signal: AbortSignal.timeout(30_000) })
+    let currentUrl = validateRemoteLibraryUrl(libraryUrl)
+    const signal = AbortSignal.timeout(30_000)
+    let res = await net.fetch(currentUrl, { redirect: 'manual', signal })
+    for (let hop = 0; hop < MAX_LIBRARY_REDIRECTS && res.status >= 300 && res.status < 400; hop++) {
+      const location = res.headers.get('location')
+      await res.body?.cancel().catch(() => undefined)
+      if (!location) throw new Error(`HTTP ${res.status}`)
+      currentUrl = validateRemoteLibraryUrl(new URL(location, currentUrl).toString())
+      res = await net.fetch(currentUrl, { redirect: 'manual', signal })
+    }
+    if (res.status >= 300 && res.status < 400) {
+      await res.body?.cancel().catch(() => undefined)
+      throw new Error('素材库重定向次数过多')
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const reader = res.body?.getReader()
     const chunks: Uint8Array[] = []
@@ -352,6 +367,10 @@ export function openLibraryBrowserWindow(browseUrl: string): void {
 
   child.webContents.on('will-redirect', (event, targetUrl) => {
     if (interceptInstallUrl(targetUrl)) {
+      event.preventDefault()
+      return
+    }
+    if (!isExcalidrawLibraryBrowseUrl(targetUrl)) {
       event.preventDefault()
     }
   })

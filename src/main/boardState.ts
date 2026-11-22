@@ -13,7 +13,7 @@ import { BOARDS_DIR, legacyM0Path, pendingPath, statePath } from './paths'
 import { patchAppStateFile } from './appStateFile'
 import { scenePrefsKey } from '../shared/scenePrefs'
 import { hasExactBackground } from '../shared/paper'
-import { win, agent, currentBoardId, setCurrentBoardId } from './context'
+import { win, agent, currentBoardId, setCurrentBoardId, windowReady } from './context'
 import { rpc, takeSnapshot } from './rpc'
 
 export interface VersionRecord {
@@ -172,6 +172,21 @@ export async function loadBoard(id = currentBoardId): Promise<{ board: string; t
 export async function acceptScene(json: string, id = currentBoardId): Promise<number> {
   const session = getSession(id)
   const path = boardFilePath(BOARDS_DIR, id)
+  if (session.version === 0 && session.lastElementsKey === null && existsSync(path)) {
+    try {
+      const diskScene = JSON.parse(await readFile(path, 'utf8'))
+      session.version = Number(diskScene?.flyingdraws?.version) || 1
+      session.title =
+        typeof diskScene?.flyingdraws?.title === 'string' && diskScene.flyingdraws.title.trim()
+          ? diskScene.flyingdraws.title.trim()
+          : null
+      session.lastElementsKey = elementsKey(diskScene.elements ?? [])
+      session.lastPrefsKey = scenePrefsKey(diskScene.appState)
+      session.backgroundMarked = hasExactBackground(diskScene?.flyingdraws)
+    } catch {
+      // 磁盘文件损坏或读取失败时按未初始化处理，避免阻断后续保存
+    }
+  }
   const scene = JSON.parse(json)
   syncBoardSeats(id, (scene.elements ?? []) as SceneElement[])
   const key = elementsKey(scene.elements ?? [])
@@ -233,7 +248,19 @@ export async function listBoards(): Promise<BoardInfo[]> {
   for (const id of diskIds) {
     seen.add(id)
     const active = sameBoardOnDisk(id, currentBoardId)
-    if (active && id !== currentBoardId) setCurrentBoardId(id)
+    if (active && id !== currentBoardId) {
+      const prevId = currentBoardId
+      const oldSession = sessions.get(prevId)
+      if (oldSession) {
+        sessions.delete(prevId)
+        oldSession.id = id
+        sessions.set(id, oldSession)
+      }
+      for (const [reqId, bId] of requestBoard) {
+        if (bId === prevId) requestBoard.set(reqId, id)
+      }
+      setCurrentBoardId(id)
+    }
   }
   // 限并发地读，没改过的画板直接用缓存，不再整份读出来解析
   const metas = await boardMetaCache.readAll(diskIds.map((id) => ({ id, file: boardFilePath(BOARDS_DIR, id) })))
@@ -262,11 +289,20 @@ export async function flushOutgoingScene(
   boardId: string,
   opts: { outgoingSceneJson?: string; updateRenderer?: boolean }
 ): Promise<void> {
+  // 在 serialized() 内向活着的页面现取快照，避免页面入队前拍的 outgoingSceneJson 盖掉刚完成的 agent 绘制结果
+  if (win && !win.isDestroyed()) {
+    try {
+      const snap = await takeSnapshot(false)
+      if (!snap.board || sameBoardOnDisk(snap.board, boardId)) {
+        await acceptScene(snap.sceneJson, boardId)
+      }
+      return
+    } catch (err) {
+      if (typeof opts.outgoingSceneJson !== 'string') throw err
+    }
+  }
   if (typeof opts.outgoingSceneJson === 'string') {
     await acceptScene(opts.outgoingSceneJson, boardId)
-  } else if (opts.updateRenderer && win && !win.isDestroyed()) {
-    const snap = await takeSnapshot(false)
-    await acceptScene(snap.sceneJson, boardId)
   }
 }
 
@@ -320,7 +356,10 @@ export async function switchBoard(
   pushHubState()
 
   if (opts.updateRenderer && switching && win && !win.isDestroyed()) {
-    await rpc('loadScene', { board: targetId, title: loaded.title, version: loaded.version, json: loaded.json })
+    await windowReady
+    if (win && !win.isDestroyed()) {
+      await rpc('loadScene', { board: targetId, title: loaded.title, version: loaded.version, json: loaded.json })
+    }
   }
 
   return {
@@ -410,13 +449,16 @@ export async function renameBoard(
   const boards = await listBoards()
   const hubState = buildHubState(currentBoardId)
   if (opts.updateRenderer && win && !win.isDestroyed()) {
-    await rpc('syncBoards', {
-      board: currentBoardId,
-      title: getSession(currentBoardId).title,
-      version: getSession(currentBoardId).version,
-      boards,
-      hubState
-    })
+    await windowReady
+    if (win && !win.isDestroyed()) {
+      await rpc('syncBoards', {
+        board: currentBoardId,
+        title: getSession(currentBoardId).title,
+        version: getSession(currentBoardId).version,
+        boards,
+        hubState
+      })
+    }
   }
 
   return {
@@ -488,10 +530,13 @@ export async function deleteBoard(
   const hubState = buildHubState(currentBoardId)
 
   if (opts.updateRenderer && win && !win.isDestroyed()) {
-    if (deletedActive) {
-      await rpc('loadScene', { board: loaded.board, title: loaded.title, version: loaded.version, json: loaded.json })
-    } else {
-      await rpc('syncBoards', { board: loaded.board, title: loaded.title, version: loaded.version, boards, hubState })
+    await windowReady
+    if (win && !win.isDestroyed()) {
+      if (deletedActive) {
+        await rpc('loadScene', { board: loaded.board, title: loaded.title, version: loaded.version, json: loaded.json })
+      } else {
+        await rpc('syncBoards', { board: loaded.board, title: loaded.title, version: loaded.version, boards, hubState })
+      }
     }
   }
 

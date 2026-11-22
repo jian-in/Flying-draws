@@ -32,6 +32,8 @@ ipc.handle('board:save', (_e, json: unknown, board?: unknown) =>
     return { board: boardId, path, saveCount, version: ver, savedAt: new Date().toISOString(), skipped: false }
   })
 )
+// 以下四个画板操作保留 currentSceneJson 入参以兼容渲染层，但 flushOutgoingScene 在 serialized() 内会优先现取页面快照，
+// 仅在窗口不可用或取快照失败时才回退使用入队前传入的 outgoingSceneJson。
 ipc.handle('board:create', (_e, payload: { name: string; title?: string; currentSceneJson?: string }) =>
   serialized(() =>
     switchBoard(payload.name, {

@@ -385,11 +385,15 @@ function canvasRegion(b: Bbox, overall: Bbox): string | null {
   return '中间'
 }
 
-// 阅读顺序：按左上角先分行（纵向容差 40px），再从左到右。
+const ROW_BAND_PX = 40
+
+// 阅读顺序：按左上角分 40px 行带，再从左到右（同 x 再按 y 打破平局，满足严格弱序）。
 // 用左上角而不用中心，外框才会排在它里面的小框前面。
-function readingOrder(a: Bbox, b: Bbox): number {
-  if (Math.abs(a.y - b.y) > 40) return a.y - b.y
-  return a.x - b.x
+export function readingOrder(a: Bbox, b: Bbox): number {
+  const rowDiff = Math.floor(a.y / ROW_BAND_PX) - Math.floor(b.y / ROW_BAND_PX)
+  if (rowDiff !== 0) return rowDiff
+  if (a.x !== b.x) return a.x - b.x
+  return a.y - b.y
 }
 
 // 两个框在横向或纵向上有没有投影重叠。都不重叠说明是斜对角关系。
