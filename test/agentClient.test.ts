@@ -20,6 +20,18 @@ createInterface({input:process.stdin}).on('line', line => {
   if(method==='command_error') { send({id,result:{accepted:true}}); event(id,'provider_setup',{error:'配置未保存'}); return event(id,'done'); }
   if(method==='reject') return send({id,error:{code:'busy',message:'当前正在执行任务'}});
   if(method==='echo_size') return send({id,result:{length:params.image.length}});
+  if(method==='split_utf8') {
+    const raw = Buffer.from(JSON.stringify({id,result:{text:'中文边界测试'}}) + '\\r\\n', 'utf8');
+    const idx = raw.indexOf(Buffer.from('中', 'utf8')) + 1;
+    process.stdout.write(raw.subarray(0, idx));
+    setTimeout(() => process.stdout.write(raw.subarray(idx)), 10);
+    return;
+  }
+  if(method==='oversize_no_nl') {
+    const chunk = Buffer.alloc(1024 * 1024, 97);
+    for (let i = 0; i < 11; i++) process.stdout.write(chunk);
+    return;
+  }
   if(method==='crash') return process.exit(17);
   if(method==='hang') return;
   send({id,result:{accepted:true}});
@@ -50,5 +62,16 @@ test('大图片请求保持完整，进程死亡拒绝所有在途请求', async
   const hung = host.request('hang')
   const crashed = host.request('crash')
   await Promise.all([assert.rejects(hung, /内核已退出/), assert.rejects(crashed, /内核已退出/)])
+  assert.equal(host.alive, false)
+  await assert.rejects(host.request('echo_size', { image: '' }), /内核尚未连接/)
+})
+
+test('跨分片 UTF-8 与 CRLF 帧正常解码，无换行超大帧立即失败并终止子进程', async t => {
+  const host = await client(t)
+  assert.deepEqual(await host.request('split_utf8'), { text: '中文边界测试' })
+  const disconnected = new Promise<Error>(resolve => host.once('disconnected', resolve))
+  await assert.rejects(host.request('oversize_no_nl'), /超过大小上限/)
+  const err = await disconnected
+  assert.match(err.message, /超过大小上限/)
   assert.equal(host.alive, false)
 })

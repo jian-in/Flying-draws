@@ -177,3 +177,144 @@ test('工具返回截图时记录原图尺寸、页面 URL、视口和轮次元�
   assert.deepEqual(saved.images[0].meta.viewport, { w: 1280, h: 720 })
   assert.equal(saved.images[0].meta.round, 2)
 })
+
+test('openTask 只调用一次 workspace.open；setWorkspace 过渡期间拒绝并发操作且失败不污染 workspace；starting 时拒绝切换审批模式', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-lifecycle-'))
+  const ws1 = join(home, 'ws1')
+  const ws2 = join(home, 'ws2')
+  t.after(() => rm(home, { recursive: true, force: true }))
+  await mkdir(join(home, 'agent'), { recursive: true })
+  await mkdir(ws1, { recursive: true })
+  await mkdir(ws2, { recursive: true })
+  const item: AgentWorkItem = {
+    id: 'w1', board: 'b1', cwd: ws1, sessionId: 's1', title: '任务一',
+    runs: [{ id: 'r1', mode: 'direct', status: 'completed', goal: '目标', startedAt: '2026-11-18', reply: 'ok', draft: '', tools: [], approvals: [] }]
+  }
+  await writeFile(join(home, 'agent', 'work-items.json'), JSON.stringify({ version: 1, items: [item] }))
+  const service = new AgentService({ home, executable: () => { throw new Error('不应启动真实内核') }, mcpServers: {} })
+  const calls: { method: string; params: Record<string, unknown> }[] = []
+  let openGate: (() => void) | null = null
+  let failNextOpen = false
+  const live = service as unknown as { client: unknown }
+  live.client = {
+    alive: true,
+    stop: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => {
+      calls.push({ method, params })
+      if (method === 'workspace.open') {
+        if (openGate) await new Promise<void>(resolve => { const g = openGate!; openGate = () => { g(); resolve() } })
+        if (failNextOpen) { failNextOpen = false; throw new Error('打开失败') }
+        return { session_id: String(params.session_id ?? 'new-s'), provider: 'p', model: 'm', setup_needed: false, vision: false, choices: [] }
+      }
+      return {}
+    }
+  }
+
+  // openTask 只发一次 workspace.open
+  await service.openTask('w1')
+  assert.equal(calls.filter(c => c.method === 'workspace.open').length, 1)
+  assert.equal(calls[0].params.session_id, 's1')
+  const prevWorkspace = service.snapshot().workspace
+
+  // setWorkspace 进行中：拒绝并发 submit 和 setApprovalMode，且 workspace 未提前改写
+  let releaseOpen: (() => void) | null = null
+  live.client = {
+    alive: true,
+    stop: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => {
+      calls.push({ method, params })
+      if (method === 'workspace.open') {
+        await new Promise<void>(resolve => { releaseOpen = resolve })
+        if (failNextOpen) { failNextOpen = false; throw new Error('打开失败') }
+        return { session_id: 's2', provider: 'p', model: 'm', setup_needed: false, vision: false, choices: [] }
+      }
+      return {}
+    }
+  }
+  failNextOpen = true
+  const switching = service.setWorkspace('b1', ws2)
+  await new Promise(r => setTimeout(r, 20))
+  assert.equal(service.snapshot().workspace, prevWorkspace)
+  await assert.rejects(
+    service.submit({ board: 'b1', goal: '并发', mode: 'direct', capture: { sceneJson: '{"elements":[]}', selectedIds: [], pngBase64: null } }),
+    /另一项操作正在进行/
+  )
+  await assert.rejects(service.setApprovalMode('full-access'), /正在连接/)
+  releaseOpen!()
+  await assert.rejects(switching, /打开失败/)
+  assert.equal(service.snapshot().workspace, prevWorkspace)
+  await service.close()
+})
+
+test('冷启动 submit 保留上一轮 reviewContext；session_reset 同步活动任务 sessionId；离线自动审批不抛错；close 等待 deferredEvents 落盘', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-review-ctx-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  await mkdir(join(home, 'agent'), { recursive: true })
+  const item: AgentWorkItem = {
+    id: 'w1', board: 'default', cwd: home, sessionId: 's1', title: '改按钮',
+    allowedCommands: [{ name: 'pwsh', input: '{"command":"echo hi"}' }],
+    runs: [{
+      id: 'r1', mode: 'direct', status: 'rejected', goal: '首轮', startedAt: '2026-11-18',
+      reply: '已改', draft: '', tools: [], approvals: [],
+      review: { verdict: 'rejected', decidedAt: '2026-11-18', note: '按钮偏右了' }
+    }]
+  }
+  await writeFile(join(home, 'agent', 'work-items.json'), JSON.stringify({ version: 1, items: [item] }))
+  const service = new AgentService({ home, executable: () => { throw new Error('不应启动真实内核') }, mcpServers: {} })
+  const sentRuns: Record<string, unknown>[] = []
+  const live = service as unknown as {
+    client: unknown
+    deferredEvents: Promise<void> | null
+    autoApproved: Map<string, string>
+    onEvent(e: unknown): void
+  }
+  live.client = {
+    alive: true,
+    stop: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => {
+      if (method === 'workspace.open') return { session_id: 's1', provider: 'p', model: 'm', setup_needed: false, vision: false, choices: [] }
+      if (method === 'run.start') { sentRuns.push(params); return {} }
+      return {}
+    }
+  }
+
+  // 冷启动（activeItemId 为 null）直接 submit：prompt 必须包含上一轮 reviewContext
+  assert.equal(service.snapshot().activeItemId, null)
+  await service.submit({ board: 'default', goal: '再调一下', mode: 'direct', capture: { sceneJson: '{"elements":[]}', selectedIds: [], pngBase64: null } })
+  assert.equal(sentRuns.length, 1)
+  assert.match(String(sentRuns[0].text), /按钮偏右了/)
+
+  // session_reset 同步到当前活动工作项的 sessionId
+  const runId = service.snapshot().items[0].runs[1].id
+  live.onEvent({ type: 'event', seq: 1, run_id: runId, req: 1, event: 'session_reset', data: { session_id: 's-reset-2' } })
+  assert.equal(service.snapshot().items[0].sessionId, 's-reset-2')
+
+  // autoApproved 在 run_finished 时清空
+  live.onEvent({ type: 'event', seq: 2, run_id: runId, req: 1, event: 'tool_auto_approved', data: { id: 'orphan-tool', auto_approved: 'readonly_shell' } })
+  assert.equal(live.autoApproved.size, 1)
+  live.onEvent({ type: 'event', seq: 3, run_id: runId, req: 1, event: 'run_finished', data: { outcome: { status: 'completed' } } })
+  if (live.deferredEvents) await live.deferredEvents
+  assert.equal(live.autoApproved.size, 0)
+
+  // 客户端离线时收到命中已记住规则的 approval_request，不抛错且不误标 answered
+  live.client = { alive: false, stop: async () => undefined, request: async () => { throw new Error('dead') } }
+  live.onEvent({
+    type: 'event', seq: 4, run_id: runId, req: 1, event: 'approval_request',
+    data: { request_id: 'req-offline', id: 'tool-offline', name: 'pwsh', description: '操作预览：pwsh: {"command":"echo hi"}' }
+  })
+  assert.equal(service.snapshot().items[0].runs[1].approvals.at(-1)?.answered, false)
+
+  // close() 等待 deferredEvents 完成后再 persist()
+  live.deferredEvents = new Promise<void>(resolve => {
+    setTimeout(() => {
+      service.snapshot() // no-op
+      ;(service as unknown as { state: { items: AgentWorkItem[] } }).state.items[0].title = '收尾后标题'
+      live.deferredEvents = null
+      resolve()
+    }, 30)
+  })
+  await service.close()
+  const saved = JSON.parse(await readFile(join(home, 'agent', 'work-items.json'), 'utf8')).items[0]
+  assert.equal(saved.title, '收尾后标题')
+  assert.equal(saved.sessionId, 's-reset-2')
+})

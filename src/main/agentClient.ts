@@ -1,6 +1,18 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { createInterface } from 'node:readline'
+
+const MAX_FRAME_BYTES = 10 * 1024 * 1024
+
+function killTree(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  if (process.platform === 'win32' && child.pid) {
+    return new Promise<void>(resolve => {
+      execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 5000 }, () => resolve())
+    })
+  }
+  try { child.kill() } catch {}
+  return Promise.resolve()
+}
 
 export interface HostEvent {
   type: 'event'
@@ -28,7 +40,7 @@ export class AgentClient extends EventEmitter {
   private starting: Promise<void> | null = null
 
   constructor(launch: { command: string; args: string[]; env?: NodeJS.ProcessEnv }) { super(); this.launch = launch }
-  get alive(): boolean { return this.child !== null && this.child.exitCode === null && !this.child.killed }
+  get alive(): boolean { return this.child !== null && this.child.exitCode === null && this.child.signalCode === null && !this.child.killed }
 
   start(): Promise<void> {
     if (this.starting) return this.starting
@@ -41,29 +53,75 @@ export class AgentClient extends EventEmitter {
       env: this.launch.env ?? process.env, windowsHide: true, stdio: 'pipe'
     })
     this.child = child
+    child.stdin.on('error', () => {})
     // Consume diagnostics without retaining or forwarding possible credentials.
     child.stderr.resume()
-    const lines = createInterface({ input: child.stdout })
-    lines.on('line', line => {
-      if (this.child !== child) return
-      if (Buffer.byteLength(line) > 10 * 1024 * 1024) {
-        this.fail(new Error('内核响应超过大小上限'), child)
-        child.kill()
-        return
+    let chunks: Buffer[] = []
+    let bufferedBytes = 0
+    const handleLine = (lineBuf: Buffer): boolean => {
+      const trimmed = lineBuf.length > 0 && lineBuf[lineBuf.length - 1] === 0x0d ? lineBuf.subarray(0, -1) : lineBuf
+      const line = trimmed.toString('utf8')
+      try {
+        this.receive(JSON.parse(line))
+        return true
+      } catch {
+        this.fail(new Error('内核返回了无效的协议数据'), child)
+        void killTree(child)
+        return false
       }
-      try { this.receive(JSON.parse(line)) }
-      catch { this.fail(new Error('内核返回了无效的协议数据'), child); child.kill() }
+    }
+    child.stdout.on('data', (chunk: Buffer) => {
+      let offset = 0
+      while (offset < chunk.length) {
+        if (this.child !== child) { chunks = []; bufferedBytes = 0; return }
+        const nl = chunk.indexOf(0x0a, offset)
+        if (nl === -1) {
+          const part = offset === 0 ? chunk : chunk.subarray(offset)
+          bufferedBytes += part.length
+          if (bufferedBytes > MAX_FRAME_BYTES) {
+            chunks = []
+            bufferedBytes = 0
+            this.fail(new Error('内核响应超过大小上限'), child)
+            void killTree(child)
+            return
+          }
+          chunks.push(part)
+          return
+        }
+        const part = chunk.subarray(offset, nl)
+        const lineBytes = bufferedBytes + part.length
+        if (lineBytes > MAX_FRAME_BYTES) {
+          chunks = []
+          bufferedBytes = 0
+          this.fail(new Error('内核响应超过大小上限'), child)
+          void killTree(child)
+          return
+        }
+        const lineBuf = chunks.length ? Buffer.concat([...chunks, part], lineBytes) : part
+        chunks = []
+        bufferedBytes = 0
+        offset = nl + 1
+        if (!handleLine(lineBuf)) return
+      }
+    })
+    child.stdout.on('end', () => {
+      if (this.child !== child || bufferedBytes === 0) { chunks = []; bufferedBytes = 0; return }
+      const lineBuf = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, bufferedBytes)
+      chunks = []
+      bufferedBytes = 0
+      handleLine(lineBuf)
     })
     child.once('error', () => this.fail(new Error('无法启动 Fuxi 内核，请先构建内核或检查程序路径'), child))
     child.once('close', code => {
-      lines.close()
+      chunks = []
+      bufferedBytes = 0
       this.fail(new Error(`Fuxi 内核已退出${code === null ? '' : `（${code}）`}`), child)
     })
     try {
       const hello = await this.request('initialize', { protocol: 1, client: { name: 'Flying draws', version: '0.0.1' } }) as { protocol?: number }
       if (hello?.protocol !== 1) throw new Error('内核协议版本不兼容，请重新构建随应用分发的 Fuxi')
     } catch (error) {
-      child.kill()
+      void killTree(child)
       this.fail(error instanceof Error ? error : new Error('内核初始化失败'), child)
       throw error
     }
@@ -88,7 +146,7 @@ export class AgentClient extends EventEmitter {
       const child = this.child
       if (child) {
         this.fail(new Error(typeof frame.message === 'string' ? frame.message : '内核启动失败'), child)
-        child.kill()
+        void killTree(child)
       }
       return
     }
@@ -121,7 +179,7 @@ export class AgentClient extends EventEmitter {
   }
   request(method: string, params: unknown = {}, waitDone = false, timeout = 30_000): Promise<unknown> {
     const child = this.child
-    if (!child || child.killed) return Promise.reject(new Error('Fuxi 内核尚未连接'))
+    if (!child || child.killed || child.exitCode !== null || child.signalCode !== null) return Promise.reject(new Error('Fuxi 内核尚未连接'))
     const id = ++this.serial
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -145,9 +203,7 @@ export class AgentClient extends EventEmitter {
     await new Promise<void>(resolve => {
       const timer = setTimeout(() => {
         if (child.exitCode !== null || child.signalCode !== null) { resolve(); return }
-        if (process.platform === 'win32' && child.pid) {
-          execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 5000 }, () => resolve())
-        } else { child.kill(); resolve() }
+        void killTree(child).then(resolve)
       }, 12_000)
       child.once('close', () => { clearTimeout(timer); resolve() })
     })

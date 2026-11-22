@@ -67,7 +67,20 @@ const log = (...args: unknown[]) => console.error('[flying-draws-mcp]', ...args)
 
 function readInfo(): DaemonInfo | null {
   try {
-    return JSON.parse(readFileSync(DAEMON_INFO, 'utf8')) as DaemonInfo
+    const raw = JSON.parse(readFileSync(DAEMON_INFO, 'utf8')) as { port?: unknown; token?: unknown }
+    if (
+      !raw ||
+      typeof raw !== 'object' ||
+      typeof raw.port !== 'number' ||
+      !Number.isInteger(raw.port) ||
+      raw.port < 1 ||
+      raw.port > 65535 ||
+      typeof raw.token !== 'string' ||
+      !raw.token.trim()
+    ) {
+      return null
+    }
+    return { port: raw.port, token: raw.token }
   } catch {
     return null
   }
@@ -84,27 +97,39 @@ function call(info: DaemonInfo, path: string, body: unknown, timeoutMs: number, 
       headers['content-type'] = 'application/json'
       headers['content-length'] = data.length
     }
+    let settled = false
+    const settle = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      fn()
+    }
     const req = http.request(
       // signal：工具调用被取消时中止请求，画布那边看到连接断开就撤下这次等待
       { host: '127.0.0.1', port: info.port, path, method: isGet ? 'GET' : 'POST', headers, timeout: timeoutMs, signal },
       (res) => {
         const chunks: Buffer[] = []
+        let ended = false
         res.on('data', (c: Buffer) => chunks.push(c))
+        res.on('error', (err) => settle(() => reject(err)))
         res.on('end', () => {
+          ended = true
           const raw = Buffer.concat(chunks).toString('utf8')
           let parsed: Record<string, unknown> = {}
           try {
             parsed = raw ? (JSON.parse(raw) as Record<string, unknown>) : {}
           } catch {
-            return reject(new Error(`bad response from canvas app (HTTP ${res.statusCode}): ${raw.slice(0, 200)}`))
+            return settle(() => reject(new Error(`bad response from canvas app (HTTP ${res.statusCode}): ${raw.slice(0, 200)}`)))
           }
-          if ((res.statusCode ?? 500) >= 400) reject(new Error(String(parsed.error ?? `HTTP ${res.statusCode}`)))
-          else resolvePromise(parsed)
+          if ((res.statusCode ?? 500) >= 400) settle(() => reject(new Error(String(parsed.error ?? `HTTP ${res.statusCode}`))))
+          else settle(() => resolvePromise(parsed))
+        })
+        res.on('close', () => {
+          if (!ended) settle(() => reject(new Error(`connection closed before response completed (${path})`)))
         })
       }
     )
     req.on('timeout', () => req.destroy(new Error(`request to ${path} timed out`)))
-    req.on('error', reject)
+    req.on('error', (err) => settle(() => reject(err)))
     if (!isGet) req.write(data)
     req.end()
   })
@@ -113,8 +138,8 @@ function call(info: DaemonInfo, path: string, body: unknown, timeoutMs: number, 
 async function healthy(info: DaemonInfo | null): Promise<boolean> {
   if (!info) return false
   try {
-    await call(info, '/health', null, 1500)
-    return true
+    const res = await call(info, '/health', null, 1500)
+    return res.ok === true && (res.pid === undefined || (typeof res.pid === 'number' && Number.isInteger(res.pid) && res.pid > 0))
   } catch {
     return false
   }
@@ -266,7 +291,7 @@ function resolveDesktopLaunch(): DesktopResolution {
   }
 }
 
-function launchApp(): void {
+function launchApp(): { child: ReturnType<typeof spawn>; source: DesktopLaunchTarget['source'] } {
   const resolved = resolveDesktopLaunch()
   if (!resolved.ok) {
     throw new Error(resolved.error)
@@ -284,6 +309,7 @@ function launchApp(): void {
   child.on('error', (err) => log(`Could not start Flying draws (${target.source}):`, err.message))
   child.unref()
   log('launched canvas app via', target.source, 'pid', child.pid)
+  return { child, source: target.source }
 }
 
 function resolveFuxiBinary(desktopResolution: DesktopResolution): string | null {
@@ -523,14 +549,41 @@ async function ensureDaemon(): Promise<DaemonInfo> {
   if (await healthy(info)) return info!
   if (!launching) {
     launching = (async () => {
-      launchApp()
-      const deadline = Date.now() + LAUNCH_TIMEOUT_MS
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 400))
-        const fresh = readInfo()
-        if (await healthy(fresh)) return fresh!
+      const { child, source } = launchApp()
+      let launchFailure: Error | null = null
+      let wake: (() => void) | null = null
+      const onError = (err: Error) => {
+        launchFailure = new Error(`Could not start Flying draws (${source}): ${err.message}`)
+        wake?.()
       }
-      throw new Error('Flying draws canvas app did not start within 30s')
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        // 第二个实例没抢到单实例锁会以 code 0 正常退出，此时继续轮询等待主实例就绪
+        if (code === 0 && !signal) return
+        launchFailure = new Error(
+          `Flying draws (${source}) exited before becoming ready (${signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`})`
+        )
+        wake?.()
+      }
+      child.once('error', onError)
+      child.once('exit', onExit)
+      try {
+        const deadline = Date.now() + LAUNCH_TIMEOUT_MS
+        while (Date.now() < deadline) {
+          if (!launchFailure) {
+            await new Promise<void>((r) => {
+              const t = setTimeout(() => { wake = null; r() }, 400)
+              wake = () => { clearTimeout(t); wake = null; r() }
+            })
+          }
+          const fresh = readInfo()
+          if (await healthy(fresh)) return fresh!
+          if (launchFailure) throw launchFailure
+        }
+        throw new Error('Flying draws canvas app did not start within 30s')
+      } finally {
+        child.off('error', onError)
+        child.off('exit', onExit)
+      }
     })().finally(() => {
       launching = null
     })

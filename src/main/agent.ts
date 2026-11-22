@@ -236,6 +236,7 @@ export class AgentService extends EventEmitter {
   private lastPrune = 0
   private pruning: Promise<void> | null = null
   private autoApproved = new Map<string, string>()
+  private transitioning = false
   private preparingBoard: string | null = null
   private changingBoards = new Set<string>()
   private closing = false
@@ -347,18 +348,24 @@ export class AgentService extends EventEmitter {
     if (!this.client?.alive) throw new Error('内核未连接，请点击重新连接')
     return this.client
   }
-  async connect(board: string): Promise<void> {
+  private async withTransition<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.transitioning) throw new Error('另一项操作正在进行，请稍候')
+    this.transitioning = true
+    try { return await fn() }
+    finally { this.transitioning = false }
+  }
+  async connect(board: string, target?: { item?: AgentWorkItem; cwd?: string; forceOpen?: boolean }): Promise<void> {
     if (this.connecting) {
       await this.connecting
-      if (this.board !== board) await this.connect(board)
+      if (target?.forceOpen || this.board !== board) await this.connect(board, target)
       return
     }
     if (this.state.busy) return
-    if (this.client?.alive && this.state.connection === 'ready' && this.board === board) return
-    this.connecting = this.connectInner(board).finally(() => { this.connecting = null })
+    if (!target?.forceOpen && this.client?.alive && this.state.connection === 'ready' && this.board === board) return
+    this.connecting = this.connectInner(board, target).finally(() => { this.connecting = null })
     return this.connecting
   }
-  private async connectInner(board: string): Promise<void> {
+  private async connectInner(board: string, target?: { item?: AgentWorkItem; cwd?: string; forceOpen?: boolean }): Promise<void> {
     this.requireIdle()
     this.state.connection = 'starting'
     this.state.error = null
@@ -369,6 +376,7 @@ export class AgentService extends EventEmitter {
         this.client = new AgentClient({ command: executable, args: ['--host', '--host-data', this.root, '--config', join(this.root, 'config.toml')] })
         this.client.on('event', (event: HostEvent) => this.onEvent(event))
         this.client.on('disconnected', (error: Error) => {
+          this.autoApproved.clear()
           if (this.closing) {
             this.state.connection = 'offline'
             this.state.busy = false
@@ -385,24 +393,28 @@ export class AgentService extends EventEmitter {
         })
         await this.client.start()
       }
-      const item = [...this.state.items].reverse().find(item => item.board === board && !item.archived)
-      await this.openWorkspace(board, item)
+      const item = target ? target.item : [...this.state.items].reverse().find(item => item.board === board && !item.archived)
+      await this.openWorkspace(board, item, target?.cwd)
     } catch (error) {
       this.state.connection = 'error'
       this.report(error)
       throw error
     }
   }
-  private async openWorkspace(board: string, item?: AgentWorkItem): Promise<void> {
+  private async openWorkspace(board: string, item?: AgentWorkItem, cwdOverride?: string): Promise<void> {
     const key = createHash('sha256').update(board).digest('hex').slice(0, 16)
-    const candidate = item?.cwd || this.state.workspace
+    const hadOverride = Boolean(cwdOverride)
+    let fallbackWorkspace = this.state.workspace
+    let workspaceWarning = hadOverride ? undefined : this.state.workspaceWarning
+    const candidate = cwdOverride || item?.cwd || fallbackWorkspace
     if (candidate && !(await stat(candidate).then(info => info.isDirectory(), () => false))) {
       item = undefined
-      this.state.workspace = ''
-      this.state.workspaceWarning = '原工作目录已不存在或无法访问，历史记录已保留。当前使用应用专用目录，请重新选择项目后开始新任务。'
+      cwdOverride = undefined
+      fallbackWorkspace = ''
+      workspaceWarning = '原工作目录已不存在或无法访问，历史记录已保留。当前使用应用专用目录，请重新选择项目后开始新任务。'
     }
-    const cwd = item?.cwd || this.state.workspace || join(this.root, 'workspaces', key)
-    if (!item && !this.state.workspace) await mkdir(cwd, { recursive: true })
+    const cwd = cwdOverride || item?.cwd || fallbackWorkspace || join(this.root, 'workspaces', key)
+    if (!cwdOverride && !item && !fallbackWorkspace) await mkdir(cwd, { recursive: true })
     let ready: Ready
     try {
       ready = await this.host().request('workspace.open', {
@@ -426,7 +438,7 @@ export class AgentService extends EventEmitter {
     this.sessionId = ready.session_id
     if (item) item.sessionId = ready.session_id
     this.state = {
-      ...this.state, activeItemId: item?.id ?? null, workspace: cwd, connection: 'ready', error: null,
+      ...this.state, activeItemId: item?.id ?? null, workspace: cwd, workspaceWarning, connection: 'ready', error: null,
       provider: ready.provider, model: ready.model, choices: ready.choices ?? [], setupNeeded: ready.setup_needed, vision: ready.vision,
       toolLabels: toolLabels(ready.tools),
       approvalMode: isApprovalMode(ready.approval_mode) ? ready.approval_mode : this.state.approvalMode,
@@ -441,47 +453,41 @@ export class AgentService extends EventEmitter {
     this.changed()
   }
   async setWorkspace(board: string, path: string): Promise<void> {
-    this.requireIdle()
-    const resolved = await realpath(path)
-    if (!(await stat(resolved)).isDirectory()) throw new Error('请选择文件夹')
-    await this.connect(board)
-    const previous = this.state.workspace
-    const previousWarning = this.state.workspaceWarning
-    this.state.workspace = resolved
-    try {
-      await this.openWorkspace(board)
-      this.state.workspaceWarning = undefined
-      this.changed()
-    } catch (error) {
-      this.state.workspace = previous
-      this.state.workspaceWarning = previousWarning
-      this.changed()
-      throw error
-    }
+    return this.withTransition(async () => {
+      this.requireIdle()
+      const resolved = await realpath(path)
+      if (!(await stat(resolved)).isDirectory()) throw new Error('请选择文件夹')
+      await this.connect(board, { cwd: resolved, forceOpen: true })
+    })
   }
   async newTask(board: string): Promise<void> {
-    this.requireIdle()
-    await this.connect(board)
-    await this.openWorkspace(board)
+    return this.withTransition(async () => {
+      this.requireIdle()
+      await this.connect(board, { forceOpen: true })
+    })
   }
   async openTask(id: string): Promise<void> {
-    this.requireIdle()
-    if (id === this.state.activeItemId && this.state.connection === 'ready') return
-    const item = this.state.items.find(item => item.id === id)
-    if (!item) throw new Error('没有找到这项任务')
-    if (item.archived) throw new Error('这项任务所属的画板已删除，记录已归档')
-    await this.connect(item.board)
-    await this.openWorkspace(item.board, item)
+    return this.withTransition(async () => {
+      this.requireIdle()
+      if (id === this.state.activeItemId && this.state.connection === 'ready') return
+      const item = this.state.items.find(item => item.id === id)
+      if (!item) throw new Error('没有找到这项任务')
+      if (item.archived) throw new Error('这项任务所属的画板已删除，记录已归档')
+      await this.connect(item.board, { item, forceOpen: true })
+    })
   }
   async configure(draft: ProviderDraft): Promise<void> {
-    this.requireIdle()
-    if (typeof draft.credential !== 'string' || !draft.credential.trim()) throw new Error('请填写 API Key 或 env:环境变量名')
-    await this.host().request('provider.add', draft, true)
-    if (this.state.setupNeeded || this.state.provider !== draft.name || this.state.model !== draft.model) await this.selectModel(draft.name, draft.model)
+    return this.withTransition(async () => {
+      this.requireIdle()
+      if (typeof draft.credential !== 'string' || !draft.credential.trim()) throw new Error('请填写 API Key 或 env:环境变量名')
+      await this.host().request('provider.add', draft, true)
+      if (this.state.setupNeeded || this.state.provider !== draft.name || this.state.model !== draft.model) await this.selectModelInner(draft.name, draft.model)
+    })
   }
   /** 切换审批模式；内核已连上时当场生效（进行中的任务也从下一个工具调用起生效）。YOLO 只在本次运行内有效。 */
   async setApprovalMode(mode: ApprovalMode): Promise<void> {
     if (!isApprovalMode(mode)) throw new Error('审批模式无效')
+    if (this.state.connection === 'starting' || this.connecting) throw new Error('内核正在连接，请稍后再切换审批模式')
     if (this.state.connection === 'ready' && this.client) {
       const result = await this.host().request('session.set_approval_mode', { mode }) as { mode?: unknown } | undefined
       if (result && result.mode !== undefined && result.mode !== mode) throw new Error('内核没有切换到所选的审批模式')
@@ -492,9 +498,12 @@ export class AgentService extends EventEmitter {
     await atomicWriteJson(this.settingsPath, { approvalMode: mode === 'full-access' ? 'auto-safe' : mode })
     this.changed()
   }
-  async selectModel(provider: string, model: string): Promise<void> {
+  private async selectModelInner(provider: string, model: string): Promise<void> {
     this.requireIdle()
     await this.host().request('provider.switch', { provider, model }, true)
+  }
+  async selectModel(provider: string, model: string): Promise<void> {
+    return this.withTransition(() => this.selectModelInner(provider, model))
   }
   private async ensureItem(board: string): Promise<AgentWorkItem> {
     this.requireRecording()
@@ -509,16 +518,24 @@ export class AgentService extends EventEmitter {
     return item
   }
   async submit(input: AgentSubmission): Promise<void> {
-    this.requireIdle()
-    if (this.preparingBoard) throw new Error('上一项任务正在准备，请稍候')
-    if (this.changingBoards.has(input.board)) throw new Error('画板正在更新，请稍后发送')
-    this.preparingBoard = input.board
-    try { await this.submitPrepared(input) }
-    finally { this.preparingBoard = null }
+    return this.withTransition(async () => {
+      this.requireIdle()
+      if (this.preparingBoard) throw new Error('上一项任务正在准备，请稍候')
+      if (this.changingBoards.has(input.board)) throw new Error('画板正在更新，请稍后发送')
+      this.preparingBoard = input.board
+      try { await this.submitPrepared(input) }
+      finally { this.preparingBoard = null }
+    })
   }
   private async submitPrepared(input: AgentSubmission): Promise<void> {
     const current = this.item()
-    const previousRun = current && current.board === input.board ? current.runs.at(-1) : undefined
+    const willReconnect = !this.client?.alive || this.state.connection !== 'ready' || this.board !== input.board
+    const existing = current && current.board === input.board
+      ? current
+      : willReconnect
+        ? [...this.state.items].reverse().find(item => item.board === input.board && !item.archived)
+        : undefined
+    const previousRun = existing?.runs.at(-1)
     const text = canvasPrompt(input.goal, input.board, input.capture, previousRun)
     const graph = parseCaptureGraph(input.capture)
     const annotations = extractImageAnnotations(graph)
@@ -626,25 +643,28 @@ export class AgentService extends EventEmitter {
     run.status = 'failed'
     run.error = error instanceof Error ? error.message : '内核请求失败'
     run.endedAt = new Date().toISOString()
+    this.autoApproved.clear()
     this.state.busy = false
     this.changed()
   }
   async execute(text: string): Promise<void> {
-    this.requireIdle()
-    this.requireRecording()
-    if (this.preparingBoard) throw new Error('另一项任务正在准备，请稍候')
-    const item = this.item()
-    if (this.changingBoards.has(item?.board ?? this.board)) throw new Error('画板正在更新，请稍后确认执行')
-    const previous = item?.runs.at(-1)
-    if (!item || previous?.status !== 'planned') throw new Error('没有等待确认的计划')
-    const run = this.makeRun(item, text || '按确认的计划执行', 'execute')
-    if (previous.sourceImageRef) run.sourceImageRef = previous.sourceImageRef
-    if (previous.annotations?.length) run.annotations = previous.annotations
-    try {
-      await this.beginBaseline(run, item.cwd)
-      await this.persist()
-      await this.host().request('run.execute_plan', { run_id: run.id, text })
-    } catch (error) { this.failed(run, error); throw error }
+    return this.withTransition(async () => {
+      this.requireIdle()
+      this.requireRecording()
+      if (this.preparingBoard) throw new Error('另一项任务正在准备，请稍候')
+      const item = this.item()
+      if (this.changingBoards.has(item?.board ?? this.board)) throw new Error('画板正在更新，请稍后确认执行')
+      const previous = item?.runs.at(-1)
+      if (!item || previous?.status !== 'planned') throw new Error('没有等待确认的计划')
+      const run = this.makeRun(item, text || '按确认的计划执行', 'execute')
+      if (previous.sourceImageRef) run.sourceImageRef = previous.sourceImageRef
+      if (previous.annotations?.length) run.annotations = previous.annotations
+      try {
+        await this.beginBaseline(run, item.cwd)
+        await this.persist()
+        await this.host().request('run.execute_plan', { run_id: run.id, text })
+      } catch (error) { this.failed(run, error); throw error }
+    })
   }
   async cancel(): Promise<void> {
     const run = this.currentRun()
@@ -681,11 +701,13 @@ export class AgentService extends EventEmitter {
     if (!approval.preview) return false
     const item = this.state.items.find(item => item.runs.includes(run))
     if (!item?.allowedCommands?.some(rule => rule.name === approval.name && rule.input === approval.preview)) return false
+    const client = this.client
+    if (!client?.alive) return false
     approval.answered = true
     approval.autoApproved = true
     if (toolId) this.autoApproved.set(toolId, 'task_rule')
     // 失败时退回让用户自己点：把卡片重新亮出来
-    void this.host().request('approval.respond', { request_id: approval.requestId, decision: 'approve' }).catch(error => {
+    void client.request('approval.respond', { request_id: approval.requestId, decision: 'approve' }).catch(error => {
       approval.answered = false
       approval.autoApproved = false
       if (toolId) this.autoApproved.delete(toolId)
@@ -819,7 +841,11 @@ export class AgentService extends EventEmitter {
       const profile = data.profile as { capabilities?: { vision?: boolean } } | undefined
       this.state.vision = profile?.capabilities?.vision === true
     }
-    if (event.event === 'session_reset' && typeof data.session_id === 'string') this.sessionId = data.session_id
+    if (event.event === 'session_reset' && typeof data.session_id === 'string') {
+      this.sessionId = data.session_id
+      const active = this.item()
+      if (active) active.sessionId = data.session_id
+    }
     if (event.event === 'approval_mode_changed' && isApprovalMode(data.mode)) this.state.approvalMode = data.mode
     const run = event.run_id ? this.state.items.flatMap(item => item.runs).find(run => run.id === event.run_id) : undefined
     if (!run) { this.changed(); return }
@@ -898,9 +924,10 @@ export class AgentService extends EventEmitter {
         run.draft = ''
         run.endedAt = new Date().toISOString()
         for (const approval of run.approvals) approval.answered = true
+        this.autoApproved.clear()
         break
       }
-      case 'done': this.state.busy = false; break
+      case 'done': this.autoApproved.clear(); this.state.busy = false; break
     }
     this.changed(event.event === 'text_delta' || event.event === 'thinking_delta')
     if (event.event === 'task_started' || event.event === 'run_finished') void this.persist().catch(error => this.report(error))
@@ -912,7 +939,14 @@ export class AgentService extends EventEmitter {
     this.persistTimer = null
     this.emitTimer = null
     await this.client?.stop()
-    await Promise.allSettled([...this.imageWrites, ...(this.pruning ? [this.pruning] : [])])
+    while (this.imageWrites.size || this.roundDiffs.size || this.deferredEvents || this.pruning) {
+      await Promise.allSettled([
+        ...this.imageWrites,
+        ...this.roundDiffs,
+        ...(this.deferredEvents ? [this.deferredEvents] : []),
+        ...(this.pruning ? [this.pruning] : [])
+      ])
+    }
     await this.persist()
   }
 }
