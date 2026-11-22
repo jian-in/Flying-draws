@@ -46,7 +46,7 @@ flowchart LR
 
 | 模块路径 | 工程职责 | 依赖特征 |
 |---|---|---|
-| `src/bridge/index.ts` | 10 个 MCP 画布工具注册、席位心跳上报、`setup`/`doctor` CLI、多路径桌面端自动拉起 | Node.js 标准库 + MCP SDK |
+| `src/bridge/index.ts` | 10 个 MCP 画布工具注册、席位心跳上报、`setup`/`doctor`/`call` CLI、多路径桌面端自动拉起 | Node.js 标准库 + MCP SDK |
 | `src/main/ops.ts` | 指令校验、Dagre 自动排版、梁-巴斯基（Liang–Barsky）连线避障、`trace_image` 比例映射、`rebaseOps` 重编号、`elementFingerprints` 指纹、`toProposalPlan` 预览框转换 | 纯函数（仅依赖 `@dagrejs/dagre`） |
 | `src/main/semantic.ts` | 阅读序短编号生成、两阶段并查集手绘聚类与标注圈预判、旁注吸附、裁剪/翻转原图像素逆映射（`canvasRectToImagePixels`） | 纯函数，零外部依赖 |
 | `src/main/imageSize.ts` | PNG / GIF / WebP（VP8/VP8L/VP8X）/ JPEG / SVG 二进制头部零依赖像素尺寸解析 | 纯函数，零外部依赖 |
@@ -60,7 +60,7 @@ flowchart LR
 
 ## 一、双向提议对齐协议（Proposal-Diff Protocol）
 
-**涉及源码**：`src/main/ops.ts`、`src/renderer/src/App.tsx`、`src/main/diff.ts`、`src/main/pending.ts`
+**涉及源码**：`src/main/ops.ts`、`src/renderer/src/canvas/proposal.ts`、`src/renderer/src/App.tsx`、`src/main/diff.ts`、`src/main/pending.ts`
 
 ### 1. 设计动机
 普通画图 MCP 工具只有单向输出（Agent 直接覆写画布），一旦理解偏差就会破坏用户手绘草图；而退回聊天框用文字逐条请示又割裂了空间直觉。Flying draws 设计了类 Git PR Review 的**画布原位提议与手改回流协议**：Agent 把新增与改删意图以「半透明可交互草稿」投射到画布，用户可以直接在提议上拖拽、改字、局部剔除单条修改，画布在确认瞬间自动把人类手改行为编译回自然语言 Diff。
@@ -71,7 +71,7 @@ flowchart LR
 sequenceDiagram
   participant A as Coding Agent
   participant M as Main (ops.ts / diff.ts)
-  participant R as Renderer (App.tsx)
+  participant R as Renderer (App.tsx / proposal.ts)
   participant U as User (Excalidraw)
 
   A->>M: canvas_propose(ops, question, base_version)
@@ -97,7 +97,7 @@ sequenceDiagram
 
 2. **细粒度局部否决（`resolveProposal`）**
    - 用户审阅提议时，如果同意整体方案但反感其中某一处删除或改名，只需直接在画布上选中并按 `Delete` 删掉那一个预览框。
-   - 点击「对，就这样」时，`App.tsx` 中的 `resolveProposal()` 扫描当前未删除元素集合 `liveIds`：仅当 `liveIds.has(m.frameId)` 成立时才将其 `m.targets` 纳入 `approvedTargets` 交由 `applyChanges()` 落地；被用户手动删掉的标记框则自动转化为 `"不同意" + m.summary`（如 `不同意删除节点「登录」`），随后统一清理剩余标记框并将提议层新元素转正为 `layer: 'final'`（恢复 100% 不透明度与实线，同时保留 `trace_image` 原有的虚线属性）。
+   - 点击「对，就这样」时，`src/renderer/src/canvas/proposal.ts` 中的 `resolveProposal()` 扫描当前未删除元素集合 `liveIds`：仅当 `liveIds.has(m.frameId)` 成立时才将其 `m.targets` 纳入 `approvedTargets` 交由 `applyChanges()` 落地；被用户手动删掉的标记框则自动转化为 `"不同意" + m.summary`（如 `不同意删除节点「登录」`），随后统一清理剩余标记框并将提议层新元素转正为 `layer: 'final'`（恢复 100% 不透明度与实线，同时保留 `trace_image` 原有的虚线属性）。
 
 3. **抗手抖几何去噪与语义 Diff 合成（`captureBaseline` & `diffProposal`）**
    - 提议落盘瞬间，`captureBaseline()` 提取提议元素的初始快照 `ProposalBaseline`，不仅记录 `(x, y, w, h, label, from, to)`，还提前把连线两端关联元素的可读名称缓存在 `names: Record<string, string>` 字典中（即使确认前用户把连线指向的旧节点删了，Diff 依然能准确说出「把连线『网关』→『鉴权』改成了…」），同时拍下全画布 `elementIds` 快照。
@@ -110,7 +110,7 @@ sequenceDiagram
 
 ## 二、基于语义指纹的乐观并发控制（Semantic Rebase & Fingerprinting）
 
-**涉及源码**：`src/main/index.ts`（`VersionRecord`、`remember`、`drawOps`）、`src/main/ops.ts`（`rebaseOps`、`elementFingerprints`）
+**涉及源码**：`src/main/boardState.ts`（`VersionRecord`）、`src/main/draw.ts`（`remember`、`drawOps`）、`src/main/ops.ts`（`rebaseOps`、`elementFingerprints`）
 
 ### 1. 工程痛点：短编号漂移与 Excalidraw 派生版本膨胀
 直接让大模型读写 Excalidraw 的 21 位随机 ID 极易产生拼写幻觉，因此语义层按阅读顺序（`readingOrder`：行高容差 `40px` 分行后从左到右）实时编号为 `N1, N2 / T1 / S1 / I1`。这带来两个棘手的并发挑战：

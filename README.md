@@ -185,6 +185,7 @@ node out/bridge/index.js call --list
 | `npm start` | 运行构建好的应用 |
 | `npm run typecheck` | 类型检查 |
 | `npm test` | 单元测试 |
+| `npm run test:fast` | 快速单元测试（跳过耗时的基线和 CLI 测试） |
 | `npm run e2e:draw` | 在隔离实例里跑画板、绘制和提议的端到端测试 |
 | `npm run e2e:agent` | 用本机的假模型服务跑内置 Agent 的端到端测试，不调用真实模型 |
 | `npm run inspect -- <文件>` | 打印一个 `.excalidraw` 文件的结构 |

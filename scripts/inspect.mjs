@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const file = process.argv[2] ?? join(homedir(), '.flyingdraws', 'boards', 'default.excalidraw')
+const home = process.env.FLYINGDRAWS_HOME || join(homedir(), '.flyingdraws')
+const file = process.argv[2] ?? join(home, 'boards', 'default.excalidraw')
 const scene = JSON.parse(readFileSync(file, 'utf8'))
 const elements = (scene.elements ?? []).filter((el) => !el.isDeleted)
 const byId = new Map(elements.map((el) => [el.id, el]))

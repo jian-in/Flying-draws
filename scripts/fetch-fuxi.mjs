@@ -1,7 +1,7 @@
 // 自动获取并校验预编译 Fuxi 宿主内核（免 Rust 工具链、无需公开内核源码，兼容终端代理）。
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { chmodSync, existsSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -81,7 +81,7 @@ async function downloadViaCurl(targetUrl) {
   try {
     await execFileAsync(
       curlBin,
-      ['-fsSL', '--connect-timeout', '15', '--max-time', '90', '-A', 'flying-draws-fetch-fuxi', '-o', tempGz, targetUrl],
+      ['-fsSL', '--connect-timeout', '15', '--max-time', '90', '-A', 'flying-draws-fetch-fuxi', '-o', tempGz, '--', targetUrl],
       { windowsHide: true, timeout: 95_000 }
     )
     return await readFile(tempGz)
@@ -174,6 +174,7 @@ async function main() {
   if (existsSync(binaryPath)) {
     const existing = await readFile(binaryPath)
     if (sha256Hex(existing) === expectedSha256) {
+      if (process.platform !== 'win32') chmodSync(binaryPath, 0o755)
       await writeMetadata(expectedSha256)
       console.log(`[fetch-fuxi] 内置 Fuxi 内核已就绪 -> ${binaryPath}`)
       return
@@ -183,7 +184,7 @@ async function main() {
   const targetUrl = customUrl || DEFAULT_URL
   console.log(`[fetch-fuxi] 正在获取预编译 Fuxi 内核 (${RELEASE_TAG})...`)
   const compressed = await downloadCompressedPayload(targetUrl)
-  const decompressed = gunzipSync(compressed)
+  const decompressed = gunzipSync(compressed, { maxOutputLength: 256 * 1024 * 1024 })
   const actualSha256 = sha256Hex(decompressed)
   if (actualSha256 !== expectedSha256) {
     throw new Error(`Fuxi 内核 SHA-256 校验失败：期望 ${expectedSha256}，实际 ${actualSha256}`)
@@ -194,6 +195,7 @@ async function main() {
   try {
     await writeFile(tempPath, decompressed)
     await rename(tempPath, binaryPath)
+    if (process.platform !== 'win32') chmodSync(binaryPath, 0o755)
   } catch (error) {
     await rm(tempPath, { force: true }).catch(() => {})
     throw error

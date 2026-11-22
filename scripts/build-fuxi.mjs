@@ -8,6 +8,9 @@ import { fileURLToPath } from 'node:url'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const args = process.argv.slice(2)
 const sourceIndex = args.indexOf('--source')
+if (sourceIndex >= 0 && (sourceIndex + 1 >= args.length || !args[sourceIndex + 1])) {
+  throw new Error('参数 --source 缺少路径取值')
+}
 const source = resolve(sourceIndex >= 0 ? args[sourceIndex + 1] : process.env.FLYINGDRAWS_FUXI_SOURCE || join(root, '..', 'fuxi-code'))
 if (!existsSync(join(source, 'Cargo.toml'))) throw new Error('找不到 Fuxi 源码，请用 --source PATH 或 FLYINGDRAWS_FUXI_SOURCE 指定')
 const debug = args.includes('--debug')

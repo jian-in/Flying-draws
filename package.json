@@ -38,7 +38,8 @@
     "visual-diff"
   ],
   "scripts": {
-    "postinstall": "node node_modules/electron/install.js && node scripts/copy-fonts.mjs && node scripts/fetch-fuxi.mjs",
+    "postinstall": "node -e \"const fs=require('node:fs'),cp=require('node:child_process');for(const f of ['node_modules/electron/install.js','scripts/copy-fonts.mjs','scripts/fetch-fuxi.mjs']){if(!fs.existsSync(f))continue;const r=cp.spawnSync(process.execPath,[f],{stdio:'inherit'});if(r.error)throw r.error;if(r.status!==0)process.exit(r.status??1)}\"",
+    "prepack": "npm run build",
     "dev": "electron-vite dev",
     "build": "electron-vite build && tsc -p tsconfig.bridge.json",
     "icons": "electron scripts/generate-icons.cjs",
@@ -48,7 +49,7 @@
     "package:desktop": "node scripts/package-desktop.mjs",
     "package:canvas": "node scripts/package-desktop.mjs --without-fuxi",
     "start": "electron-vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.bridge.json",
     "test": "node --test \"test/*.test.ts\"",
     "test:fast": "node scripts/test-fast.mjs",
     "e2e": "node scripts/e2e.mjs",
