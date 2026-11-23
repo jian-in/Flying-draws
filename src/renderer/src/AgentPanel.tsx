@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { AgentMarkdown } from './AgentMarkdown'
 import { shouldAutoPlaceResultImage } from '../../main/lineage'
-import { pickCompareImage, toolDisplayName, traceImageGoal, type AgentCapture, type AgentResultImage, type AgentRun, type AgentState, type ImageRegionAnnotation, type ProviderDraft, type RoundFileChange } from '../../shared/agent'
+import { pickCompareImage, toolDisplayName, traceImageGoal, type AgentCapture, type AgentResultImage, type AgentRun, type AgentRunUsage, type AgentState, type AgentTelemetry, type ImageRegionAnnotation, type ProviderDraft, type RoundFileChange } from '../../shared/agent'
 import { BASE_URL_PLACEHOLDER, DEFAULT_PRESET, PROVIDER_PRESETS, type PresetId } from '../../shared/providerPresets'
 
 const LABEL: Record<AgentRun['status'], string> = {
@@ -29,6 +29,28 @@ function readableIpcError(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error)
   const tail = text.replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, '').trim()
   return tail || '拉取失败'
+}
+function formatTokens(n: number): string {
+  const value = Math.max(0, Math.round(n))
+  if (value < 1_000) return String(value)
+  if (value < 999_500) {
+    const k = value / 1_000
+    if (k >= 100) return `${Math.round(k)}k`
+    const fixed = k.toFixed(1)
+    return `${fixed.endsWith('.0') ? fixed.slice(0, -2) : fixed}k`
+  }
+  const m = value / 1_000_000
+  return `${m >= 100 ? Math.round(m) : m.toFixed(1)}M`
+}
+function formatRunUsage(usage?: AgentRunUsage): string {
+  if (!usage) return ''
+  const parts: string[] = []
+  if (usage.spentTokens > 0) parts.push(`消耗 ${formatTokens(usage.spentTokens)} tokens`)
+  if (usage.requestsUsed > 0) parts.push(`${usage.requestsUsed} 次请求`)
+  if (typeof usage.cacheHitRate === 'number' && (usage.cacheObservations ?? 0) > 0) {
+    parts.push(`缓存命中 ${Math.round(usage.cacheHitRate * 100)}%`)
+  }
+  return parts.join(' · ')
 }
 
 export function AgentPanel({
@@ -123,6 +145,19 @@ export function AgentPanel({
   const canResume = Boolean(last?.taskId && last.mode !== 'plan' && ['interrupted', 'cancelled', 'failed'].includes(last.status))
   const resumePrevious = canResume && continuation === 'resume'
   const alertError = error || (state.error && state.error !== last?.error ? state.error : null)
+  const telemetry: AgentTelemetry | null = state.telemetry
+    ? state.telemetry
+    : last?.usage
+      ? {
+          contextTokens: last.usage.contextTokens ?? 0,
+          contextLimit: last.usage.contextLimit ?? 0,
+          cacheHitRate: last.usage.cacheHitRate ?? null,
+          cacheObservations: last.usage.cacheObservations ?? 0,
+          requestsUsed: last.usage.requestsUsed,
+          spentTokens: last.usage.spentTokens,
+          estimatedCost: last.usage.estimatedCost
+        }
+      : null
 
   useEffect(() => {
     let live = true
@@ -476,19 +511,21 @@ export function AgentPanel({
               <p>画草图、圈出问题，或直接写下目标。Agent 会带着画布上下文开始工作。</p>
               <p className="fd-agent-small">选中元素时只发送选区；未选择时发送当前画板。需要操作文件时，请先选择项目目录。</p>
               {state.setupNeeded ? <button className="fd-agent-primary" onClick={() => setSettings(true)}>先连接模型</button> : null}
-            </div> : active.runs.map((run, index) => <article className="fd-agent-run" key={run.id}>
+            </div> : active.runs.map((run, index) => {
+              const usageText = run.status !== 'running' ? formatRunUsage(run.usage) : ''
+              return <article className="fd-agent-run" key={run.id}>
               <div className="fd-agent-run-meta"><span>第 {index + 1} 轮 · {run.mode === 'plan' ? '规划' : run.mode === 'execute' ? '执行' : run.mode === 'resume' ? '续接' : '任务'}</span><span className={`fd-agent-run-status fd-agent-run-${run.status}`}>{LABEL[run.status]}</span></div>
               <p className="fd-agent-goal">{run.goal}</p>
               <Thinking run={run} />
+              {run.tools.length ? <details className="fd-agent-tools"><summary>工具记录 · {run.tools.length} 项{run.tools.some(t => t.status === 'running') && run.status === 'running' ? ' · 正在执行' : ''}</summary>
+                {run.tools.map((tool, toolIndex) => <details key={`${tool.id}/${toolIndex}`}><summary><span>{tool.status === 'completed' ? '✓' : tool.status === 'failed' ? '×' : '·'}</span> {toolDisplayName(tool.name, state.toolLabels)}{tool.autoApproved ? <span className="fd-agent-small" title="按规则自动放行，没有弹窗确认"> · 自动放行（{AUTO_APPROVED[tool.autoApproved] ?? tool.autoApproved}）</span> : null}</summary><pre>{tool.input}{tool.result ? `\n\n${tool.result}` : ''}</pre></details>)}
+              </details> : null}
+              <RoundChangesView run={run} />
+              {run.images?.map(image => <ResultImage key={image.id} image={image} placed={Boolean(placedImageIds?.has(image.id))} disabled={working || state.busy || active?.board !== board} onPreview={(src, alt) => setPreviewSrc({ src, alt })} onInsert={dataURL => act(() => insertImage(image, dataURL, { annotations: run.annotations }))} onLoaded={() => { if (follow.current && !pointerDownRef.current) scrollToBottom() }} />)}
+              {run.plan ? <div className="fd-agent-plan"><strong>{run.status === 'planned' ? '待确认的计划' : '本轮计划'}</strong><AgentMarkdown text={run.reply || planBody(run.plan)} /></div> : null}
               {/* A plan's text is the model's reply; show it once, inside the plan box. */}
               {run.reply && !run.plan ? <div className="fd-agent-reply"><AgentMarkdown text={run.reply} /></div> : null}
               {run.draft ? <div className="fd-agent-reply fd-agent-draft"><AgentMarkdown text={run.draft} draft /></div> : null}
-              {run.plan ? <div className="fd-agent-plan"><strong>{run.status === 'planned' ? '待确认的计划' : '本轮计划'}</strong><AgentMarkdown text={run.reply || planBody(run.plan)} /></div> : null}
-              {run.tools.length ? <details className="fd-agent-tools"><summary>工具记录 · {run.tools.length} 项{run.tools.some(t => t.status === 'running') && run.status === 'running' ? ' · 正在执行' : ''}</summary>
-                {run.tools.map((tool, index) => <details key={`${tool.id}/${index}`}><summary><span>{tool.status === 'completed' ? '✓' : tool.status === 'failed' ? '×' : '·'}</span> {toolDisplayName(tool.name, state.toolLabels)}{tool.autoApproved ? <span className="fd-agent-small" title="按规则自动放行，没有弹窗确认"> · 自动放行（{AUTO_APPROVED[tool.autoApproved] ?? tool.autoApproved}）</span> : null}</summary><pre>{tool.input}{tool.result ? `\n\n${tool.result}` : ''}</pre></details>)}
-              </details> : null}
-              <RoundChangesView run={run} />
-              {run.images?.map(image => <ResultImage key={image.id} image={image} placed={Boolean(placedImageIds?.has(image.id))} disabled={working || state.busy || active?.board !== board} onPreview={(src, alt) => setPreviewSrc({ src, alt })} onInsert={dataURL => act(() => insertImage(image, dataURL, { annotations: run.annotations }))} />)}
               {run.verificationWarning ? <p className="fd-agent-small fd-agent-warning">{run.verificationWarning}</p> : null}
               {run.status === 'unverified' && !run.verificationWarning ? <p className="fd-agent-small">本轮已结束，仍有结果未经独立检查，请结合产物确认。</p> : null}
               {run.status === 'needs_review' || (run.status === 'unverified' && run.compareImageId) ? <ReviewBox
@@ -503,7 +540,11 @@ export function AgentPanel({
               /> : null}
               {run.review ? <p className="fd-agent-small">{run.review.verdict === 'approved' ? '你已确认改对了。' : `你标记了没改对${run.review.note ? `：${run.review.note}` : ''}；下一轮会带上这条说明。`}</p> : null}
               {run.error ? <p className="fd-agent-error">{run.error}</p> : null}
-            </article>)}
+              {run.status !== 'running' ? <div className="fd-agent-run-foot">
+                <span className={`fd-agent-run-status fd-agent-run-${run.status}`}>{LABEL[run.status]}</span>
+                {usageText ? <span className="fd-agent-run-usage">{usageText}</span> : null}
+              </div> : null}
+            </article>})}
           </div>
           {!following && state.busy ? (
             <button
@@ -532,6 +573,7 @@ export function AgentPanel({
             <button className="fd-agent-link" disabled={working} title={active.allowedCommands.map(rule => `${toolDisplayName(rule.name, state.toolLabels)}：${rule.input}`).join('\n')} onClick={() => void act(() => api.clearAllowedCommands())}>清空</button>
           </p> : null}
           {alertError ? <div className="fd-agent-error fd-agent-alert" role="alert">{alertError}</div> : null}
+          {state.connection === 'ready' && telemetry ? <TelemetryBar telemetry={telemetry} /> : null}
           <div className="fd-agent-composer">
             {state.connection !== 'ready' ? <button className="fd-agent-primary" disabled={state.connection === 'starting' || working} onClick={() => void act(() => api.connect(board))}>{state.connection === 'starting' ? '连接中…' : '重新连接内核'}</button> : <>
               {canResume ? <select className="fd-agent-continuation" aria-label="后续任务方式" disabled={working || state.busy} value={continuation} onChange={e => setContinuation(e.target.value as 'resume' | 'new')}>
@@ -664,18 +706,63 @@ function ReviewBox({ run, disabled, onShow, onDecide }: {
   </div>
 }
 
+function TelemetryBar({ telemetry }: { telemetry: AgentTelemetry }) {
+  const ctx = telemetry.contextTokens ?? 0
+  const limit = telemetry.contextLimit ?? 0
+  const hasLimit = limit > 0
+  const rawPct = hasLimit ? (ctx / limit) * 100 : 0
+  const pct = hasLimit ? Math.max(0, Math.round(rawPct)) : 0
+  const fillPct = hasLimit ? Math.min(100, Math.max(0, rawPct)) : 0
+  const level = pct >= 90 ? 'fd-agent-telemetry-danger' : pct >= 75 ? 'fd-agent-telemetry-warn' : ''
+  const obs = telemetry.cacheObservations ?? 0
+  const hit = telemetry.cacheHitRate
+  const hasCache = typeof hit === 'number' && obs > 0
+  const spent = telemetry.spentTokens ?? 0
+  const reqs = telemetry.requestsUsed ?? 0
+
+  return (
+    <div className="fd-agent-telemetry" aria-label="上下文与用量">
+      <div className="fd-agent-telemetry-row">
+        <span
+          className={level || undefined}
+          title={hasLimit ? `当前上下文 ${ctx.toLocaleString()} / ${limit.toLocaleString()} tokens` : ctx > 0 ? `当前上下文 ${ctx.toLocaleString()} tokens` : '尚未收到上下文统计'}
+        >
+          {hasLimit ? `上下文 ${formatTokens(ctx)} / ${formatTokens(limit)} (${pct}%)` : ctx > 0 ? `上下文 ${formatTokens(ctx)}` : '上下文 —'}
+        </span>
+        <div className="fd-agent-telemetry-items">
+          <span title={hasCache ? `提示词缓存命中率（已观测 ${obs} 次请求）` : `已观测 ${obs} 次请求`}>
+            {hasCache ? `缓存命中 ${Math.round(hit * 100)}%` : '缓存 —'}
+          </span>
+          {spent > 0 ? (
+            <span title={reqs > 0 ? `本轮消耗 ${spent.toLocaleString()} tokens（${reqs} 次调用）` : `本轮消耗 ${spent.toLocaleString()} tokens`}>
+              消耗 {formatTokens(spent)}
+            </span>
+          ) : null}
+        </div>
+      </div>
+      {hasLimit ? (
+        <div className="fd-agent-telemetry-bar" aria-hidden="true">
+          <div className={`fd-agent-telemetry-fill${level ? ` ${level}` : ''}`} style={{ width: `${fillPct}%` }} />
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function ResultImage({
   image,
   placed = false,
   disabled,
   onPreview,
-  onInsert
+  onInsert,
+  onLoaded
 }: {
   image: AgentResultImage
   placed?: boolean
   disabled: boolean
   onPreview(src: string, alt: string): void
   onInsert(dataURL: string): Promise<boolean>
+  onLoaded?: () => void
 }) {
   const [dataURL, setDataURL] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -694,7 +781,7 @@ function ResultImage({
   if (image.meta?.changedFiles?.length) captionParts.push(image.meta.changedFiles.slice(0, 2).join(', '))
   const onCanvas = placed || inserted
   return <figure className="fd-agent-result-image">
-    {dataURL ? <img src={dataURL} alt={image.name} title="点击查看大图" onClick={() => onPreview(dataURL, image.name)} /> : <span>{error || '读取结果图片…'}</span>}
+    {dataURL ? <img src={dataURL} alt={image.name} title="点击查看大图" onLoad={onLoaded} onClick={() => onPreview(dataURL, image.name)} /> : <span>{error || '读取结果图片…'}</span>}
     <figcaption>
       <span title={image.meta?.url || image.meta?.sourcePath || image.name}>{captionParts.join(' · ')}</span>
       <button disabled={disabled || !dataURL} onClick={() => {

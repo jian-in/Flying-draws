@@ -524,3 +524,136 @@ test('persist() 在运行中落盘时保留内存里的 run 引用与实时流�
   assert.equal(savedRun.thinkingDraft, '')
   await service.close()
 })
+
+test('context、request_context、policy 与 run_finished 实时更新 telemetry 与 run.usage，落盘保留并在重置/切换会话时清空', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-telemetry-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  await mkdir(join(home, 'agent'), { recursive: true })
+  const item: AgentWorkItem = {
+    id: 'w1',
+    board: 'default',
+    cwd: home,
+    sessionId: 's1',
+    title: '统计用量',
+    runs: [{
+      id: 'run1',
+      mode: 'direct',
+      status: 'completed',
+      goal: '测试统计',
+      startedAt: '2026-11-23',
+      reply: '',
+      draft: '',
+      tools: [],
+      approvals: []
+    }]
+  }
+  await writeFile(join(home, 'agent', 'work-items.json'), JSON.stringify({ version: 1, items: [item] }))
+  const service = new AgentService({ home, executable: () => { throw new Error('不应启动真实内核') }, mcpServers: {} })
+  const live = service as unknown as {
+    client: unknown
+    state: { activeItemId: string | null; items: AgentWorkItem[] }
+    onEvent(e: unknown): void
+  }
+  live.client = {
+    alive: true,
+    stop: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => {
+      if (method === 'workspace.open') {
+        return { session_id: String(params.session_id ?? 's-fresh'), provider: 'p', model: 'm', setup_needed: false, vision: false, choices: [] }
+      }
+      return {}
+    }
+  }
+  await service.openTask('w1')
+  assert.equal(service.snapshot().telemetry, undefined)
+
+  // 1) context (run_id: null) 初始化上下文与缓存统计
+  live.onEvent({
+    type: 'event', seq: 1, run_id: null, req: null, event: 'context',
+    data: { cache_hit_rate: null, cache_observations: 0, max_tokens: 128_000, total_tokens: 6_400 }
+  })
+  assert.deepEqual(service.snapshot().telemetry, {
+    contextTokens: 6_400,
+    contextLimit: 128_000,
+    cacheHitRate: null,
+    cacheObservations: 0
+  })
+
+  // 2) request_context 给出更精确的估算输入，之后的非零 context.total_tokens 不覆盖它
+  live.onEvent({
+    type: 'event', seq: 2, run_id: 'run1', req: 1, event: 'request_context',
+    data: { estimated_input_tokens: 11_700, context_limit: 128_000, request_number: 1 }
+  })
+  live.onEvent({
+    type: 'event', seq: 3, run_id: 'run1', req: 1, event: 'context',
+    data: { cache_hit_rate: 0.8, cache_observations: 2, max_tokens: 128_000, total_tokens: 8_000 }
+  })
+  assert.equal(service.snapshot().telemetry?.contextTokens, 11_700)
+  assert.equal(service.snapshot().telemetry?.cacheHitRate, 0.8)
+  assert.equal(service.snapshot().telemetry?.cacheObservations, 2)
+
+  // 3) policy 更新消耗、请求数和费用，并同步到 run.usage
+  live.onEvent({
+    type: 'event', seq: 4, run_id: 'run1', req: 1, event: 'policy',
+    data: { requests_used: 2, spent_tokens: 1_200, estimated: false, estimated_cost: 0.015, cost_complete: true }
+  })
+  assert.equal(service.snapshot().telemetry?.requestsUsed, 2)
+  assert.equal(service.snapshot().telemetry?.spentTokens, 1_200)
+  assert.equal(service.snapshot().telemetry?.estimatedCost, 0.015)
+  assert.deepEqual(service.snapshot().items[0].runs[0].usage, {
+    spentTokens: 1_200,
+    requestsUsed: 2,
+    cacheHitRate: 0.8,
+    cacheObservations: 2,
+    contextTokens: 11_700,
+    contextLimit: 128_000,
+    estimatedCost: 0.015
+  })
+
+  // 4) run_finished 用 outcome.spent_tokens 校正 run.usage 并落盘
+  live.onEvent({
+    type: 'event', seq: 5, run_id: 'run1', req: 1, event: 'run_finished',
+    data: { outcome: { status: 'completed', spent_tokens: 1_350 } }
+  })
+  assert.equal(service.snapshot().items[0].runs[0].usage?.spentTokens, 1_350)
+
+  // 5) context.total_tokens === 0 重置 hasRequestContext，使后续非零 total_tokens 生效
+  live.onEvent({
+    type: 'event', seq: 6, run_id: null, req: null, event: 'context',
+    data: { cache_hit_rate: null, cache_observations: 0, max_tokens: 128_000, total_tokens: 0 }
+  })
+  assert.equal(service.snapshot().telemetry?.contextTokens, 0)
+  live.onEvent({
+    type: 'event', seq: 7, run_id: null, req: null, event: 'context',
+    data: { cache_hit_rate: 0.5, cache_observations: 1, max_tokens: 128_000, total_tokens: 3_200 }
+  })
+  assert.equal(service.snapshot().telemetry?.contextTokens, 3_200)
+
+  // 6) session_reset 清空 telemetry
+  live.onEvent({
+    type: 'event', seq: 8, run_id: null, req: null, event: 'session_reset',
+    data: { session_id: 's-reset' }
+  })
+  assert.equal(service.snapshot().telemetry, undefined)
+
+  // 7) 写入 telemetry 后通过 newTask 重新打开工作区，也应清空 telemetry
+  live.onEvent({
+    type: 'event', seq: 9, run_id: null, req: null, event: 'context',
+    data: { cache_hit_rate: 0.6, cache_observations: 3, max_tokens: 128_000, total_tokens: 5_000 }
+  })
+  assert.ok(service.snapshot().telemetry)
+  await service.newTask('default')
+  assert.equal(service.snapshot().telemetry, undefined)
+
+  await service.close()
+  const saved = JSON.parse(await readFile(join(home, 'agent', 'work-items.json'), 'utf8')) as { items: AgentWorkItem[] }
+  assert.deepEqual(saved.items[0].runs[0].usage, {
+    spentTokens: 1_350,
+    requestsUsed: 2,
+    cacheHitRate: 0.8,
+    cacheObservations: 2,
+    contextTokens: 11_700,
+    contextLimit: 128_000,
+    estimatedCost: 0.015
+  })
+})

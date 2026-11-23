@@ -69,6 +69,7 @@ import {
   type AgentRunReview,
   type AgentState,
   type AgentSubmission,
+  type AgentTelemetry,
   type AgentWorkItem,
   type ApprovalMode,
   type ImageRegionAnnotation,
@@ -347,6 +348,7 @@ export class AgentService extends EventEmitter {
   private preparingBoard: string | null = null
   private changingBoards = new Set<string>()
   private closing = false
+  private hasRequestContext = false
 
   constructor(options: Options) {
     super()
@@ -445,6 +447,44 @@ export class AgentService extends EventEmitter {
   snapshot(): AgentState { return structuredClone(this.state) }
   private item(): AgentWorkItem | undefined { return this.state.items.find(item => item.id === this.state.activeItemId && !item.archived) }
   private currentRun(): AgentRun | undefined { return this.item()?.runs.at(-1) }
+  private ensureTelemetry(): AgentTelemetry {
+    if (!this.state.telemetry) {
+      this.state.telemetry = {
+        contextTokens: 0,
+        contextLimit: 0,
+        cacheHitRate: null,
+        cacheObservations: 0
+      }
+    }
+    return this.state.telemetry
+  }
+  private syncRunUsage(run: AgentRun, telemetry: AgentTelemetry): void {
+    const prev = run.usage
+    run.usage = {
+      spentTokens: telemetry.spentTokens ?? prev?.spentTokens ?? 0,
+      requestsUsed: telemetry.requestsUsed ?? prev?.requestsUsed ?? 0,
+      cacheHitRate: telemetry.cacheHitRate,
+      cacheObservations: telemetry.cacheObservations,
+      contextTokens: telemetry.contextTokens,
+      contextLimit: telemetry.contextLimit,
+      ...(telemetry.estimatedCost !== undefined
+        ? { estimatedCost: telemetry.estimatedCost }
+        : prev?.estimatedCost !== undefined
+          ? { estimatedCost: prev.estimatedCost }
+          : {})
+    }
+  }
+  private syncFinishedUsage(run: AgentRun, spentTokens?: number): void {
+    if (this.state.telemetry) {
+      if (spentTokens !== undefined) this.state.telemetry.spentTokens = spentTokens
+      this.syncRunUsage(run, this.state.telemetry)
+    } else if (spentTokens !== undefined) {
+      run.usage = {
+        ...(run.usage ?? { requestsUsed: 0 }),
+        spentTokens
+      }
+    }
+  }
   private changed(stream = false): void {
     if (this.closing) return
     if (stream) {
@@ -565,10 +605,12 @@ export class AgentService extends EventEmitter {
     this.board = board
     this.sessionId = ready.session_id
     if (item) item.sessionId = ready.session_id
+    this.hasRequestContext = false
     this.state = {
       ...this.state, activeItemId: item?.id ?? null, workspace: cwd, workspaceWarning, connection: 'ready', error: null,
       provider: ready.provider, model: ready.model, choices: ready.choices ?? [], setupNeeded: ready.setup_needed, vision: ready.vision,
       toolLabels: toolLabels(ready.tools),
+      telemetry: undefined,
       approvalMode: isApprovalMode(ready.approval_mode) ? ready.approval_mode : this.state.approvalMode,
       toolStorage: ready.tool_storage?.mode
         ? {
@@ -747,6 +789,14 @@ export class AgentService extends EventEmitter {
   private makeRun(item: AgentWorkItem, goal: string, mode: AgentRun['mode']): AgentRun {
     const run: AgentRun = { id: randomUUID(), mode, goal, status: 'running', startedAt: new Date().toISOString(), reply: '', draft: '', tools: [], approvals: [] }
     item.runs.push(run)
+    if (mode !== 'resume' && this.state.telemetry) {
+      this.state.telemetry = {
+        ...this.state.telemetry,
+        requestsUsed: undefined,
+        spentTokens: undefined,
+        estimatedCost: undefined
+      }
+    }
     this.state.busy = true
     this.state.error = null
     this.changed()
@@ -991,13 +1041,47 @@ export class AgentService extends EventEmitter {
       const profile = data.profile as { capabilities?: { vision?: boolean } } | undefined
       this.state.vision = profile?.capabilities?.vision === true
     }
-    if (event.event === 'session_reset' && typeof data.session_id === 'string') {
-      this.sessionId = data.session_id
-      const active = this.item()
-      if (active) active.sessionId = data.session_id
+    if (event.event === 'session_reset') {
+      this.hasRequestContext = false
+      this.state.telemetry = undefined
+      if (typeof data.session_id === 'string') {
+        this.sessionId = data.session_id
+        const active = this.item()
+        if (active) active.sessionId = data.session_id
+      }
     }
     if (event.event === 'approval_mode_changed' && isApprovalMode(data.mode)) this.state.approvalMode = data.mode
     const run = event.run_id ? this.state.items.flatMap(item => item.runs).find(run => run.id === event.run_id) : undefined
+    if (event.event === 'context' || event.event === 'request_context' || event.event === 'policy') {
+      const t = this.ensureTelemetry()
+      if (event.event === 'context') {
+        if (typeof data.max_tokens === 'number' && data.max_tokens > 0) t.contextLimit = data.max_tokens
+        if (typeof data.total_tokens === 'number') {
+          if (data.total_tokens === 0) {
+            this.hasRequestContext = false
+            t.contextTokens = 0
+          } else if (!this.hasRequestContext) {
+            t.contextTokens = data.total_tokens
+          }
+        }
+        if (typeof data.cache_hit_rate === 'number' || data.cache_hit_rate === null) t.cacheHitRate = data.cache_hit_rate
+        if (typeof data.cache_observations === 'number') t.cacheObservations = data.cache_observations
+      } else if (event.event === 'request_context') {
+        if (typeof data.context_limit === 'number' && data.context_limit > 0) t.contextLimit = data.context_limit
+        if (typeof data.estimated_input_tokens === 'number' && data.estimated_input_tokens >= 0) {
+          t.contextTokens = data.estimated_input_tokens
+          this.hasRequestContext = true
+        }
+      } else if (event.event === 'policy') {
+        if (typeof data.requests_used === 'number') t.requestsUsed = data.requests_used
+        if (typeof data.spent_tokens === 'number') t.spentTokens = data.spent_tokens
+        if (typeof data.estimated_cost === 'number' || data.estimated_cost === null) t.estimatedCost = data.estimated_cost
+      }
+      const targetRun = run ?? (this.state.busy ? this.currentRun() : undefined)
+      if (targetRun) this.syncRunUsage(targetRun, t)
+      this.changed(true)
+      return
+    }
     if (!run) { this.changed(); return }
     switch (event.event) {
       case 'task_started': run.taskId = String(data.task_id); break
@@ -1051,10 +1135,21 @@ export class AgentService extends EventEmitter {
         break
       }
       case 'error': run.error = String(data.error ?? '任务执行失败'); break
-      case 'task_finished': run.outcome = data; break
+      case 'task_finished': {
+        run.outcome = data
+        const spent = typeof data.spent_tokens === 'number' ? data.spent_tokens : undefined
+        if (spent !== undefined) this.syncFinishedUsage(run, spent)
+        break
+      }
       case 'run_finished': {
         if (data.task_id) run.taskId = String(data.task_id)
         if (data.outcome && typeof data.outcome === 'object') run.outcome = data.outcome as Record<string, unknown>
+        const spent = typeof data.spent_tokens === 'number'
+          ? data.spent_tokens
+          : typeof run.outcome?.spent_tokens === 'number'
+            ? run.outcome.spent_tokens
+            : undefined
+        if (spent !== undefined || this.state.telemetry) this.syncFinishedUsage(run, spent)
         if (data.error) run.error = String(data.error)
         const status = run.outcome?.status
         if ((status === 'completed' || status === 'cancelled') && !data.error) run.error = undefined

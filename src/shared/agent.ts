@@ -84,6 +84,24 @@ export type RunStatus =
   | 'needs_review'
   /** 用户看过对照图，说没改对 */
   | 'rejected'
+export interface AgentTelemetry {
+  contextTokens: number
+  contextLimit: number
+  cacheHitRate: number | null
+  cacheObservations: number
+  requestsUsed?: number
+  spentTokens?: number
+  estimatedCost?: number | null
+}
+export interface AgentRunUsage {
+  spentTokens: number
+  requestsUsed: number
+  cacheHitRate?: number | null
+  cacheObservations?: number
+  contextTokens?: number
+  contextLimit?: number
+  estimatedCost?: number | null
+}
 export interface AgentRunReview {
   verdict: 'approved' | 'rejected'
   note?: string
@@ -123,6 +141,8 @@ export interface AgentRun {
   roundChanges?: RoundChanges
   /** 没能按快照统计本轮改动的原因（不是 git 仓库、快照失败等） */
   roundChangesNote?: string
+  /** 本轮消耗的 token、调用次数与上下文/缓存统计 */
+  usage?: AgentRunUsage
 }
 /** git：工作目录在 git 仓库里；plain：普通文件夹，快照库自己当 git 目录来拍 */
 export type SnapshotMode = 'git' | 'plain'
@@ -192,6 +212,8 @@ export interface AgentState {
   toolStorage?: { mode: string; artifactsDir?: string; jobsDir?: string }
   /** 工具审批模式：auto-safe（默认，按风险询问）或 full-access（YOLO，全部自动执行、不再询问）。YOLO 只在本次运行内有效，重启应用回到 auto-safe。 */
   approvalMode: ApprovalMode
+  /** 当前会话的实时上下文窗口、缓存命中率与消耗统计 */
+  telemetry?: AgentTelemetry
   activeItemId: string | null
   items: AgentWorkItem[]
 }
