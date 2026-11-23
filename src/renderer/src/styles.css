@@ -43,7 +43,11 @@ body,
 .fd-agent .fd-agent-workspace { border: 0; background: transparent; padding: 8px 0 0; width: 100%; display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--fd-muted); text-align: left; }
 .fd-agent-workspace > span:first-child, .fd-agent-workspace > span:last-child { flex: none; }
 .fd-agent-workspace > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.fd-agent-history-row { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
 .fd-agent-history { width: 100%; margin-top: 8px; border: 1px solid var(--fd-border); background: var(--fd-surface); padding: 3px 5px; border-radius: 3px; font-size: 11px !important; }
+.fd-agent-history-row > .fd-agent-history { flex: 1; min-width: 0; margin-top: 0; }
+.fd-agent-history-delete { flex: none; padding: 3px 7px !important; font-size: 11px !important; border-radius: 3px !important; white-space: nowrap; }
+.fd-agent-history-delete:hover:enabled { color: var(--fd-danger); border-color: var(--fd-danger); }
 .fd-agent-lineage-toggle { margin-top: 8px; cursor: pointer; user-select: none; font-size: 10.5px !important; line-height: 1.4; }
 .fd-agent-lineage-toggle input { cursor: pointer; margin: 0; flex: none; }
 .fd-agent-transcript-wrap { flex: 1; min-height: 60px; position: relative; display: flex; flex-direction: column; }

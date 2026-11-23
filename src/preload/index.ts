@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('flyingdraws', {
     chooseWorkspace: (board: string) => ipcRenderer.invoke('agent:workspace', board),
     newTask: (board: string) => ipcRenderer.invoke('agent:new', board),
     openTask: (id: string) => ipcRenderer.invoke('agent:open', id),
+    deleteTask: (id: string) => ipcRenderer.invoke('agent:delete', id),
     submit: (input: unknown) => ipcRenderer.invoke('agent:submit', input),
     execute: (text: string) => ipcRenderer.invoke('agent:execute', text),
     cancel: () => ipcRenderer.invoke('agent:cancel'),

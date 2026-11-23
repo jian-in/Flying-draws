@@ -1,9 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { AgentService, canvasPrompt } from '../src/main/agent.ts'
+import { AgentService, KEEP_ARCHIVED_ITEMS, KEEP_ITEMS_PER_BOARD, canvasPrompt, compactItems } from '../src/main/agent.ts'
 import { AGENT_SEAT, toolDisplayName, type AgentWorkItem } from '../src/shared/agent.ts'
 
 test('选区上下文保留稳定ID、画板及不可信输入边界，不把短编号当实时版本', () => {
@@ -317,4 +318,209 @@ test('冷启动 submit 保留上一轮 reviewContext；session_reset 同步活�
   const saved = JSON.parse(await readFile(join(home, 'agent', 'work-items.json'), 'utf8')).items[0]
   assert.equal(saved.title, '收尾后标题')
   assert.equal(saved.sessionId, 's-reset-2')
+})
+
+test('deleteTask 删除指定任务、重置当前活动会话，并在快照清理时回收孤立结果图片', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-delete-task-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const imagesDir = join(home, 'agent', 'images')
+  await mkdir(imagesDir, { recursive: true })
+  const img1Bytes = Buffer.from('image-one')
+  const img2Bytes = Buffer.from('image-two')
+  const img1Id = createHash('sha256').update(img1Bytes).digest('hex')
+  const img2Id = createHash('sha256').update(img2Bytes).digest('hex')
+  await writeFile(join(imagesDir, img1Id), img1Bytes)
+  await writeFile(join(imagesDir, img2Id), img2Bytes)
+
+  const items: AgentWorkItem[] = [
+    {
+      id: 'w1', board: 'default', cwd: home, sessionId: 's1', title: '任务一',
+      runs: [{
+        id: 'r1', mode: 'direct', status: 'completed', goal: '目标一', startedAt: '2026-11-18',
+        reply: 'ok', draft: '', tools: [], approvals: [],
+        images: [{ id: img1Id, mediaType: 'image/png', name: 'img1' }]
+      }]
+    },
+    {
+      id: 'w2', board: 'default', cwd: home, sessionId: 's2', title: '任务二',
+      runs: [{
+        id: 'r2', mode: 'direct', status: 'completed', goal: '目标二', startedAt: '2026-11-18',
+        reply: 'ok', draft: '', tools: [], approvals: [],
+        images: [{ id: img2Id, mediaType: 'image/png', name: 'img2' }]
+      }]
+    }
+  ]
+  await writeFile(join(home, 'agent', 'work-items.json'), JSON.stringify({ version: 1, items }))
+  const service = new AgentService({ home, executable: () => { throw new Error('不应启动真实内核') }, mcpServers: {} })
+  const openCalls: Record<string, unknown>[] = []
+  ;(service as unknown as { client: unknown }).client = {
+    alive: true,
+    stop: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => {
+      if (method === 'workspace.open') {
+        openCalls.push(params)
+        return { session_id: String(params.session_id ?? 'fresh-session'), provider: 'p', model: 'm', setup_needed: false, vision: false, choices: [] }
+      }
+      return {}
+    }
+  }
+
+  await assert.rejects(service.deleteTask('non-existent'), /没有找到这项任务/)
+  await service.openTask('w1')
+  assert.equal(service.snapshot().activeItemId, 'w1')
+
+  // 删除当前活动任务 w1：activeItemId 置空并重新打开新会话
+  await service.deleteTask('w1')
+  assert.equal(service.snapshot().activeItemId, null)
+  assert.deepEqual(service.snapshot().items.map(i => i.id), ['w2'])
+  assert.equal(openCalls.at(-1)?.new_session, true)
+
+  // 立即触发回收：w1 的孤立图片 img1Id 被清理，w2 的 img2Id 保留
+  await service.maybePruneSnapshots(true)
+  const remainingImages = await readdir(imagesDir)
+  assert.deepEqual(remainingImages, [img2Id])
+  await service.close()
+})
+
+test('compactItems 按画板限制任务数、保留归档上限，并裁剪较早历史任务的思考与工具输出', () => {
+  const total = KEEP_ITEMS_PER_BOARD + 5
+  const items: AgentWorkItem[] = []
+  for (let i = 1; i <= total; i++) {
+    items.push({
+      id: `item-${i}`,
+      board: 'b1',
+      cwd: '/tmp',
+      sessionId: `s-${i}`,
+      title: `任务 ${i}`,
+      runs: [{
+        id: `run-${i}`,
+        mode: 'direct',
+        status: 'completed',
+        goal: `目标 ${i}`,
+        startedAt: '2026-11-18',
+        reply: 'done',
+        draft: '',
+        thinking: '思'.repeat(6_000),
+        tools: [{ id: `t-${i}`, name: 'read_file', input: '入'.repeat(5_000), status: 'completed', result: '出'.repeat(5_000) }],
+        approvals: []
+      }]
+    })
+  }
+  for (let i = 1; i <= KEEP_ARCHIVED_ITEMS + 3; i++) {
+    items.push({
+      id: `arch-${i}`,
+      board: 'deleted',
+      cwd: '/tmp',
+      sessionId: `sa-${i}`,
+      title: `归档 ${i}`,
+      archived: true,
+      runs: [{
+        id: `arun-${i}`,
+        mode: 'direct',
+        status: 'completed',
+        goal: '归档目标',
+        startedAt: '2026-11-18',
+        reply: 'ok',
+        draft: '',
+        thinking: '旧'.repeat(6_000),
+        tools: [],
+        approvals: []
+      }]
+    })
+  }
+
+  // activeItemId 指向最早的 item-1，确保即使超出窗口也被保留
+  const compacted = compactItems(items, 'item-1')
+  const nonArchived = compacted.filter(i => !i.archived)
+  const archived = compacted.filter(i => i.archived)
+  assert.equal(nonArchived.length, KEEP_ITEMS_PER_BOARD)
+  assert.equal(archived.length, KEEP_ARCHIVED_ITEMS)
+  assert.ok(nonArchived.some(i => i.id === 'item-1'))
+  assert.ok(!nonArchived.some(i => i.id === 'item-2'))
+
+  // 较早的非活动历史任务（如 item-10）思考被裁剪到 4000 字符（带前导省略号共 4001），工具输入/输出被裁剪到 2000
+  const oldInactive = nonArchived.find(i => i.id === 'item-10')!
+  assert.equal(oldInactive.runs[0].thinking?.length, 4_001)
+  assert.ok(oldInactive.runs[0].thinking?.startsWith('…'))
+  assert.equal(oldInactive.runs[0].tools[0].input.length, 2_000)
+  assert.equal(oldInactive.runs[0].tools[0].result?.length, 2_000)
+
+  // 最近的任务（如最后一篇）和当前活动任务 item-1 保持完整思考
+  const newest = nonArchived.at(-1)!
+  assert.equal(newest.runs[0].thinking?.length, 6_000)
+  const active = nonArchived.find(i => i.id === 'item-1')!
+  assert.equal(active.runs[0].thinking?.length, 6_000)
+})
+
+test('后续轮次 canvasPrompt 省略重复静态工具教学，但保留画布摘要与上一轮 reviewContext', () => {
+  const capture = {
+    selectedIds: ['box1'],
+    pngBase64: null,
+    sceneJson: JSON.stringify({
+      elements: [{ id: 'box1', type: 'rectangle', x: 0, y: 0, width: 100, height: 60 }]
+    })
+  }
+  const previous = {
+    status: 'rejected' as const,
+    review: { verdict: 'rejected' as const, decidedAt: '2026-11-18', note: '间距太窄' }
+  }
+  const firstPrompt = canvasPrompt('继续调整布局', 'main', capture, previous)
+  const followUpPrompt = canvasPrompt('继续调整布局', 'main', capture, previous, { followUp: true })
+
+  assert.match(firstPrompt, /优先用 glob、grep、read_file/)
+  assert.doesNotMatch(followUpPrompt, /优先用 glob、grep、read_file/)
+  assert.doesNotMatch(followUpPrompt, /不要设 keep_alive/)
+  assert.match(followUpPrompt, /沿用本会话已约定的工具与画布规范/)
+  assert.match(followUpPrompt, /稳定 ID：box1/)
+  assert.match(followUpPrompt, /间距太窄/)
+  assert.ok(followUpPrompt.length < firstPrompt.length)
+})
+
+test('persist() 在运行中落盘时保留内存里的 run 引用与实时流式草稿，同时磁盘清空 draft/thinkingDraft', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-persist-identity-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  await mkdir(join(home, 'agent'), { recursive: true })
+  const makeItem = (id: string): AgentWorkItem => ({
+    id, board: 'default', cwd: home, sessionId: `s-${id}`, title: id,
+    runs: [{ id: `run-${id}`, mode: 'direct', status: 'completed', goal: '目标', startedAt: '2026-11-23', reply: '', draft: '', tools: [], approvals: [] }]
+  })
+  const seeded = Array.from({ length: KEEP_ITEMS_PER_BOARD }, (_, i) => makeItem(`old-${i}`))
+  await writeFile(join(home, 'agent', 'work-items.json'), JSON.stringify({ version: 1, items: seeded }))
+  const service = new AgentService({ home, executable: () => { throw new Error('不应启动') }, mcpServers: {} })
+  const live = service as unknown as {
+    state: { activeItemId: string | null; items: AgentWorkItem[] }
+    onEvent(e: unknown): void
+    persist(): Promise<void>
+  }
+  const activeItem = makeItem('work')
+  live.state.items.push(activeItem)
+  live.state.activeItemId = activeItem.id
+  const runRef = activeItem.runs[0]
+  runRef.status = 'running'
+
+  // 触发一次淘汰（old-0 被移出）+ 一次无淘汰落盘，均应保留同一个 runRef 和实时草稿
+  live.onEvent({ type: 'event', seq: 1, run_id: runRef.id, req: 1, event: 'text_delta', data: { text: '正在输出正文' } })
+  live.onEvent({ type: 'event', seq: 2, run_id: runRef.id, req: 1, event: 'thinking_delta', data: { text: '正在思考步骤' } })
+  await live.persist()
+
+  assert.equal(live.state.items.length, KEEP_ITEMS_PER_BOARD)
+  assert.ok(!live.state.items.some(item => item.id === 'old-0'))
+  assert.equal(live.state.items.at(-1)?.runs[0], runRef)
+  assert.equal(runRef.draft, '正在输出正文')
+  assert.equal(runRef.thinkingDraft, '正在思考步骤')
+
+  live.onEvent({ type: 'event', seq: 3, run_id: runRef.id, req: 1, event: 'text_delta', data: { text: '追加' } })
+  live.onEvent({ type: 'event', seq: 4, run_id: runRef.id, req: 1, event: 'thinking_delta', data: { text: '再思考' } })
+  await live.persist()
+
+  assert.equal(live.state.items.at(-1)?.runs[0], runRef)
+  assert.equal(runRef.draft, '正在输出正文追加')
+  assert.equal(runRef.thinkingDraft, '正在思考步骤再思考')
+
+  const saved = JSON.parse(await readFile(join(home, 'agent', 'work-items.json'), 'utf8')).items as AgentWorkItem[]
+  const savedRun = saved.at(-1)!.runs[0]
+  assert.equal(saved.length, KEEP_ITEMS_PER_BOARD)
+  assert.equal(savedRun.draft, '')
+  assert.equal(savedRun.thinkingDraft, '')
+  await service.close()
 })

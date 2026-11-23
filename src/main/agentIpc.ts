@@ -65,6 +65,11 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
     if (!service.snapshot().items.some(item => item.id === id && item.board === board())) throw new Error('任务不属于当前画板')
     return service.openTask(id)
   })
+  ipc.handle('agent:delete', (_event, id: string) => {
+    if (typeof id !== 'string' || !id) throw new Error('参数无效')
+    if (!service.snapshot().items.some(item => item.id === id && item.board === board())) throw new Error('任务不属于当前画板')
+    return service.deleteTask(id)
+  })
   ipc.handle('agent:submit', (_event, input: AgentSubmission) => {
     if (!input || typeof input !== 'object') throw new Error('参数无效')
     if (input.mode !== 'direct' && input.mode !== 'plan') throw new Error('任务模式无效')

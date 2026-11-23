@@ -216,6 +216,7 @@ export interface AgentApi {
   chooseWorkspace(board: string): Promise<string | null>
   newTask(board: string): Promise<void>
   openTask(id: string): Promise<void>
+  deleteTask(id: string): Promise<void>
   submit(input: AgentSubmission): Promise<void>
   execute(text: string): Promise<void>
   cancel(): Promise<void>

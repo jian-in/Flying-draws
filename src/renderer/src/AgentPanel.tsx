@@ -409,9 +409,25 @@ export function AgentPanel({
             </button>
             {state.workspaceWarning ? <p className="fd-agent-small" role="status">{state.workspaceWarning}</p> : null}
             {state.toolStorage?.mode === 'host' ? <p className="fd-agent-small" title={state.toolStorage.artifactsDir}>截图和运行日志存在应用数据目录，不写进项目。只读命令、本轮自己起的服务的预览和关闭不再逐次确认。</p> : null}
-            {items.length ? <select className="fd-agent-history" aria-label="任务历史" value={active?.id ?? ''} disabled={disabled} onChange={e => { if (e.target.value) void act(() => api.openTask(e.target.value)) }}>
-              <option value="">新任务</option>{[...items].reverse().map(item => <option key={item.id} value={item.id}>{item.title || '未命名任务'}</option>)}
-            </select> : null}
+            {items.length ? <div className="fd-agent-history-row">
+              <select className="fd-agent-history" aria-label="任务历史" value={active?.id ?? ''} disabled={disabled} onChange={e => {
+                if (e.target.value) void act(() => api.openTask(e.target.value))
+                else void act(() => api.newTask(board))
+              }}>
+                <option value="">新任务</option>{[...items].reverse().map(item => <option key={item.id} value={item.id}>{item.title || '未命名任务'}</option>)}
+              </select>
+              <button
+                type="button"
+                className="fd-agent-history-delete"
+                disabled={disabled || !active}
+                title="删除当前任务的聊天记录（画布内容不受影响）"
+                onClick={() => {
+                  if (!active) return
+                  if (!window.confirm(`确定删除任务「${active.title || '未命名任务'}」的聊天记录吗？画布内容不受影响。`)) return
+                  void act(() => api.deleteTask(active.id))
+                }}
+              >删除</button>
+            </div> : null}
             <label
               className="fd-agent-check fd-agent-lineage-toggle"
               title="Agent 产出 render_page / browser_page 等页面结果图时自动连入演进墙（严格排除 canvas_read 画布自读图）"
