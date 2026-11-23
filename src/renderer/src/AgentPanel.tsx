@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { AgentMarkdown } from './AgentMarkdown'
 import { shouldAutoPlaceResultImage } from '../../main/lineage'
 import { pickCompareImage, toolDisplayName, traceImageGoal, type AgentCapture, type AgentResultImage, type AgentRun, type AgentState, type ImageRegionAnnotation, type ProviderDraft, type RoundFileChange } from '../../shared/agent'
+import { BASE_URL_PLACEHOLDER, DEFAULT_PRESET, PROVIDER_PRESETS, type PresetId } from '../../shared/providerPresets'
 
 const LABEL: Record<AgentRun['status'], string> = {
   running: '进行中', planned: '等你确认计划', completed: '已完成', unverified: '结果待核验',
@@ -19,25 +20,6 @@ const EMPTY: AgentState = {
   connection: 'offline', error: null, busy: false, setupNeeded: true, vision: false,
   provider: '', model: '', choices: [], workspace: '', activeItemId: null, items: [], approvalMode: 'auto-safe'
 }
-// 模型设置的预设：已实测过的服务商只需填密钥；「自定义」要用户自己确认模型是否支持看图
-const PROVIDER_PRESETS = {
-  'deepseek-flash': {
-    label: 'DeepSeek · deepseek-flash（已实测，支持看图）',
-    draft: {
-      protocol: 'openai-compatible', name: 'deepseek', base_url: 'https://api.deepseek.com/v1', credential: '', model: 'deepseek-flash',
-      context_window: 1000000, max_tokens: 25400, vision: true
-    }
-  },
-  custom: {
-    label: '自定义',
-    draft: {
-      protocol: 'openai-compatible', name: 'my-model', base_url: '', credential: '', model: '',
-      context_window: 128000, max_tokens: 8192, vision: false
-    }
-  }
-} satisfies Record<string, { label: string; draft: ProviderDraft }>
-type PresetId = keyof typeof PROVIDER_PRESETS
-const DEFAULT_PRESET: PresetId = 'deepseek-flash'
 /** 地址的协议 + 主机 + 端口；还没写成合法地址时返回 null */
 function urlOrigin(value: string): string | null {
   try { return new URL(value).origin } catch { return null }
@@ -47,12 +29,6 @@ function readableIpcError(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error)
   const tail = text.replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, '').trim()
   return tail || '拉取失败'
-}
-
-const BASE_URL_PLACEHOLDER: Record<ProviderDraft['protocol'], string> = {
-  'openai-compatible': 'https://api.deepseek.com/v1',
-  'anthropic-messages': 'https://api.anthropic.com',
-  gemini: 'https://generativelanguage.googleapis.com'
 }
 
 export function AgentPanel({
@@ -350,6 +326,7 @@ export function AgentPanel({
           }}>
             {(Object.keys(PROVIDER_PRESETS) as PresetId[]).map(id => <option key={id} value={id}>{PROVIDER_PRESETS[id].label}</option>)}
           </select></label>
+          {PROVIDER_PRESETS[preset].hint ? <p className="fd-agent-small fd-agent-preset-hint">{PROVIDER_PRESETS[preset].hint}</p> : null}
           <label>接口协议<select value={provider.protocol} onChange={e => setProvider({ ...provider, protocol: e.target.value as ProviderDraft['protocol'] })}>
             <option value="openai-compatible">OpenAI 兼容</option><option value="anthropic-messages">Anthropic Messages</option><option value="gemini">Gemini</option>
           </select></label>
@@ -363,8 +340,8 @@ export function AgentPanel({
             setModelList([])
             setModelsError(null)
           }} /></label>
-          <label>API Key<input required type="password" autoComplete="off" spellCheck={false} placeholder="密钥，或 env:变量名" value={provider.credential} onChange={e => setProvider({ ...provider, credential: e.target.value })} /></label>
-          <label>模型 ID<input required placeholder="服务商提供的模型 ID" value={provider.model} onChange={e => setProvider({ ...provider, model: e.target.value })} /></label>
+          <label>API Key<input required type="password" autoComplete="off" spellCheck={false} placeholder={PROVIDER_PRESETS[preset].credentialPlaceholder ?? '密钥，或 env:变量名'} value={provider.credential} onChange={e => setProvider({ ...provider, credential: e.target.value })} /></label>
+          <label>模型 ID<input required placeholder="服务商提供的模型 ID（可点下方拉取）" value={provider.model} onChange={e => setProvider({ ...provider, model: e.target.value })} /></label>
           <div className="fd-agent-models">
             <button type="button" disabled={modelsBusy} onClick={() => void fetchModels()}>{modelsBusy ? '拉取中…' : '拉取模型列表'}</button>
             {modelList.length ? <select aria-label="服务商返回的模型" value={modelList.includes(provider.model) ? provider.model : ''} onChange={e => {

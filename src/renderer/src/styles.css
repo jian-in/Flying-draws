@@ -166,6 +166,7 @@ body,
 .fd-agent-settings { overflow: auto; padding: 15px 20px 25px; border-top: 1px solid var(--fd-border); }
 .fd-agent-settings h3 { margin: 0 0 6px; font-size: 17px; }
 .fd-agent-settings > p { font-size: 11px; color: var(--fd-muted); margin: 0 0 17px; }
+.fd-agent-settings > p.fd-agent-preset-hint { margin: -7px 0 13px; }
 .fd-agent-settings > label, .fd-agent-limits > label { display: flex; flex-direction: column; gap: 4px; margin: 13px 0; font-size: 11px; }
 .fd-agent-settings input, .fd-agent-settings select { min-width: 0; width: 100%; border: 1px solid var(--fd-border); background: var(--fd-surface); padding: 7px 8px; border-radius: 3px; font-size: 12px; }
 .fd-agent-settings details { margin: 16px 0; font-size: 11px; color: var(--fd-muted); }
