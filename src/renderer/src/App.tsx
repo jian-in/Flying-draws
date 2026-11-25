@@ -5,6 +5,7 @@ import { displaySizeForImage, planImageLineage, type LineageCanvasElement } from
 import type { DrawPlan, PendingChanges } from '../../main/ops'
 import { StrokeWidthSlider } from './StrokeWidthSlider'
 import { AgentPanel } from './AgentPanel'
+import { CanvasMinimap, type CanvasMinimapHandle } from './CanvasMinimap'
 import { AGENT_SEAT } from '../../shared/agent'
 import { LIBRARY_CALLBACK_URL } from '../../shared/library'
 import { hasUnsafeCustomData, sanitizeElement, sanitizeScene } from '../../shared/sanitizeScene'
@@ -45,6 +46,7 @@ const revealCanvas = (): void => {
 
 export default function App() {
   const [agentOpen, setAgentOpen] = useState(false)
+  const minimapRef = useRef<CanvasMinimapHandle>(null)
   const [selectedImage, setSelectedImage] = useState<string | null>(null)
   const selectedImageRef = useRef<string | null>(null)
   const [selectedCount, setSelectedCount] = useState(0)
@@ -437,6 +439,7 @@ export default function App() {
         }
       }
       latest.current = [elements, appState, files]
+      minimapRef.current?.scheduleDraw()
       // 只换了背景色、开关了网格：元素版本不变，下面那条路径认不出来，单独排一次保存
       const prefs = scenePrefsKey(appState)
       if (lastSavedPrefs.current === null) lastSavedPrefs.current = prefs
@@ -982,6 +985,7 @@ export default function App() {
           {toast}
         </button>
       ) : null}
+      <CanvasMinimap ref={minimapRef} api={api} />
       <div className="fd-filter" role="tablist" aria-label="按作者筛选显示">
         {isDynamicSeats(seatInfo) ? (
           <>
@@ -1075,7 +1079,7 @@ export default function App() {
                   }
                   if (!notified && Date.now() - startedAt >= DEFERRED_NOTICE_MS) {
                     notified = true
-                    setDeferredDraw({ agent: AGENT_SEAT, editingText: Boolean(current.getAppState().editingTextElement) })
+                    setDeferredDraw({ agent: opts?.seat || AGENT_SEAT, editingText: Boolean(current.getAppState().editingTextElement) })
                   }
                   await sleep(100)
                 }
@@ -1164,7 +1168,7 @@ export default function App() {
 
             const baseMark = {
               author: 'agent',
-              agent: AGENT_SEAT,
+              agent: opts?.seat || AGENT_SEAT,
               seat: true,
               layer: 'final'
             }

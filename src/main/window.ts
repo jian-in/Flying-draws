@@ -7,7 +7,7 @@ import { WindowDock } from './dock'
 import { isAppRendererUrl } from './ipcGuard'
 import { trayRepresentations } from './trayIcon'
 import { freshApprovals, hasPendingApprovals, trayTooltip } from './agentNotice'
-import { AGENT_SEAT, type AgentState } from '../shared/agent'
+import { activeAgentSeat, type AgentState } from '../shared/agent'
 import { isExcalidrawLibraryBrowseUrl, MAX_LIBRARY_BYTES, parseLibraryInstallNavigation, validateRemoteLibraryUrl } from '../shared/library'
 import { parseAndValidateLibraryJson } from './library'
 import { BACKGROUND_ARG, TEST_INSTANCE, RENDERER_FILE, statePath } from './paths'
@@ -77,7 +77,7 @@ export function createTray(): void {
     if (!fresh.length || !away || !tray || process.platform !== 'win32') return
     tray.displayBalloon({
       iconType: 'info',
-      title: `${AGENT_SEAT} 等你确认`,
+      title: `${activeAgentSeat(state)} 等你确认`,
       content: `${fresh.join('、')}：点这里打开 Flying draws 处理。确认前任务会一直等着。`
     })
   })

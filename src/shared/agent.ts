@@ -1,7 +1,146 @@
-/** The built-in agent's seat on the canvas: its tools, drawings and inserted images all use this name. */
+/** The built-in Fuxi agent's seat on the canvas: its tools, drawings and inserted images use this name. */
 export const AGENT_SEAT = 'Fuxi'
+/** Default canvas seat name when running via Antigravity / external ACP backend. */
+export const DEFAULT_ACP_SEAT = 'Antigravity'
 
-export interface ProviderChoice { provider: string; model: string; ready: boolean }
+export type AgentEngine = 'fuxi' | 'acp'
+export type AcpPresetId = 'antigravity' | 'claude' | 'codex' | 'opencode' | 'custom'
+export type BuiltinAcpPresetId = Exclude<AcpPresetId, 'custom'>
+
+export interface AcpPresetSpec {
+  id: BuiltinAcpPresetId
+  label: string
+  shortLabel: string
+  defaultSeat: string
+  defaultArgs: string[]
+  installHint: string
+  loginHint: string
+}
+
+export const ACP_PRESETS: readonly AcpPresetSpec[] = [
+  {
+    id: 'antigravity',
+    label: 'Antigravity',
+    shortLabel: 'Antigravity',
+    defaultSeat: 'Antigravity',
+    defaultArgs: ['acp'],
+    installHint: '安装 Antigravity CLI（agy）',
+    loginHint: 'agy acp --login'
+  },
+  {
+    id: 'claude',
+    label: 'Claude Code',
+    shortLabel: 'Claude',
+    defaultSeat: 'Claude',
+    defaultArgs: [],
+    installHint: 'npm i -g @agentclientprotocol/claude-agent-acp',
+    loginHint: 'claude login'
+  },
+  {
+    id: 'codex',
+    label: 'Codex',
+    shortLabel: 'Codex',
+    defaultSeat: 'Codex',
+    defaultArgs: [],
+    installHint: 'npm i -g @agentclientprotocol/codex-acp',
+    loginHint: 'codex login'
+  },
+  {
+    id: 'opencode',
+    label: 'OpenCode',
+    shortLabel: 'OpenCode',
+    defaultSeat: 'OpenCode',
+    defaultArgs: ['acp'],
+    installHint: 'npm i -g opencode-ai',
+    loginHint: 'opencode auth login'
+  }
+]
+
+export function acpPresetSpec(id?: AcpPresetId): AcpPresetSpec | undefined {
+  return ACP_PRESETS.find(p => p.id === id)
+}
+
+export interface AcpBackendConfig {
+  /** 预设 ID（antigravity / claude / codex / opencode / custom）。 */
+  preset?: AcpPresetId
+  /** Executable path or command name; empty string auto-detects the preset's local CLI. */
+  command: string
+  /** CLI arguments passed to the ACP executable. */
+  args: string[]
+  /** Canvas seat/author name used for drawings and inserted images under ACP. */
+  seat: string
+  /** Friendly display name shown in the side panel header. */
+  label?: string
+}
+
+export const DEFAULT_ACP_CONFIG: AcpBackendConfig = {
+  preset: 'antigravity',
+  command: '',
+  args: ['acp'],
+  seat: DEFAULT_ACP_SEAT,
+  label: 'Antigravity'
+}
+
+export interface AcpSelectOption {
+  value: string
+  name: string
+  description?: string
+}
+
+export interface AcpConfigOption {
+  id: string
+  name: string
+  category?: string
+  currentValue: string
+  options: AcpSelectOption[]
+}
+
+export interface AcpModeInfo {
+  id: string
+  name: string
+  description?: string
+}
+
+export interface AcpRuntimeInfo {
+  preset?: AcpPresetId
+  name: string
+  version?: string
+  tier?: string
+  command?: string
+  detectedCommand?: string | null
+  detectedPresets?: Partial<Record<BuiltinAcpPresetId, string | null>>
+  modes?: AcpModeInfo[]
+  currentModeId?: string
+  configOptions?: AcpConfigOption[]
+}
+
+/** 代理声明的规划模式从哪里切：configOptions 里的 mode 选项优先，其次是 session modes；都没有就不能先拟计划。 */
+export type AcpPlanTarget = { via: 'config'; configId: string } | { via: 'mode' }
+export const ACP_PLAN_MODE = 'plan'
+
+export function acpPlanTarget(acp?: Pick<AcpRuntimeInfo, 'modes' | 'configOptions'> | null): AcpPlanTarget | null {
+  const modeOpt = acp?.configOptions?.find(o => o.id === 'mode' || o.category === 'mode')
+  if (modeOpt?.options.some(o => o.value === ACP_PLAN_MODE)) return { via: 'config', configId: modeOpt.id }
+  if (acp?.modes?.some(m => m.id === ACP_PLAN_MODE)) return { via: 'mode' }
+  return null
+}
+
+/** 规划前要恢复到的模式缺失时，挑一个非规划模式兜底。 */
+export function acpFallbackMode(acp: Pick<AcpRuntimeInfo, 'modes' | 'configOptions'> | null | undefined, target: AcpPlanTarget): string | undefined {
+  const values = target.via === 'config'
+    ? acp?.configOptions?.find(o => o.id === target.configId)?.options.map(o => o.value) ?? []
+    : acp?.modes?.map(m => m.id) ?? []
+  return values.includes('default') ? 'default' : values.find(v => v !== ACP_PLAN_MODE)
+}
+
+/** ACP 历史会话没能恢复：保留原任务和会话 ID，等用户重试或另开新任务。 */
+export interface AcpResumeFailure {
+  itemId: string
+  reason: 'unsupported' | 'error'
+  message: string
+}
+
+export interface ProviderChoice { provider: string; model: string; ready: boolean; label?: string }
 export interface ProviderDraft {
   protocol: 'openai-compatible' | 'anthropic-messages' | 'gemini'
   name: string
@@ -69,9 +208,22 @@ export interface AgentApproval {
   preview?: string
   /** 宿主按「本任务内都允许」自动批准了，没有弹给用户 */
   autoApproved?: boolean
+  /** ACP 后端返回的可选审批选项 */
+  options?: { id: string; name: string; kind?: string }[]
+  /** ACP：由工具身份和完整参数算出的匹配键；没有完整参数时不给，这条调用就不能记住 */
+  ruleKey?: string
 }
-/** 用户在某个任务里选了「本任务内都允许」的一条工具调用：工具名和参数要一字不差才算同一条 */
-export interface AllowedCommand { name: string; input: string }
+/**
+ * 用户在某个任务里选了「本任务内都允许」的一条工具调用：工具名和参数要一字不差才算同一条。
+ * input 只用于展示（ACP 的预览最多 8000 字符）；ACP 规则按 key 匹配，没有 key 的旧 ACP 规则不再自动放行。
+ */
+export interface AllowedCommand { name: string; input: string; key?: string }
+
+/** ACP 审批选项里能代表「只允许这一次」的那项；代理只给了永久授权时返回 undefined。 */
+export function acpAllowOnceOption<T extends { id: string; name: string; kind?: string }>(options: readonly T[]): T | undefined {
+  return options.find(o => o.kind === 'allow_once')
+    ?? options.find(o => !o.kind && !/always|永久|始终|reject|deny|拒绝/i.test(`${o.id} ${o.name}`))
+}
 export interface AgentResultImage {
   id: string
   mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
@@ -189,6 +341,10 @@ export interface AgentWorkItem {
   cwd: string
   sessionId: string
   title: string
+  /** 所属执行后端；缺省视为历史 Fuxi 任务 */
+  engine?: AgentEngine
+  /** ACP 模式下所属预设（避免跨 Agent 误续接会话 ID） */
+  acpPreset?: AcpPresetId
   archived?: boolean
   runs: AgentRun[]
   /** 本任务内已允许、不再询问的工具调用 */
@@ -205,6 +361,16 @@ export interface AgentState {
   provider: string
   model: string
   choices: ProviderChoice[]
+  /** 当前启用的 Agent 后端：fuxi（内置）或 acp（Antigravity / 标准 ACP） */
+  engine?: AgentEngine
+  /** 当前后端在画布上使用的席位名称 */
+  seat?: string
+  /** ACP 后端配置（持久化在 host-settings.json） */
+  acpConfig?: AcpBackendConfig
+  /** ACP 后端运行时信息（版本、套餐、可用模式与配置项） */
+  acp?: AcpRuntimeInfo
+  /** ACP 历史会话恢复失败；有它时当前任务只能查看，发消息前要先重试恢复或开始新任务 */
+  acpResume?: AcpResumeFailure
   /** Kernel tool name → readable name (MCP tools are numbered inside the kernel). */
   toolLabels?: Record<string, string>
   workspace: string
@@ -216,6 +382,12 @@ export interface AgentState {
   telemetry?: AgentTelemetry
   activeItemId: string | null
   items: AgentWorkItem[]
+}
+
+export function activeAgentSeat(state?: Pick<AgentState, 'seat' | 'engine' | 'acpConfig'>): string {
+  if (state?.seat?.trim()) return state.seat.trim()
+  if (state?.engine === 'acp') return state.acpConfig?.seat?.trim() || DEFAULT_ACP_SEAT
+  return AGENT_SEAT
 }
 export type ApprovalMode = 'auto-safe' | 'full-access'
 export interface AgentSubmission {
@@ -234,6 +406,9 @@ export interface AgentApi {
   /** 从服务商拉取可选模型 ID；只读请求，不发任务 */
   models(query: ProviderModelQuery): Promise<string[]>
   selectModel(provider: string, model: string): Promise<void>
+  setEngine(engine: AgentEngine, board: string, acpConfig?: Partial<AcpBackendConfig>): Promise<void>
+  setAcpConfig(config: Partial<AcpBackendConfig>, board: string): Promise<void>
+  setAcpConfigOption(configId: string, value: string): Promise<void>
   setApprovalMode(mode: ApprovalMode): Promise<void>
   chooseWorkspace(board: string): Promise<string | null>
   newTask(board: string): Promise<void>
@@ -242,8 +417,11 @@ export interface AgentApi {
   submit(input: AgentSubmission): Promise<void>
   execute(text: string): Promise<void>
   cancel(): Promise<void>
-  /** remember：批准并在本任务内记住这条调用，之后一字不差的同一调用不再询问 */
-  approve(requestId: string, approved: boolean, remember?: boolean): Promise<void>
+  /**
+   * remember：批准并在本任务内记住这条调用，之后一字不差的同一调用不再询问（由宿主记住，只向代理选「允许一次」）。
+   * always：只在 ACP 代理没有提供「允许一次」时使用，明确选它的永久授权。
+   */
+  approve(requestId: string, approved: boolean, remember?: boolean, always?: boolean): Promise<void>
   /** 清空当前任务里「本任务内都允许」的记录 */
   clearAllowedCommands(): Promise<void>
   review(runId: string, verdict: AgentRunReview['verdict'], note?: string): Promise<void>

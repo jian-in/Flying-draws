@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { AgentService } from './agent'
 import { listProviderModels, type CatalogDraft } from './modelCatalog'
-import { AGENT_SEAT, type AgentSubmission, type ProviderDraft } from '../shared/agent'
+import { AGENT_SEAT, type AcpBackendConfig, type AgentEngine, type AgentSubmission, type ProviderDraft } from '../shared/agent'
 
 export function registerAgent(home: string, window: () => BrowserWindow | null, board: () => string, ipc: IpcGuard): AgentService {
   const filename = process.platform === 'win32' ? 'fuxi.exe' : 'fuxi'
@@ -26,6 +26,33 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
         env: { ELECTRON_RUN_AS_NODE: '1', FLYINGDRAWS_HOME: home, FLYINGDRAWS_SEAT: AGENT_SEAT },
         timeout_secs: 60
       }
+    },
+    // 用户指定的 ACP 程序或改过的参数：在主进程弹原生对话框，列出实际要启动的程序和每个参数
+    confirmAcpLaunch: async launch => {
+      const target = window()
+      const argLines = launch.args.length
+        ? launch.args.map((arg, i) => `  ${i + 1}. ${arg}`).join('\n')
+        : '  （无）'
+      const options = {
+        type: 'warning' as const,
+        title: '确认启动 ACP 代理',
+        message: `要启动这个本地程序作为「${launch.label}」吗？`,
+        detail: [
+          `程序：${launch.command}`,
+          `参数（每行一个）：\n${argLines}`,
+          '',
+          '它会以你的账户权限在这台电脑上运行，能读写所选工作目录并调用画布工具。只启动你信任的程序。',
+          '确认后会记住这组程序和参数；只改席位名或重新连接不会再问。'
+        ].join('\n'),
+        buttons: ['启动', '取消'],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true
+      }
+      const result = target && !target.isDestroyed()
+        ? await dialog.showMessageBox(target, options)
+        : await dialog.showMessageBox(options)
+      return result.response === 0
     }
   })
   service.on('state', state => {
@@ -46,6 +73,20 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
     return listProviderModels(query)
   })
   ipc.handle('agent:model', (_event, provider: string, model: string) => service.selectModel(provider, model))
+  ipc.handle('agent:engine', (_event, engine: AgentEngine, requestedBoard: string, acpConfig?: Partial<AcpBackendConfig>) => {
+    if (engine !== 'fuxi' && engine !== 'acp') throw new Error('未知的 Agent 后端')
+    if (requestedBoard !== board()) throw new Error('画板已切换，请重试')
+    return service.setEngine(engine, requestedBoard, acpConfig)
+  })
+  ipc.handle('agent:acp-config', (_event, config: Partial<AcpBackendConfig>, requestedBoard: string) => {
+    if (!config || typeof config !== 'object') throw new Error('参数无效')
+    if (requestedBoard !== board()) throw new Error('画板已切换，请重试')
+    return service.setAcpConfig(config, requestedBoard)
+  })
+  ipc.handle('agent:acp-option', (_event, configId: string, value: string) => {
+    if (typeof configId !== 'string' || !configId || typeof value !== 'string') throw new Error('参数无效')
+    return service.setAcpConfigOption(configId, value)
+  })
   ipc.handle('agent:approval-mode', (_event, mode: 'auto-safe' | 'full-access') => service.setApprovalMode(mode))
   ipc.handle('agent:workspace', async (_event, requestedBoard: string) => {
     if (requestedBoard !== board()) throw new Error('画板已切换，请重新选择目录')
@@ -84,9 +125,9 @@ export function registerAgent(home: string, window: () => BrowserWindow | null, 
     return service.execute(text)
   })
   ipc.handle('agent:cancel', () => service.cancel())
-  ipc.handle('agent:approve', (_event, requestId: string, approved: boolean, remember?: boolean) => {
+  ipc.handle('agent:approve', (_event, requestId: string, approved: boolean, remember?: boolean, always?: boolean) => {
     if (typeof requestId !== 'string' || typeof approved !== 'boolean') throw new Error('参数无效')
-    return service.approve(requestId, approved, remember === true)
+    return service.approve(requestId, approved, remember === true, always === true)
   })
   ipc.handle('agent:clear-allowed', () => service.clearAllowedCommands())
   ipc.handle('agent:review', (_event, runId: string, verdict: 'approved' | 'rejected', note?: string) => service.review(runId, verdict, note))

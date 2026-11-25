@@ -1,5 +1,5 @@
 // 后台常驻时的 Agent 提醒：托盘提示文字，以及哪些审批是新出现、需要提醒的。纯函数，不依赖 Electron。
-import { AGENT_SEAT, toolDisplayName, type AgentState } from '../shared/agent.ts'
+import { activeAgentSeat, toolDisplayName, type AgentState } from '../shared/agent.ts'
 
 function pendingApprovals(state: AgentState) {
   return state.items.flatMap(item => item.runs).flatMap(run => run.approvals).filter(approval => !approval.answered)
@@ -10,8 +10,9 @@ export function hasPendingApprovals(state: AgentState): boolean {
 }
 
 export function trayTooltip(state: AgentState): string {
-  if (pendingApprovals(state).length) return `Flying draws · ${AGENT_SEAT} 等你确认`
-  return state.busy ? `Flying draws · ${AGENT_SEAT} 正在工作` : 'Flying draws'
+  const seat = activeAgentSeat(state)
+  if (pendingApprovals(state).length) return `Flying draws · ${seat} 等你确认`
+  return state.busy ? `Flying draws · ${seat} 正在工作` : 'Flying draws'
 }
 
 /**
