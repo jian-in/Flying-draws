@@ -367,6 +367,8 @@ export interface AgentState {
   seat?: string
   /** ACP 后端配置（持久化在 host-settings.json） */
   acpConfig?: AcpBackendConfig
+  /** 各 ACP 预设已保存的独立配置（供设置面板切换预设卡片时回显） */
+  acpProfiles?: Partial<Record<AcpPresetId, AcpBackendConfig>>
   /** ACP 后端运行时信息（版本、套餐、可用模式与配置项） */
   acp?: AcpRuntimeInfo
   /** ACP 历史会话恢复失败；有它时当前任务只能查看，发消息前要先重试恢复或开始新任务 */

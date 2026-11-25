@@ -161,10 +161,10 @@ function urlOrigin(value: string): string | null {
   try { return new URL(value).origin } catch { return null }
 }
 /** Electron 的 invoke 失败会把「Error invoking remote method …」前缀带进来，面板只显示正文 */
-function readableIpcError(error: unknown): string {
+function readableIpcError(error: unknown, fallback = '操作失败'): string {
   const text = error instanceof Error ? error.message : String(error)
   const tail = text.replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, '').trim()
-  return tail || '拉取失败'
+  return tail || fallback
 }
 function formatTokens(n: number): string {
   const value = Math.max(0, Math.round(n))
@@ -269,7 +269,11 @@ export function AgentPanel({
   const planSupported = !isAcp || Boolean(acpPlanTarget(state.acp))
   const resumeFailure = isAcp ? state.acpResume : undefined
   const currentChoice = state.choices.find(c => c.provider === state.provider && c.model === state.model)
-  const currentModelLabel = currentChoice?.label || state.model || '尚未配置模型'
+  const currentModelLabel = currentChoice?.label || state.model || (
+    resumeFailure ? '会话未恢复'
+      : isAcp ? (state.connection === 'ready' ? '代理默认模型' : '等待连接')
+        : '尚未配置模型'
+  )
   // 上面那块设置（模型、工作目录、任务）可以收起成一行，给对话留出空间；收起状态记在本机
   const [contextCollapsed, setContextCollapsed] = useState<boolean>(() => {
     try { return window.localStorage.getItem('fd:agent-context-collapsed') === '1' } catch { return false }
@@ -407,7 +411,7 @@ export function AgentPanel({
   }, [open, board, active?.id])
   useEffect(() => {
     if (!open || state.busy) return
-    void api.connect(board).catch(err => setError(String(err.message ?? err)))
+    void api.connect(board).catch(err => setError(readableIpcError(err)))
   }, [open, board, state.busy])
   useEffect(() => { setContinuation(last?.status === 'failed' ? 'new' : 'resume') }, [last?.id, last?.status])
   useEffect(() => {
@@ -436,11 +440,38 @@ export function AgentPanel({
     if (open && follow.current && !pointerDownRef.current) scrollToBottom()
   }, [state, open])
 
+  function draftForAcpPreset(presetId: AcpPresetId) {
+    const saved = presetId === state.acpConfig?.preset
+      ? state.acpConfig
+      : state.acpProfiles?.[presetId]
+    const spec = acpPresetSpec(presetId)
+    if (saved) {
+      return {
+        preset: presetId,
+        command: saved.command ?? '',
+        argsText: (saved.args ?? []).join('\n'),
+        seat: saved.seat || spec?.defaultSeat || 'ACP',
+        label: saved.label || spec?.label || '自定义 ACP'
+      }
+    }
+    return {
+      preset: presetId,
+      command: '',
+      argsText: spec ? spec.defaultArgs.join('\n') : '',
+      seat: spec?.defaultSeat ?? 'ACP',
+      label: spec?.label ?? '自定义 ACP'
+    }
+  }
+  function openSettingsPanel(next: boolean) {
+    if (next && isAcp) setAcpDraft(draftForAcpPreset(acpPreset))
+    setSettings(next)
+  }
+
   async function act(action: () => Promise<unknown>): Promise<boolean> {
     setWorking(true)
     setError(null)
     try { await action(); return true }
-    catch (error) { setError(error instanceof Error ? error.message : '操作失败'); return false }
+    catch (error) { setError(readableIpcError(error)); return false }
     finally { setWorking(false) }
   }
   async function fetchModels() {
@@ -460,14 +491,14 @@ export function AgentPanel({
       setModelsError(list.length ? null : '服务商没有返回任何模型，模型 ID 需要手填')
     } catch (error) {
       setModelList([])
-      setModelsError(readableIpcError(error))
+      setModelsError(readableIpcError(error, '拉取失败'))
     } finally {
       setModelsBusy(false)
     }
   }
 
   async function send() {
-    if (!goal.trim() || disabled) return
+    if (!goal.trim() || disabled || resumeFailure) return
     const text = goal
     const success = await act(async () => {
       const context = await capture()
@@ -477,7 +508,7 @@ export function AgentPanel({
   }
   // 把选中的图片照原样转成可编辑的方框、文字和线条：结果以提议的形式画在原图旁边，确认后才落到画布上
   async function traceSelected() {
-    if (!selectedImage || disabled || !state.vision) return
+    if (!selectedImage || disabled || !state.vision || resumeFailure) return
     const success = await act(async () => {
       const { imageId, width, height, capture: context } = await traceCapture()
       await api.submit({
@@ -488,7 +519,7 @@ export function AgentPanel({
     if (success) { updateFollow(true); scrollToBottom() }
   }
   async function execute() {
-    if (disabled) return
+    if (disabled || resumeFailure) return
     if (await act(() => api.execute(goal.trim()))) { setGoal(''); updateFollow(true); scrollToBottom() }
   }
   async function saveModel() {
@@ -699,7 +730,7 @@ export function AgentPanel({
           title={yolo ? 'YOLO 已开启：所有工具调用都不再确认，直接执行。点击关闭' : '开启 YOLO：所有工具调用都不再逐次确认'}
           onClick={() => { if (yolo) void act(() => api.setApprovalMode('auto-safe')); else setConfirmYolo(true) }}
         >YOLO{yolo ? ' · 开' : ''}</button>
-        <button onClick={() => setSettings(value => !value)} disabled={state.busy}>
+        <button onClick={() => openSettingsPanel(!settings)} disabled={state.busy}>
           {settings ? '返回任务' : isAcp ? 'ACP 设置' : '模型设置'}
         </button>
       </div>
@@ -727,13 +758,10 @@ export function AgentPanel({
                   type="button"
                   className={`fd-acp-preset-card${selected ? ' fd-acp-preset-card-active' : ''}`}
                   data-preset={spec.id}
-                  onClick={() => setAcpDraft({
-                    preset: spec.id,
-                    command: '',
-                    argsText: spec.defaultArgs.join('\n'),
-                    seat: spec.defaultSeat,
-                    label: spec.label
-                  })}
+                  onClick={() => {
+                    if (acpDraft.preset === spec.id) return
+                    setAcpDraft(draftForAcpPreset(spec.id))
+                  }}
                 >
                   <span className="fd-acp-preset-head">
                     <AcpAgentMark preset={spec.id} />
@@ -749,13 +777,10 @@ export function AgentPanel({
               type="button"
               className={`fd-acp-preset-card${acpDraft.preset === 'custom' ? ' fd-acp-preset-card-active' : ''}`}
               data-preset="custom"
-              onClick={() => setAcpDraft(v => ({
-                preset: 'custom',
-                command: v.preset === 'custom' ? v.command : '',
-                argsText: v.preset === 'custom' ? v.argsText : '',
-                seat: v.preset === 'custom' ? v.seat : 'ACP',
-                label: v.preset === 'custom' ? v.label : '自定义 ACP'
-              }))}
+              onClick={() => {
+                if (acpDraft.preset === 'custom') return
+                setAcpDraft(draftForAcpPreset('custom'))
+              }}
             >
               <span className="fd-acp-preset-head">
                 <AcpAgentMark preset="custom" />
@@ -891,7 +916,7 @@ export function AgentPanel({
             {state.workspaceWarning ? <p className="fd-agent-small" role="status">{state.workspaceWarning}</p> : null}
           </div> : <div className="fd-agent-context">
             <div className="fd-agent-model-row">
-              <select aria-label="当前模型" disabled={disabled} value={JSON.stringify([state.provider, state.model])} onChange={e => {
+              <select aria-label="当前模型" disabled={disabled || Boolean(resumeFailure)} value={JSON.stringify([state.provider, state.model])} onChange={e => {
                 const [provider, model] = JSON.parse(e.target.value) as string[]
                 void act(() => api.selectModel(provider, model))
               }}>
@@ -1169,7 +1194,7 @@ export function AgentPanel({
                   {state.connection === 'starting' ? '连接中…' : isAcp ? '重新连接 ACP' : '重新连接内核'}
                 </button>
                 {isAcp ? (
-                  <button type="button" disabled={working} onClick={() => setSettings(true)}>配置 ACP 路径</button>
+                  <button type="button" disabled={working} onClick={() => openSettingsPanel(true)}>配置 ACP 路径</button>
                 ) : null}
               </div>
             ) : <>
@@ -1183,11 +1208,11 @@ export function AgentPanel({
               </div> : null}
               {selectedImage && !state.setupNeeded ? <div className="fd-agent-trace">
                 <span>已选中一张图片{state.vision ? '' : '（当前模型不支持看图，无法转换）'}</span>
-                <button disabled={disabled || !state.vision} title={`让 ${seatName} 照着这张图画出可编辑的方框、文字和线条，确认后才落到画布上`} onClick={() => void traceSelected()}>转成可编辑图 ↗</button>
+                <button disabled={disabled || !state.vision || Boolean(resumeFailure)} title={`让 ${seatName} 照着这张图画出可编辑的方框、文字和线条，确认后才落到画布上`} onClick={() => void traceSelected()}>转成可编辑图 ↗</button>
               </div> : null}
-              <textarea ref={composerRef} aria-label="任务目标" placeholder={last?.status === 'planned' ? '可补充调整，Enter 确认执行，Shift+Enter 换行' : isAcp ? `对 ${acpBrand} 说点什么，或圈出画布再发…（Enter 发送，Shift+Enter 换行）` : '想让 Agent 做什么？（Enter 发送，Shift+Enter 换行）'} value={goal} disabled={state.busy || state.setupNeeded} onChange={e => setGoal(e.target.value)} onKeyDown={e => {
+              <textarea ref={composerRef} aria-label="任务目标" placeholder={resumeFailure ? (resumeFailure.reason === 'error' ? '原会话未恢复：请先点上方「重试恢复」或「开始新任务」' : '原会话只能查看：请先点上方「开始新任务」') : last?.status === 'planned' ? '可补充调整，Enter 确认执行，Shift+Enter 换行' : isAcp ? `对 ${acpBrand} 说点什么，或圈出画布再发…（Enter 发送，Shift+Enter 换行）` : '想让 Agent 做什么？（Enter 发送，Shift+Enter 换行）'} value={goal} disabled={state.busy || state.setupNeeded || Boolean(resumeFailure)} onChange={e => setGoal(e.target.value)} onKeyDown={e => {
                 if (e.nativeEvent.isComposing || e.keyCode === 229) return
-                if (e.key === 'Enter' && !e.shiftKey && !e.altKey) { e.preventDefault(); if (last?.status === 'planned') void execute(); else void send() }
+                if (e.key === 'Enter' && !e.shiftKey && !e.altKey) { e.preventDefault(); if (resumeFailure) return; if (last?.status === 'planned') void execute(); else void send() }
               }} rows={3} />
               <div className="fd-agent-actions">
                 {resumePrevious ? <span className="fd-agent-small">沿用原任务的目标与预算</span> : <label className="fd-agent-check" title={planSupported ? undefined : `${acpBrand} 没有提供规划模式，只能直接执行`}><input type="checkbox" checked={planFirst && planSupported} disabled={disabled || !planSupported} onChange={e => setPlanFirst(e.target.checked)} />先拟计划</label>}

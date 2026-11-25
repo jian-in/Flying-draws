@@ -973,6 +973,8 @@ test('ACP 设置：参数按数组保存，含空格的路径是一项；每个�
   await s1.setAcpConfig({ preset: 'claude' }, 'default')
   assert.deepEqual(s1.snapshot().acpConfig?.args, claudeArgs)
   assert.equal(s1.snapshot().seat, '小克')
+  assert.deepEqual(s1.snapshot().acpProfiles?.codex?.args, codexArgs, '快照里带出其他预设已保存的配置，方便设置页切换卡片时回显')
+  assert.equal(s1.snapshot().acpProfiles?.codex?.seat, '小码')
   await s1.close()
 
   const s2 = makeService(join(home, 'app'), process.execPath, { confirm: async () => { reviews++; return true } })

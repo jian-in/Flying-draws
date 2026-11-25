@@ -799,7 +799,15 @@ export class AgentService extends EventEmitter {
     }
     if (expired.length || result.broken.length) this.changed()
   }
-  snapshot(): AgentState { return structuredClone(this.state) }
+  snapshot(): AgentState {
+    const snap = structuredClone(this.state)
+    const profiles: Partial<Record<AcpPresetId, AcpBackendConfig>> = {}
+    for (const [id, cfg] of Object.entries(this.acpProfiles) as [AcpPresetId, AcpBackendConfig][]) {
+      profiles[id] = { ...cfg, args: [...cfg.args] }
+    }
+    if (Object.keys(profiles).length) snap.acpProfiles = profiles
+    return snap
+  }
   private item(): AgentWorkItem | undefined { return this.state.items.find(item => item.id === this.state.activeItemId && !item.archived) }
   private currentRun(): AgentRun | undefined { return this.item()?.runs.at(-1) }
   private ensureTelemetry(): AgentTelemetry {
