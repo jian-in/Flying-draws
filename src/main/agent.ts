@@ -83,6 +83,7 @@ import {
   type AcpConfigOption,
   type AcpPlanTarget,
   type AcpPresetId,
+  type AcpResumeFailure,
   type AcpSelectOption,
   type AgentApproval,
   type AgentCapture,
@@ -98,6 +99,7 @@ import {
   type ImageRegionAnnotation,
   type ImageSourceMeta,
   type ProviderChoice,
+  type ReadOnlyTask,
   type ProviderDraft,
   type SnapshotMode
 } from '../shared/agent.ts'
@@ -289,6 +291,11 @@ function acpRejectOutcome(options: readonly AcpOption[]): AcpOutcome {
   return once ? { outcome: 'selected', optionId: once.id } : { outcome: 'cancelled' }
 }
 
+/** 去掉首尾空白后非空的字符串；其他类型和空串都当没给。 */
+function nonEmptyText(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
 /** 键排好序的 JSON，参数对象里字段顺序不同也算同一份参数。 */
 function stableJson(value: unknown): string {
   const seen = new WeakSet<object>()
@@ -310,9 +317,13 @@ function stableJson(value: unknown): string {
  */
 export function acpRuleKey(toolCall: { kind?: string; title?: string }, rawInput: unknown): string | undefined {
   if (rawInput === undefined) return undefined
+  const kind = String(toolCall.kind ?? '').trim()
+  const title = String(toolCall.title ?? '').trim()
+  // 不知道是哪个工具时不给匹配键：参数相同的两个不同工具不能共用一条许可，只能单次允许
+  if (!kind && !title) return undefined
   let body: string
   try { body = stableJson(rawInput) } catch { return undefined }
-  const identity = JSON.stringify([String(toolCall.kind ?? '').trim(), String(toolCall.title ?? '').trim()])
+  const identity = JSON.stringify([kind, title])
   return `acp:${createHash('sha256').update(identity).update('\n').update(body).digest('hex')}`
 }
 
@@ -875,12 +886,20 @@ export class AgentService extends EventEmitter {
   }
   private requireIdle(): void { if (this.state.busy) throw new Error('请先等待当前任务结束或停止任务') }
   private requireRecording(): void { if (!this.recordsWritable) throw new Error(this.state.recordsWarning || '任务记录不可写') }
-  /** 原 ACP 会话没恢复时不发消息：既不能塞进新会话冒充旧任务，也不能悄悄另起任务 */
-  private requireAcpSession(): void {
+  /**
+   * 当前任务只能查看时不发消息：只读的历史任务、没恢复的 ACP 原会话，都不能塞进新会话冒充旧任务，
+   * 也不能悄悄另起任务。
+   */
+  private requireWritableTask(): void {
+    if (this.state.readOnlyTask) throw new Error('这项任务的工作目录已不存在，只能查看记录；请重新选择项目后开始新任务。')
     if (this.currentEngine() !== 'acp' || !this.state.acpResume) return
     throw new Error(this.state.acpResume.reason === 'error'
       ? '原会话还没恢复：请先重试恢复，或开始新任务。'
       : '这项任务的会话无法恢复，只能查看记录；请开始新任务。')
+  }
+  /** 只读查看时给用户看的说明：工作目录已不存在。 */
+  private missingWorkspaceTask(item: AgentWorkItem, cwd: string): ReadOnlyTask {
+    return { itemId: item.id, message: `这项任务的工作目录已不存在或无法访问（${cwd}），记录只能查看；要接着做请重新选择项目后开始新任务。` }
   }
   private currentEngine(): AgentEngine { return this.state.engine === 'acp' ? 'acp' : 'fuxi' }
   private currentAcpPreset(): AcpPresetId { return isAcpPresetId(this.acpConfig.preset) ? this.acpConfig.preset : 'antigravity' }
@@ -1026,6 +1045,7 @@ export class AgentService extends EventEmitter {
         acpConfig: { ...this.acpConfig, args: [...this.acpConfig.args] },
         acp: this.acpBaseInfo(),
         acpResume: undefined,
+        readOnlyTask: undefined,
         connection: 'starting',
         error: null,
         telemetry: undefined,
@@ -1066,6 +1086,7 @@ export class AgentService extends EventEmitter {
         ...(activeAcp
           ? {
               acpResume: undefined,
+              readOnlyTask: undefined,
               connection: 'starting' as const,
               error: null,
               telemetry: undefined,
@@ -1100,6 +1121,10 @@ export class AgentService extends EventEmitter {
       if (this.currentEngine() !== 'acp') throw new Error('当前不是 ACP 模式')
       if (!this.sessionId) throw new Error('ACP 会话尚未就绪')
       const hasConfigOpt = Boolean(this.state.acp?.configOptions?.some(o => o.id === configId))
+      const planTarget = acpPlanTarget(this.state.acp)
+      const isModeOption = configId === 'mode'
+        || this.state.acp?.configOptions?.some(o => o.id === configId && o.category === 'mode')
+        || (planTarget?.via === 'config' && planTarget.configId === configId)
       let nextOptions = this.state.acp?.configOptions
       if (configId === 'mode' && !hasConfigOpt) {
         await this.acpHost().setMode(this.sessionId, value)
@@ -1107,6 +1132,8 @@ export class AgentService extends EventEmitter {
         const res = await this.acpHost().setConfigOption(this.sessionId, configId, value)
         nextOptions = normalizeAcpConfigOptions(res?.configOptions) ?? nextOptions
       }
+      // 用户明确选了模式：以后确认执行、发新任务都按这个模式来，不再切回进入规划前记下的模式
+      if (isModeOption) this.acpPrePlanMode = null
       const modeOpt = nextOptions?.find(o => o.id === 'mode' || o.category === 'mode')
       this.state.acp = {
         ...(this.state.acp ?? { name: this.acpConfig.label || 'Antigravity' }),
@@ -1173,6 +1200,7 @@ export class AgentService extends EventEmitter {
             this.state.connection = 'offline'
             this.state.error = error.message
             this.state.acpResume = undefined
+            this.state.readOnlyTask = undefined
             for (const item of this.state.items) for (const run of item.runs) {
               if (run.status === 'running' || run.status === 'planned') {
                 run.status = 'interrupted'
@@ -1210,6 +1238,7 @@ export class AgentService extends EventEmitter {
           }
           this.state.connection = 'offline'
           this.state.error = error.message
+          this.state.readOnlyTask = undefined
           for (const item of this.state.items) for (const run of item.runs) {
             if (run.status === 'running' || run.status === 'planned') { run.status = 'interrupted'; run.error = '内核连接已中断，尚未确认的工具结果保持未知；计划需要重新确认。' }
             for (const approval of run.approvals) approval.answered = true
@@ -1222,7 +1251,7 @@ export class AgentService extends EventEmitter {
       const item = target
         ? target.item
         : [...this.state.items].reverse().find(item => item.board === board && !item.archived && (item.engine ?? 'fuxi') === 'fuxi')
-      await this.openWorkspace(board, item, target?.cwd)
+      await this.openWorkspace(board, item, target?.cwd, { explicit: Boolean(target?.item) })
     } catch (error) {
       this.state.connection = 'error'
       this.report(error)
@@ -1230,10 +1259,10 @@ export class AgentService extends EventEmitter {
     }
   }
   /**
-   * ACP 原会话没能恢复：不换成新会话、不改原任务的会话 ID。任务记录照常显示，发消息前要用户
-   * 重试恢复（再次提交原 ID）或明确开始新任务。
+   * ACP 原会话没能恢复、或任务只能只读查看：不换成新会话、不改原任务的会话 ID。任务记录照常显示，
+   * 发消息前要用户重试恢复（再次提交原 ID）或明确开始新任务。
    */
-  private markAcpDetached(board: string, item: AgentWorkItem, cwd: string, workspaceWarning: string | undefined, failure: NonNullable<AgentState['acpResume']>): void {
+  private markAcpDetached(board: string, item: AgentWorkItem, cwd: string, workspaceWarning: string | undefined, lock: { acpResume: AcpResumeFailure } | { readOnlyTask: ReadOnlyTask }): void {
     for (const work of this.state.items) for (const run of work.runs) {
       if (run.status === 'planned') { run.status = 'interrupted'; run.error = '会话已切换，请重新拟定计划后执行。' }
     }
@@ -1267,7 +1296,34 @@ export class AgentService extends EventEmitter {
         ...(init?.agentInfo?.version ? { version: init.agentInfo.version } : {}),
         command: this.acpCommandPath
       },
-      acpResume: failure
+      acpResume: 'acpResume' in lock ? lock.acpResume : undefined,
+      readOnlyTask: 'readOnlyTask' in lock ? lock.readOnlyTask : undefined
+    }
+    this.changed()
+  }
+  /**
+   * Fuxi 的历史任务只能只读查看（工作目录已不存在）：不打开工作区、不在别的目录里接着它的会话，
+   * 任务记录照常显示，要接着做先开始新任务。
+   */
+  private markFuxiReadOnly(board: string, item: AgentWorkItem, cwd: string): void {
+    for (const work of this.state.items) for (const run of work.runs) {
+      if (run.status === 'planned') { run.status = 'interrupted'; run.error = '会话已切换，请重新拟定计划后执行。' }
+    }
+    this.board = board
+    this.sessionId = ''
+    this.hasRequestContext = false
+    this.state = {
+      ...this.state,
+      engine: 'fuxi',
+      seat: AGENT_SEAT,
+      activeItemId: item.id,
+      workspace: cwd,
+      workspaceWarning: undefined,
+      connection: 'ready',
+      error: null,
+      telemetry: undefined,
+      acpResume: undefined,
+      readOnlyTask: this.missingWorkspaceTask(item, cwd)
     }
     this.changed()
   }
@@ -1277,7 +1333,15 @@ export class AgentService extends EventEmitter {
     let fallbackWorkspace = this.state.workspace
     let workspaceWarning = hadOverride ? undefined : this.state.workspaceWarning
     const candidate = cwdOverride || item?.cwd || fallbackWorkspace
+    const acp = this.acpHost()
+    const prevSession = this.sessionId
     if (candidate && !(await stat(candidate).then(info => info.isDirectory(), () => false))) {
+      if (opts?.explicit && item && !cwdOverride) {
+        // 用户主动打开历史任务：照常显示这项任务的记录，只读；不在别的目录里接着它的会话
+        if (prevSession) void acp.closeSession(prevSession)
+        this.markAcpDetached(board, item, candidate, undefined, { readOnlyTask: this.missingWorkspaceTask(item, candidate) })
+        return
+      }
       item = undefined
       cwdOverride = undefined
       fallbackWorkspace = ''
@@ -1285,9 +1349,7 @@ export class AgentService extends EventEmitter {
     }
     const cwd = cwdOverride || item?.cwd || fallbackWorkspace || join(this.root, 'workspaces', key)
     if (!cwdOverride && !item && !fallbackWorkspace) await mkdir(cwd, { recursive: true })
-    const acp = this.acpHost()
     const mcpServers = toAcpMcpServers(this.options.mcpServers, this.activeSeat())
-    const prevSession = this.sessionId
     let session: AcpSessionResult | undefined
     try {
       if (item && (item.engine ?? 'fuxi') === 'acp' && item.sessionId) {
@@ -1305,7 +1367,7 @@ export class AgentService extends EventEmitter {
             item = undefined
           } else {
             if (prevSession) void acp.closeSession(prevSession)
-            this.markAcpDetached(board, item, cwd, workspaceWarning, failure)
+            this.markAcpDetached(board, item, cwd, workspaceWarning, { acpResume: failure })
             return
           }
         }
@@ -1371,17 +1433,23 @@ export class AgentService extends EventEmitter {
         ...(session.modes?.currentModeId ? { currentModeId: session.modes.currentModeId } : {}),
         ...(configOptions ? { configOptions } : {})
       },
-      acpResume: undefined
+      acpResume: undefined,
+      readOnlyTask: undefined
     }
     this.changed()
   }
-  private async openWorkspace(board: string, item?: AgentWorkItem, cwdOverride?: string): Promise<void> {
+  private async openWorkspace(board: string, item?: AgentWorkItem, cwdOverride?: string, opts?: { explicit?: boolean }): Promise<void> {
     const key = createHash('sha256').update(board).digest('hex').slice(0, 16)
     const hadOverride = Boolean(cwdOverride)
     let fallbackWorkspace = this.state.workspace
     let workspaceWarning = hadOverride ? undefined : this.state.workspaceWarning
     const candidate = cwdOverride || item?.cwd || fallbackWorkspace
     if (candidate && !(await stat(candidate).then(info => info.isDirectory(), () => false))) {
+      if (opts?.explicit && item && !cwdOverride) {
+        // 用户主动打开历史任务：照常显示这项任务的记录，只读；不在别的目录里接着它的会话
+        this.markFuxiReadOnly(board, item, candidate)
+        return
+      }
       item = undefined
       cwdOverride = undefined
       fallbackWorkspace = ''
@@ -1413,7 +1481,7 @@ export class AgentService extends EventEmitter {
     if (item) item.sessionId = ready.session_id
     this.hasRequestContext = false
     this.state = {
-      ...this.state, engine: 'fuxi', seat: AGENT_SEAT, acpResume: undefined,
+      ...this.state, engine: 'fuxi', seat: AGENT_SEAT, acpResume: undefined, readOnlyTask: undefined,
       activeItemId: item?.id ?? null, workspace: cwd, workspaceWarning, connection: 'ready', error: null,
       provider: ready.provider, model: ready.model, choices: ready.choices ?? [], setupNeeded: ready.setup_needed, vision: ready.vision,
       toolLabels: toolLabels(ready.tools),
@@ -1446,8 +1514,8 @@ export class AgentService extends EventEmitter {
   async openTask(id: string): Promise<void> {
     return this.withTransition(async () => {
       this.requireIdle()
-      // 原会话没恢复时，再点这项任务就是重试恢复
-      if (id === this.state.activeItemId && this.state.connection === 'ready' && this.state.acpResume?.itemId !== id) return
+      // 原会话没恢复、或只能只读查看时，再点这项任务就是重试（比如工作目录已经放回原处）
+      if (id === this.state.activeItemId && this.state.connection === 'ready' && this.state.acpResume?.itemId !== id && this.state.readOnlyTask?.itemId !== id) return
       const item = this.state.items.find(item => item.id === id)
       if (!item) throw new Error('没有找到这项任务')
       if (item.archived) throw new Error('这项任务所属的画板已删除，记录已归档')
@@ -1468,6 +1536,7 @@ export class AgentService extends EventEmitter {
           seat: itemEngine === 'acp' ? this.activeSeat() : AGENT_SEAT,
           acp: this.acpBaseInfo(),
           acpResume: undefined,
+          readOnlyTask: undefined,
           connection: 'starting',
           error: null,
           telemetry: undefined,
@@ -1559,8 +1628,9 @@ export class AgentService extends EventEmitter {
   private async ensureItem(board: string): Promise<AgentWorkItem> {
     this.requireRecording()
     await this.connect(board)
+    // 只读查看先说清楚：这项任务本身就不能接着发，和模型设没设好无关
+    this.requireWritableTask()
     if (this.state.setupNeeded) throw new Error('请先设置模型')
-    this.requireAcpSession()
     const engine = this.currentEngine()
     const preset = engine === 'acp' ? this.currentAcpPreset() : undefined
     let item = this.item()
@@ -1782,6 +1852,8 @@ export class AgentService extends EventEmitter {
     }
     if (!target) { this.acpPrePlanMode = null; return }
     const current = this.acpCurrentMode(target)
+    // 只在代理还停在规划模式时替用户切回；代理自己退出了规划、或用户之后改过模式，都以当前模式为准
+    if (current !== undefined && current !== ACP_PLAN_MODE) { this.acpPrePlanMode = null; return }
     const restore = this.acpPrePlanMode ?? (mode === 'execute' && current === ACP_PLAN_MODE ? acpFallbackMode(this.state.acp, target) : undefined)
     if (!restore || restore === current) { this.acpPrePlanMode = null; return }
     try { await this.switchAcpMode(target, restore) }
@@ -1855,6 +1927,9 @@ export class AgentService extends EventEmitter {
       this.flushAcpDrafts(run)
       this.clearAcpPermissions(false)
       this.activeAcpRunId = null
+      // 本轮请求报错也可能已经改过文件：照常结算快照
+      if (this.imageWrites.size) await Promise.allSettled([...this.imageWrites])
+      if (run.baseline && !run.roundChanges) await this.finishBaseline(run).catch(err => this.report(err))
       const wasCancelled = this.acpCancelRequested
       this.acpCancelRequested = false
       if (wasCancelled) {
@@ -1880,25 +1955,34 @@ export class AgentService extends EventEmitter {
     this.acpCancelTimer = null
     if (this.activeAcpRunId !== runId || this.acpClient !== client) return
     const run = this.activeAcpRun()
+    // 先断开：旧连接迟到的输出被忽略、迟到的审批答 cancelled。busy 和 acpCancelRequested 保持到旧进程退出，
+    // 这期间面板不会自动重连、也发不了下一轮，新代理不可能和还在写文件的旧进程同时接手同一个会话
     this.acpClient = null
     this.activeAcpRunId = null
-    this.acpCancelRequested = false
     this.acpPrePlanMode = null
     this.sessionId = ''
     this.clearAcpPermissions(true)
     this.autoApproved.clear()
+    this.acpToolInputs.clear()
     if (run) {
       this.flushAcpDrafts(run)
+      for (const approval of run.approvals) approval.answered = true
+    }
+    this.changed()
+    await client.stop().catch(() => undefined)
+    if (run) {
+      // 旧进程已退出：结算这一轮的改动快照，再标记结束
+      if (this.imageWrites.size) await Promise.allSettled([...this.imageWrites])
+      if (run.baseline && !run.roundChanges) await this.finishBaseline(run).catch(error => this.report(error))
       run.status = 'cancelled'
       run.error = '代理没有响应停止请求，已结束这次连接；下一轮会重新连接。'
       run.endedAt = new Date().toISOString()
-      for (const approval of run.approvals) approval.answered = true
     }
+    this.acpCancelRequested = false
     this.state.busy = false
     this.state.connection = 'offline'
     this.changed()
     await this.persist().catch(error => this.report(error))
-    await client.stop().catch(() => undefined)
     if (!this.closing) void this.connect(this.board).catch(error => this.report(error))
   }
   private activeAcpRun(): AgentRun | undefined {
@@ -1970,15 +2054,15 @@ export class AgentService extends EventEmitter {
         break
       }
       case 'plan': {
-        if (Array.isArray(update.entries)) {
+        if (Array.isArray(update.entries) && run.mode === 'plan') {
+          // 协议要求每次都发完整列表、客户端整体替换：空列表就是代理撤回了全部步骤
           const lines = update.entries
             .filter((e): e is Record<string, unknown> => Boolean(e && typeof e === 'object'))
-            .map(e => `- [${e.status === 'completed' ? 'x' : ' '}] ${String(e.content ?? '')}`)
+            .map(e => String(e.content ?? '').trim() ? `- [${e.status === 'completed' ? 'x' : ' '}] ${String(e.content).trim()}` : '')
             .filter(Boolean)
-          if (lines.length && run.mode === 'plan') {
-            run.plan = lines.join('\n')
-            this.changed()
-          }
+          if (lines.length) run.plan = lines.join('\n')
+          else delete run.plan
+          this.changed()
         }
         break
       }
@@ -1994,14 +2078,16 @@ export class AgentService extends EventEmitter {
             ? update.kind.trim()
             : '工具调用'
         const inputText = previewAcpInput(update.rawInput)
-        if (update.rawInput !== undefined) {
-          // 记下完整参数（不截断），审批请求没带参数时用它判断是不是同一条调用
+        {
+          // 工具身份和完整参数（不截断）分别记下、逐条合并：代理可能先发标题、后补参数，
+          // 审批请求缺哪一项就用这里的补上，判断是不是同一个工具的同一条调用
           const prev = this.acpToolInputs.get(toolId)
-          this.acpToolInputs.set(toolId, {
-            kind: typeof update.kind === 'string' ? update.kind : prev?.kind,
-            title: typeof update.title === 'string' ? update.title : prev?.title,
-            rawInput: update.rawInput
-          })
+          const seenKind = nonEmptyText(update.kind) ?? prev?.kind
+          const seenTitle = nonEmptyText(update.title) ?? prev?.title
+          const seenInput = update.rawInput !== undefined ? update.rawInput : prev?.rawInput
+          if (seenKind !== undefined || seenTitle !== undefined || seenInput !== undefined) {
+            this.acpToolInputs.set(toolId, { kind: seenKind, title: seenTitle, rawInput: seenInput })
+          }
         }
         const resultText = (extractAcpText(update.rawOutput) || extractAcpText(update.content)).slice(0, 16_000)
         let tool = [...run.tools].reverse().find(t => t.id === toolId)
@@ -2033,14 +2119,16 @@ export class AgentService extends EventEmitter {
   }
   private onAcpPermission(req: AcpPermissionRequest): void {
     const run = this.activeAcpRun()
-    if (!run || !this.state.busy) {
+    // 已点停止（代理还没回应取消）、或不是当前会话的请求：一律答 cancelled，不按 YOLO 或任务规则放行，也不再弹卡
+    const otherSession = Boolean(req.sessionId && this.sessionId && req.sessionId !== this.sessionId)
+    if (!run || !this.state.busy || this.acpCancelRequested || otherSession) {
       req.respond({ outcome: 'cancelled' })
       return
     }
     const toolId = req.toolCall.toolCallId || ''
     const seen = toolId ? this.acpToolInputs.get(toolId) : undefined
-    const kind = req.toolCall.kind ?? seen?.kind
-    const title = req.toolCall.title ?? seen?.title
+    const kind = nonEmptyText(req.toolCall.kind) ?? seen?.kind
+    const title = nonEmptyText(req.toolCall.title) ?? seen?.title
     const name = title?.trim() || kind?.trim() || '操作确认'
     const rawInput = req.toolCall.rawInput !== undefined ? req.toolCall.rawInput : seen?.rawInput
     const preview = rawInput !== undefined ? previewAcpInput(rawInput) : undefined
@@ -2092,7 +2180,7 @@ export class AgentService extends EventEmitter {
       if (this.changingBoards.has(item?.board ?? this.board)) throw new Error('画板正在更新，请稍后确认执行')
       const previous = item?.runs.at(-1)
       if (!item || previous?.status !== 'planned') throw new Error('没有等待确认的计划')
-      this.requireAcpSession()
+      this.requireWritableTask()
       const run = this.makeRun(item, text || '按确认的计划执行', 'execute')
       if (previous.sourceImageRef) run.sourceImageRef = previous.sourceImageRef
       if (previous.annotations?.length) run.annotations = previous.annotations

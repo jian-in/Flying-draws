@@ -87,6 +87,8 @@ body.fd-resizing { cursor: col-resize !important; user-select: none !important; 
 .fd-agent-caret { display: inline-block; height: 12px; width: 2px; background: currentColor; margin-left: 3px; }
 .fd-agent-plan { margin-top: 15px; padding: 12px; border: 1px solid var(--fd-border); border-radius: 3px; background: var(--fd-surface); }
 .fd-agent-plan > strong { display: block; font-size: 11px; margin-bottom: 7px; }
+.fd-agent-plan-note { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--fd-border); }
+.fd-agent-plan-note > strong { display: block; font-size: 11px; margin-bottom: 5px; color: var(--fd-muted); }
 .fd-markdown { min-width: 0; max-width: 100%; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .fd-markdown :is(p, ul, ol, blockquote, pre, hr, .fd-md-table) { margin: .55em 0; }
 .fd-markdown p { white-space: pre-line; }

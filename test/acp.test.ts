@@ -166,6 +166,17 @@ test('自动探测本地 agy 与自定义路径解析', async t => {
   assert.equal(resolveAcpCommand('', { LOCALAPPDATA: localAppData, PATH: '' }, root, 'win32'), agyBin)
   assert.throws(() => resolveAcpCommand(join(root, 'missing.exe'), { PATH: '' }, root, 'win32'), /找不到配置的 ACP/)
 
+  // 相对路径按当前工作目录解析成绝对路径：确认框、信任指纹和启动用的是同一个文件
+  const cwd = process.cwd()
+  try {
+    process.chdir(localAppData)
+    assert.equal(resolveAcpCommand(join('agy', 'bin', 'agy.exe'), { PATH: '' }, root, 'win32'), agyBin)
+    process.chdir(root)
+    assert.throws(() => resolveAcpCommand(join('agy', 'bin', 'agy.exe'), { PATH: '' }, root, 'win32'), /找不到配置的 ACP/, '换个目录，同一串相对路径不再指向原文件')
+  } finally {
+    process.chdir(cwd)
+  }
+
   // 探测全局 npm 目录下的 claude-agent-acp / codex-acp / opencode
   const appData = join(root, 'AppData')
   const npmBin = join(appData, 'npm')
@@ -393,7 +404,9 @@ interface ScriptStep {
   echo?: boolean
   plan?: string[]
   tool?: { toolCallId: string; title?: string; kind?: string; rawInput?: unknown }
-  perm?: { toolCallId: string; title?: string; kind?: string; rawInput?: unknown; options?: { optionId: string; name: string; kind: string }[] }
+  perm?: { toolCallId: string; title?: string; kind?: string; rawInput?: unknown; sessionId?: string; options?: { optionId: string; name: string; kind: string }[] }
+  /** 代理自己切模式，并发 current_mode_update / config_option_update */
+  setMode?: string
   hang?: boolean
   stop?: string
 }
@@ -408,10 +421,13 @@ interface FakeConfig {
   failSetMode?: string[]
   loadFailTimes?: number
   ignoreCancel?: boolean
+  /** 收到 session/cancel 后、回应 prompt 之前再发一条审批请求（模拟取消与审批赛跑） */
+  permOnCancel?: { toolCallId: string; title?: string; kind?: string; rawInput?: unknown }
   cases?: Record<string, ScriptStep[]>
 }
 interface FakeLogEntry {
   argv?: string[]
+  exit?: number
   in?: { id?: number | string; method?: string; params?: Record<string, any> }
   permission?: string
   result?: unknown
@@ -423,6 +439,7 @@ import { appendFileSync, readFileSync } from 'node:fs'
 const cfg = JSON.parse(readFileSync(process.argv[2], 'utf8'))
 const log = entry => appendFileSync(cfg.log, JSON.stringify(entry) + '\\n')
 log({ argv: process.argv.slice(3) })
+process.on('exit', () => log({ exit: process.pid }))
 const send = obj => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...obj }) + '\\n')
 const update = (sessionId, u) => send({ method: 'session/update', params: { sessionId, update: u } })
 let mode = cfg.mode || 'default'
@@ -454,13 +471,18 @@ async function runPrompt(msg) {
     if (step.echo) update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'mode=' + mode + ';images=' + blocks.filter(b => b.type === 'image').length } })
     if (step.plan) update(sid, { sessionUpdate: 'plan', entries: step.plan.map(content => ({ content, status: 'pending', priority: 'medium' })) })
     if (step.tool) update(sid, { sessionUpdate: 'tool_call', status: 'in_progress', ...step.tool })
+    if (step.setMode) {
+      mode = step.setMode
+      update(sid, { sessionUpdate: 'current_mode_update', currentModeId: mode })
+      if (cfg.modeConfig) update(sid, { sessionUpdate: 'config_option_update', configOptions: modeOptions() })
+    }
     if (step.perm) {
-      const { options, ...toolCall } = step.perm
+      const { options, sessionId: permSid, ...toolCall } = step.perm
       update(sid, { sessionUpdate: 'tool_call', status: 'pending', ...toolCall })
       const rpcId = 'perm-' + (++permSeq)
       const result = await new Promise(resolve => {
         waiters.set(rpcId, resolve)
-        send({ id: rpcId, method: 'session/request_permission', params: { sessionId: sid, toolCall, options: options || DEFAULT_OPTIONS } })
+        send({ id: rpcId, method: 'session/request_permission', params: { sessionId: permSid || sid, toolCall, options: options || DEFAULT_OPTIONS } })
       })
       const outcome = (result && result.outcome) || {}
       log({ permission: toolCall.toolCallId, result: outcome })
@@ -507,6 +529,18 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       if (!active) return
       const id = active
       active = null
+      if (cfg.permOnCancel) {
+        const toolCall = cfg.permOnCancel
+        const rpcId = 'perm-' + (++permSeq)
+        new Promise(resolve => {
+          waiters.set(rpcId, resolve)
+          send({ id: rpcId, method: 'session/request_permission', params: { sessionId: msg.params.sessionId, toolCall, options: DEFAULT_OPTIONS } })
+        }).then(result => {
+          log({ permission: toolCall.toolCallId, result: (result && result.outcome) || {} })
+          send({ id, result: { stopReason: 'cancelled' } })
+        })
+        return
+      }
       if (cfg.ignoreCancel) {
         setTimeout(() => {
           update(msg.params.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'LATE' } })
@@ -697,6 +731,178 @@ test('ACP 规划：configOptions 和 modes 两种表示都走通「拟计划 →
       await service.close()
     }
   }
+})
+
+test('ACP 规划：生成计划后用户改选的模式在确认执行时生效；代理自己退出规划后不被切回规划前的模式', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-plan-mode-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const fake = await scriptedAcp(join(home, 'fake'), {
+    modeConfig: ['fast', 'manual', 'plan'],
+    mode: 'fast',
+    cases: {
+      PLAN_IT: [{ plan: ['读画布'] }, { echo: true }],
+      PLAN_EXIT: [{ plan: ['读画布'] }, { setMode: 'fast' }, { echo: true }]
+    }
+  })
+  const service = makeService(join(home, 'app'), process.execPath)
+  t.after(() => service.close().catch(() => undefined))
+  await connectFake(service, fake)
+
+  // 从 fast 拟计划，生成后用户改选 manual：确认执行就按 manual，不切回 fast
+  await ask(service, 'PLAN_IT', 'plan')
+  assert.equal((await settle(service)).status, 'planned')
+  await service.setAcpConfigOption('mode', 'manual')
+  await service.execute('')
+  const executed = await settle(service)
+  assert.equal(executed.status, 'completed')
+  assert.match(executed.reply, /mode=manual;/, '用户最后选的模式生效')
+
+  // 从 manual 拟计划，代理在规划中自己切到 fast：确认执行以代理当前模式为准，不再切回 manual
+  await ask(service, 'PLAN_EXIT', 'plan')
+  assert.equal((await settle(service)).status, 'planned')
+  assert.equal(service.snapshot().acp?.currentModeId, 'fast')
+  await service.execute('')
+  assert.match((await settle(service)).reply, /mode=fast;/)
+
+  const switches = (await fake.received('session/set_config_option')).map(m => m.params?.value)
+  assert.deepEqual(switches, ['plan', 'manual', 'plan'], '宿主没有在确认执行前替用户改模式')
+})
+
+test('ACP 规划：代理用空列表撤回全部步骤后，旧步骤不再显示、也不能凭旧步骤确认执行', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-plan-clear-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const fake = await scriptedAcp(join(home, 'fake'), {
+    modeConfig: ['default', 'plan'],
+    cases: {
+      WITHDRAW_SILENT: [{ plan: ['改掉 a.txt'] }, { plan: [] }],
+      WITHDRAW_SAY: [{ plan: ['改掉 a.txt'] }, { plan: [] }, { say: '看过了，不需要改动。' }],
+      REPLACE: [{ plan: ['旧步骤'] }, { plan: ['新步骤一', '新步骤二'] }]
+    }
+  })
+  const service = makeService(join(home, 'app'), process.execPath)
+  t.after(() => service.close().catch(() => undefined))
+  await connectFake(service, fake)
+
+  await ask(service, 'WITHDRAW_SILENT', 'plan')
+  const silent = await settle(service)
+  assert.equal(silent.status, 'failed', '没有任何计划内容，不能确认执行')
+  assert.equal(silent.plan, undefined)
+  await assert.rejects(service.execute(''), /没有等待确认的计划/)
+
+  await ask(service, 'WITHDRAW_SAY', 'plan')
+  const said = await settle(service)
+  assert.equal(said.status, 'planned')
+  assert.doesNotMatch(said.plan ?? '', /a\.txt/, '撤回的步骤不再出现在计划里')
+  assert.match(said.plan ?? '', /不需要改动/)
+
+  await ask(service, 'REPLACE', 'plan')
+  const replaced = await settle(service)
+  assert.equal(replaced.plan, '- [ ] 新步骤一\n- [ ] 新步骤二', '每次更新整体替换')
+})
+
+test('ACP 停止：代理回应取消前又来的审批一律答 cancelled，YOLO 也不放行；其他会话的审批同样不放行', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-cancel-perm-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const fake = await scriptedAcp(join(home, 'fake'), {
+    permOnCancel: { toolCallId: 'late', title: 'run', kind: 'execute', rawInput: { cmd: 'rm -rf build' } },
+    cases: {
+      HANG_IT: [{ say: '处理中' }, { hang: true }],
+      OTHER_SESSION: [{ perm: { toolCallId: 'x1', title: 'run', kind: 'execute', rawInput: { cmd: 'ls' }, sessionId: 'someone-else' } }, { say: 'ok' }]
+    }
+  })
+  const service = makeService(join(home, 'app'), process.execPath)
+  t.after(() => service.close().catch(() => undefined))
+  await connectFake(service, fake)
+  await service.setApprovalMode('full-access')
+
+  await ask(service, 'HANG_IT')
+  await waitFor(() => lastRun(service)?.draft)
+  await service.cancel()
+  const stopped = await settle(service)
+  assert.equal(stopped.status, 'cancelled')
+  assert.deepEqual(await fake.choices(), [{ outcome: 'cancelled' }], '停止后迟到的审批没有被 YOLO 放行')
+  assert.equal(stopped.approvals.length, 0, '停止后不再弹审批卡')
+  assert.equal(stopped.tools.find(tool => tool.id === 'late')?.autoApproved, undefined)
+
+  await ask(service, 'OTHER_SESSION')
+  await settle(service)
+  assert.deepEqual((await fake.choices()).at(-1), { outcome: 'cancelled' }, '不是当前会话的审批不放行')
+})
+
+test('ACP 审批：工具身份和参数分开发送时按各自身份匹配许可；身份不明时只能单次允许', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-perm-split-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const same = { path: 'notes.txt' }
+  const fake = await scriptedAcp(join(home, 'fake'), {
+    cases: {
+      SPLIT: [
+        { tool: { toolCallId: 'a1', title: 'read_file', kind: 'read' } },
+        { perm: { toolCallId: 'a1', rawInput: same } },
+        { tool: { toolCallId: 'a2', title: 'delete_file', kind: 'delete' } },
+        { perm: { toolCallId: 'a2', rawInput: same } },
+        { say: 'ok' }
+      ],
+      ANON: [{ perm: { toolCallId: 'z1', rawInput: same } }, { say: 'ok' }]
+    }
+  })
+  const service = makeService(join(home, 'app'), process.execPath)
+  t.after(() => service.close().catch(() => undefined))
+  await connectFake(service, fake)
+
+  await ask(service, 'SPLIT')
+  const read = await pendingApproval(service)
+  assert.equal(read.name, 'read_file', '审批卡用先前通知里的工具标题')
+  assert.ok(read.ruleKey)
+  await service.approve(read.requestId, true, true)
+  const del = await pendingApproval(service, [read.requestId])
+  assert.equal(del.name, 'delete_file')
+  assert.notEqual(del.ruleKey, read.ruleKey, '参数相同但工具不同，许可不复用')
+  await service.approve(del.requestId, false)
+  await settle(service)
+
+  await ask(service, 'ANON')
+  const anon = await pendingApproval(service)
+  assert.equal(anon.ruleKey, undefined, '不知道是哪个工具时不给匹配键')
+  await assert.rejects(service.approve(anon.requestId, true, true), /没法记住/)
+  await service.approve(anon.requestId, true)
+  await settle(service)
+  const once = { outcome: 'selected', optionId: 'once' }
+  assert.deepEqual(await fake.choices(), [once, { outcome: 'selected', optionId: 'no' }, once])
+})
+
+test('ACP 历史任务：工作目录移走后主动打开仍显示原记录，只读，不能接着发', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-missing-cwd-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const project = join(home, 'project')
+  await mkdir(project, { recursive: true })
+  const fake = await scriptedAcp(join(home, 'fake'), { caps: { loadSession: true } })
+  const service = makeService(join(home, 'app'), process.execPath)
+  t.after(() => service.close().catch(() => undefined))
+  await connectFake(service, fake)
+  await service.setWorkspace('default', project)
+  await ask(service, '第一轮')
+  await settle(service)
+  const original = service.snapshot().items.find(item => item.runs.length)!
+  assert.ok(original)
+
+  await service.newTask('default')
+  await rm(project, { recursive: true, force: true })
+  await service.openTask(original.id)
+  const snap = service.snapshot()
+  assert.equal(snap.activeItemId, original.id, '选中的历史任务照常显示')
+  assert.equal(snap.readOnlyTask?.itemId, original.id)
+  assert.match(snap.readOnlyTask?.message ?? '', /工作目录已不存在/)
+  assert.equal(snap.acpResume, undefined)
+  assert.equal(snap.items.find(item => item.id === original.id)?.runs.length, 1)
+  assert.equal(snap.items.find(item => item.id === original.id)?.sessionId, original.sessionId, '原会话 ID 没被换掉')
+  await assert.rejects(ask(service, '接着做'), /只能查看/)
+  assert.equal((await fake.received('session/load')).length, 0, '没有在别的目录里接着原会话')
+
+  // 开始新任务：回到应用专用目录，正常可用
+  await service.newTask('default')
+  assert.equal(service.snapshot().readOnlyTask, undefined)
+  await ask(service, '新的一项')
+  assert.equal((await settle(service)).status, 'completed')
 })
 
 test('ACP 规划：没有规划能力时不能拟计划；切入或切回规划失败时这一轮的 session/prompt 一次都不发，并说明原因', async t => {
@@ -924,12 +1130,17 @@ test('ACP 长时间待审批：跨过原来的 30 分钟时限仍可回答；停
   const stopped = await settle(service)
   assert.equal(stopped.status, 'cancelled')
   assert.match(stopped.error ?? '', /没有响应停止/)
+  assert.ok(stopped.roundChanges, '旧进程退出后结算了这一轮的改动快照')
   assert.equal((await fake.received('session/cancel')).length, 1, '远端收到了取消')
+  assert.ok((await fake.entries()).some(e => e.exit !== undefined), '放开下一轮之前旧进程已经退出')
 
   await ask(service, '下一轮')
   const next = await settle(service)
   assert.equal(next.status, 'completed')
   assert.equal((await fake.received('initialize')).length, 2, '旧连接已结束，下一轮用的是新连接')
+  const log = await fake.entries()
+  const starts = log.flatMap((e, i) => e.argv ? [i] : [])
+  assert.ok(log.findIndex(e => e.exit !== undefined) < starts[1], '新代理在旧进程退出之后才启动')
   await new Promise(resolve => setTimeout(resolve, 1700))
   assert.doesNotMatch(lastRun(service)?.reply ?? '', /LATE/)
   assert.doesNotMatch(service.snapshot().items.flatMap(item => item.runs).map(run => run.reply).join('\n'), /LATE/)

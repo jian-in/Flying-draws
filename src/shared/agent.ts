@@ -136,7 +136,14 @@ export function acpFallbackMode(acp: Pick<AcpRuntimeInfo, 'modes' | 'configOptio
 /** ACP 历史会话没能恢复：保留原任务和会话 ID，等用户重试或另开新任务。 */
 export interface AcpResumeFailure {
   itemId: string
+  /** unsupported：代理没有恢复能力；error：恢复请求报错，可重试 */
   reason: 'unsupported' | 'error'
+  message: string
+}
+
+/** 用户主动打开的历史任务只能查看（目前是它的工作目录已不存在）；两种引擎通用。 */
+export interface ReadOnlyTask {
+  itemId: string
   message: string
 }
 
@@ -373,6 +380,8 @@ export interface AgentState {
   acp?: AcpRuntimeInfo
   /** ACP 历史会话恢复失败；有它时当前任务只能查看，发消息前要先重试恢复或开始新任务 */
   acpResume?: AcpResumeFailure
+  /** 当前任务只能查看：记录照常显示，不能接着发消息，要先开始新任务 */
+  readOnlyTask?: ReadOnlyTask
   /** Kernel tool name → readable name (MCP tools are numbered inside the kernel). */
   toolLabels?: Record<string, string>
   workspace: string

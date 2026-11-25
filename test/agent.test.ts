@@ -247,6 +247,60 @@ test('openTask 只调用一次 workspace.open；setWorkspace 过渡期间拒绝�
   await service.close()
 })
 
+test('Fuxi 历史任务：工作目录移走后主动打开仍显示原记录，只读，不能接着发；目录放回后再点就能接着做', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-fuxi-missing-cwd-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const gone = join(home, 'moved-away')
+  await mkdir(join(home, 'agent'), { recursive: true })
+  const item: AgentWorkItem = {
+    id: 'w1', board: 'b1', cwd: gone, sessionId: 's1', title: '任务一',
+    runs: [{ id: 'r1', mode: 'direct', status: 'completed', goal: '目标', startedAt: '2026-11-18', reply: 'ok', draft: '', tools: [], approvals: [] }]
+  }
+  await writeFile(join(home, 'agent', 'work-items.json'), JSON.stringify({ version: 1, items: [item] }))
+  const service = new AgentService({ home, executable: () => { throw new Error('不应启动真实内核') }, mcpServers: {} })
+  t.after(() => service.close().catch(() => undefined))
+  const opens: Record<string, unknown>[] = []
+  const live = service as unknown as { client: unknown }
+  live.client = {
+    alive: true,
+    stop: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => {
+      if (method === 'workspace.open') {
+        opens.push(params)
+        return { session_id: String(params.session_id ?? 'new-s'), provider: 'p', model: 'm', setup_needed: false, vision: false, choices: [] }
+      }
+      return {}
+    }
+  }
+  const capture = { sceneJson: '{"elements":[]}', selectedIds: [] as string[], pngBase64: null }
+
+  await service.openTask('w1')
+  let snap = service.snapshot()
+  assert.equal(opens.length, 0, '没有在别的目录里接着原会话')
+  assert.equal(snap.activeItemId, 'w1', '选中的历史任务照常显示')
+  assert.equal(snap.readOnlyTask?.itemId, 'w1')
+  assert.match(snap.readOnlyTask?.message ?? '', /工作目录已不存在/)
+  assert.equal(snap.items[0].sessionId, 's1', '原会话 ID 没被换掉')
+  await assert.rejects(service.submit({ board: 'b1', goal: '接着做', mode: 'direct', capture }), /只能查看/)
+  assert.equal(service.snapshot().items[0].runs.length, 1)
+
+  // 目录放回原处后再点这项任务：照常打开原会话
+  await mkdir(gone, { recursive: true })
+  await service.openTask('w1')
+  snap = service.snapshot()
+  assert.equal(snap.readOnlyTask, undefined)
+  assert.equal(opens.at(-1)?.session_id, 's1')
+  assert.equal(opens.at(-1)?.cwd, gone)
+
+  // 再移走，开始新任务：回到应用专用目录、新会话
+  await rm(gone, { recursive: true, force: true })
+  await service.newTask('b1')
+  snap = service.snapshot()
+  assert.equal(snap.readOnlyTask, undefined)
+  assert.equal(opens.at(-1)?.new_session, true)
+  assert.notEqual(opens.at(-1)?.cwd, gone)
+})
+
 test('冷启动 submit 保留上一轮 reviewContext；session_reset 同步活动任务 sessionId；离线自动审批不抛错；close 等待 deferredEvents 落盘', async t => {
   const home = await mkdtemp(join(tmpdir(), 'fd-review-ctx-'))
   t.after(() => rm(home, { recursive: true, force: true }))

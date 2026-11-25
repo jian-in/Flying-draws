@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { AgentMarkdown } from './AgentMarkdown'
+import { planDisplay } from './planView'
 import { AGENT_WIDTH_DEFAULT, AGENT_WIDTH_MAX, AGENT_WIDTH_MIN, clampAgentWidth } from './canvas/minimapGeometry'
 import { shouldAutoPlaceResultImage } from '../../main/lineage'
 import {
@@ -268,9 +269,13 @@ export function AgentPanel({
   // ACP 代理声明了规划模式（session modes 或 configOptions 里的 mode=plan）才能先拟计划
   const planSupported = !isAcp || Boolean(acpPlanTarget(state.acp))
   const resumeFailure = isAcp ? state.acpResume : undefined
+  // 只读查看的历史任务（两种引擎通用）和没恢复的 ACP 会话一样：记录照常显示，不能接着发
+  const readOnlyTask = state.readOnlyTask
+  const taskLocked = Boolean(resumeFailure || readOnlyTask)
   const currentChoice = state.choices.find(c => c.provider === state.provider && c.model === state.model)
   const currentModelLabel = currentChoice?.label || state.model || (
-    resumeFailure ? '会话未恢复'
+    readOnlyTask ? '只读查看'
+      : resumeFailure ? '会话未恢复'
       : isAcp ? (state.connection === 'ready' ? '代理默认模型' : '等待连接')
         : '尚未配置模型'
   )
@@ -498,7 +503,7 @@ export function AgentPanel({
   }
 
   async function send() {
-    if (!goal.trim() || disabled || resumeFailure) return
+    if (!goal.trim() || disabled || taskLocked) return
     const text = goal
     const success = await act(async () => {
       const context = await capture()
@@ -508,7 +513,7 @@ export function AgentPanel({
   }
   // 把选中的图片照原样转成可编辑的方框、文字和线条：结果以提议的形式画在原图旁边，确认后才落到画布上
   async function traceSelected() {
-    if (!selectedImage || disabled || !state.vision || resumeFailure) return
+    if (!selectedImage || disabled || !state.vision || taskLocked) return
     const success = await act(async () => {
       const { imageId, width, height, capture: context } = await traceCapture()
       await api.submit({
@@ -519,7 +524,7 @@ export function AgentPanel({
     if (success) { updateFollow(true); scrollToBottom() }
   }
   async function execute() {
-    if (disabled || resumeFailure) return
+    if (disabled || taskLocked) return
     if (await act(() => api.execute(goal.trim()))) { setGoal(''); updateFollow(true); scrollToBottom() }
   }
   async function saveModel() {
@@ -916,7 +921,7 @@ export function AgentPanel({
             {state.workspaceWarning ? <p className="fd-agent-small" role="status">{state.workspaceWarning}</p> : null}
           </div> : <div className="fd-agent-context">
             <div className="fd-agent-model-row">
-              <select aria-label="当前模型" disabled={disabled || Boolean(resumeFailure)} value={JSON.stringify([state.provider, state.model])} onChange={e => {
+              <select aria-label="当前模型" disabled={disabled || taskLocked} value={JSON.stringify([state.provider, state.model])} onChange={e => {
                 const [provider, model] = JSON.parse(e.target.value) as string[]
                 void act(() => api.selectModel(provider, model))
               }}>
@@ -1104,6 +1109,7 @@ export function AgentPanel({
               </div>
             )) : active.runs.map((run, index) => {
               const usageText = run.status !== 'running' ? formatRunUsage(run.usage) : ''
+              const plan = planDisplay(run, active.engine === 'acp')
               return <article className="fd-agent-run" key={run.id}>
               <div className="fd-agent-run-meta"><span>第 {index + 1} 轮 · {run.mode === 'plan' ? '规划' : run.mode === 'execute' ? '执行' : run.mode === 'resume' ? '续接' : '任务'}</span><span className={`fd-agent-run-status fd-agent-run-${run.status}`}>{LABEL[run.status]}</span></div>
               <p className="fd-agent-goal">{run.goal}</p>
@@ -1113,7 +1119,9 @@ export function AgentPanel({
               </details> : null}
               <RoundChangesView run={run} />
               {run.images?.map(image => <ResultImage key={image.id} image={image} placed={Boolean(placedImageIds?.has(image.id))} disabled={working || state.busy || active?.board !== board} onPreview={(src, alt) => setPreviewSrc({ src, alt })} onInsert={dataURL => act(() => insertImage(image, dataURL, { annotations: run.annotations, seat: seatName }))} onLoaded={() => { if (follow.current && !pointerDownRef.current) scrollToBottom() }} />)}
-              {run.plan ? <div className="fd-agent-plan"><strong>{run.status === 'planned' ? '待确认的计划' : '本轮计划'}</strong><AgentMarkdown text={run.reply || planBody(run.plan)} /></div> : null}
+              {plan ? <div className="fd-agent-plan"><strong>{run.status === 'planned' ? '待确认的计划' : '本轮计划'}</strong><AgentMarkdown text={plan.body} />
+                {plan.note ? <div className="fd-agent-plan-note"><strong>补充说明</strong><AgentMarkdown text={plan.note} /></div> : null}
+              </div> : null}
               {/* A plan's text is the model's reply; show it once, inside the plan box. */}
               {run.reply && !run.plan ? <div className="fd-agent-reply"><AgentMarkdown text={run.reply} /></div> : null}
               {run.draft ? <div className="fd-agent-reply fd-agent-draft"><AgentMarkdown text={run.draft} draft /></div> : null}
@@ -1178,10 +1186,10 @@ export function AgentPanel({
             本任务内已允许 {active.allowedCommands.length} 条调用不再询问
             <button className="fd-agent-link" disabled={working} title={active.allowedCommands.map(rule => `${toolDisplayName(rule.name, state.toolLabels)}：${rule.input}`).join('\n')} onClick={() => void act(() => api.clearAllowedCommands())}>清空</button>
           </p> : null}
-          {resumeFailure ? <div className="fd-agent-alert fd-agent-resume" role="alert">
-            <p>{resumeFailure.message}</p>
+          {resumeFailure || readOnlyTask ? <div className="fd-agent-alert fd-agent-resume" role="alert">
+            <p>{readOnlyTask?.message ?? resumeFailure?.message}</p>
             <div>
-              {resumeFailure.reason === 'error' ? <button type="button" disabled={working || state.busy} title="再次向代理提交原会话 ID" onClick={() => void act(() => api.openTask(resumeFailure.itemId))}>重试恢复</button> : null}
+              {!readOnlyTask && resumeFailure?.reason === 'error' ? <button type="button" disabled={working || state.busy} title="再次向代理提交原会话 ID" onClick={() => void act(() => api.openTask(resumeFailure.itemId))}>重试恢复</button> : null}
               <button type="button" className="fd-agent-primary" disabled={working || state.busy} title="原任务记录保留，新消息会进入一项独立的新任务" onClick={() => void act(() => api.newTask(board))}>开始新任务</button>
             </div>
           </div> : null}
@@ -1208,17 +1216,17 @@ export function AgentPanel({
               </div> : null}
               {selectedImage && !state.setupNeeded ? <div className="fd-agent-trace">
                 <span>已选中一张图片{state.vision ? '' : '（当前模型不支持看图，无法转换）'}</span>
-                <button disabled={disabled || !state.vision || Boolean(resumeFailure)} title={`让 ${seatName} 照着这张图画出可编辑的方框、文字和线条，确认后才落到画布上`} onClick={() => void traceSelected()}>转成可编辑图 ↗</button>
+                <button disabled={disabled || !state.vision || taskLocked} title={`让 ${seatName} 照着这张图画出可编辑的方框、文字和线条，确认后才落到画布上`} onClick={() => void traceSelected()}>转成可编辑图 ↗</button>
               </div> : null}
-              <textarea ref={composerRef} aria-label="任务目标" placeholder={resumeFailure ? (resumeFailure.reason === 'error' ? '原会话未恢复：请先点上方「重试恢复」或「开始新任务」' : '原会话只能查看：请先点上方「开始新任务」') : last?.status === 'planned' ? '可补充调整，Enter 确认执行，Shift+Enter 换行' : isAcp ? `对 ${acpBrand} 说点什么，或圈出画布再发…（Enter 发送，Shift+Enter 换行）` : '想让 Agent 做什么？（Enter 发送，Shift+Enter 换行）'} value={goal} disabled={state.busy || state.setupNeeded || Boolean(resumeFailure)} onChange={e => setGoal(e.target.value)} onKeyDown={e => {
+              <textarea ref={composerRef} aria-label="任务目标" placeholder={readOnlyTask ? '原工作目录已不存在，记录只能查看：请先点上方「开始新任务」' : resumeFailure ? (resumeFailure.reason === 'error' ? '原会话未恢复：请先点上方「重试恢复」或「开始新任务」' : '原会话只能查看：请先点上方「开始新任务」') : last?.status === 'planned' ? '可补充调整，Enter 确认执行，Shift+Enter 换行' : isAcp ? `对 ${acpBrand} 说点什么，或圈出画布再发…（Enter 发送，Shift+Enter 换行）` : '想让 Agent 做什么？（Enter 发送，Shift+Enter 换行）'} value={goal} disabled={state.busy || state.setupNeeded || taskLocked} onChange={e => setGoal(e.target.value)} onKeyDown={e => {
                 if (e.nativeEvent.isComposing || e.keyCode === 229) return
-                if (e.key === 'Enter' && !e.shiftKey && !e.altKey) { e.preventDefault(); if (resumeFailure) return; if (last?.status === 'planned') void execute(); else void send() }
+                if (e.key === 'Enter' && !e.shiftKey && !e.altKey) { e.preventDefault(); if (taskLocked) return; if (last?.status === 'planned') void execute(); else void send() }
               }} rows={3} />
               <div className="fd-agent-actions">
                 {resumePrevious ? <span className="fd-agent-small">沿用原任务的目标与预算</span> : <label className="fd-agent-check" title={planSupported ? undefined : `${acpBrand} 没有提供规划模式，只能直接执行`}><input type="checkbox" checked={planFirst && planSupported} disabled={disabled || !planSupported} onChange={e => setPlanFirst(e.target.checked)} />先拟计划</label>}
                 {state.busy ? <button className="fd-agent-stop" disabled={working} onClick={() => void act(() => api.cancel())}>停止</button>
-                  : last?.status === 'planned' ? <button className="fd-agent-primary" disabled={disabled || Boolean(resumeFailure)} onClick={() => void execute()}>确认并执行 ↗</button>
-                    : <button className="fd-agent-primary" disabled={disabled || state.setupNeeded || !goal.trim() || Boolean(resumeFailure)} onClick={() => void send()}>{resumePrevious ? '继续原任务' : planFirst && planSupported ? '拟定计划' : '开始执行'} ↗</button>}
+                  : last?.status === 'planned' ? <button className="fd-agent-primary" disabled={disabled || taskLocked} onClick={() => void execute()}>确认并执行 ↗</button>
+                    : <button className="fd-agent-primary" disabled={disabled || state.setupNeeded || !goal.trim() || taskLocked} onClick={() => void send()}>{resumePrevious ? '继续原任务' : planFirst && planSupported ? '拟定计划' : '开始执行'} ↗</button>}
               </div>
             </>}
           </div>
@@ -1238,13 +1246,6 @@ export function AgentPanel({
       ) : null}
     </aside>
   )
-}
-
-/** The kernel's plan summary repeats the whole request; keep only the plan itself. */
-function planBody(plan: string): string {
-  const lines = plan.split('\n').filter(line => !(line.includes('/execute') && line.includes('/plan clear')))
-  const contract = lines.findIndex(line => line.startsWith('原验收：'))
-  return (contract >= 0 ? lines.slice(contract + 1) : lines).join('\n').trim()
 }
 
 /** Folded reasoning: "思考中…" while it streams, "思考过程" afterwards; open on click. */

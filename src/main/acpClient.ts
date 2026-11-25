@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, isAbsolute, join } from 'node:path'
+import { delimiter, isAbsolute, join, resolve } from 'node:path'
 import {
   ACP_PRESETS,
   acpPresetSpec,
@@ -178,8 +178,11 @@ export function resolveAcpCommand(
   const custom = configuredCommand?.trim()
   if (custom) {
     if (isAbsolute(custom) || custom.includes('/') || custom.includes('\\')) {
-      if (!existsSync(custom)) throw new Error(`找不到配置的 ACP 可执行文件：${custom}`)
-      return custom
+      // 相对路径先按当前工作目录解析成绝对路径：确认框、信任指纹和实际启动都用这一个路径，
+      // 换个目录启动应用时同一串相对路径指向别的程序，指纹也跟着不同，会重新确认
+      const full = resolve(custom)
+      if (!existsSync(full)) throw new Error(`找不到配置的 ACP 可执行文件：${custom}`)
+      return full
     }
     const found = findInPath(custom, env)
     if (found) return found
