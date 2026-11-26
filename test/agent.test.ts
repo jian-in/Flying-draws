@@ -250,7 +250,6 @@ test('openTask 只调用一次 workspace.open；setWorkspace 过渡期间拒绝�
 
 test('Fuxi 历史任务：工作目录移走后主动打开仍显示原记录，只读，不能接着发；目录放回后再点就能接着做', async t => {
   const home = await mkdtemp(join(tmpdir(), 'fd-fuxi-missing-cwd-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
   const gone = join(home, 'moved-away')
   await mkdir(join(home, 'agent'), { recursive: true })
   const item: AgentWorkItem = {
@@ -259,7 +258,9 @@ test('Fuxi 历史任务：工作目录移走后主动打开仍显示原记录，
   }
   await writeFile(join(home, 'agent', 'work-items.json'), JSON.stringify({ version: 1, items: [item] }))
   const service = new AgentService({ home, executable: () => { throw new Error('不应启动真实内核') }, mcpServers: {} })
+  // after 钩子按登记顺序跑：先关服务，再删目录
   t.after(() => service.close().catch(() => undefined))
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }))
   // 内核还没启动（或启动不了）：照样选中并只读显示，不为它启动内核
   await service.openTask('w1')
   assert.equal(service.snapshot().activeItemId, 'w1')
@@ -313,9 +314,10 @@ test('Fuxi 历史任务：工作目录移走后主动打开仍显示原记录，
 
 test('Fuxi 内核意外断开：已显示的半句回复并入正文，先落盘再放开任务', async t => {
   const home = await mkdtemp(join(tmpdir(), 'fd-fuxi-disconnect-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
   const service = new AgentService({ home, executable: () => { throw new Error('不应启动真实内核') }, mcpServers: {} })
+  // after 钩子按登记顺序跑：先关服务，再删目录
   t.after(() => service.close().catch(() => undefined))
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }))
   const fake = {
     alive: true,
     stop: async () => undefined,

@@ -1,4 +1,4 @@
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -145,19 +145,39 @@ rl.on('line', line => {
   return scriptPath
 }
 
-async function waitFor<T>(check: () => T | null | undefined | false, timeout = 5000): Promise<T> {
-  const deadline = Date.now() + timeout
+/**
+ * 测试用的临时目录：整个文件跑完、各测试的服务都关掉之后才删。
+ * node:test 按登记顺序跑 after 钩子，前一个抛错后面的就不跑了。以前每个测试先登记「删目录」、
+ * 后登记「关服务」，删目录就跑在关服务前面：服务还开着、快照库还在用时，Windows 上 rmdir 会 EBUSY，
+ * 一失败关服务的钩子被跳过，假代理进程留着，测试进程退不出去。
+ */
+const tempDirs: string[] = []
+async function tempDir(prefix: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), prefix))
+  tempDirs.push(dir)
+  return dir
+}
+after(async () => {
+  for (const dir of tempDirs) {
+    // 杀毒软件或索引服务偶尔还占着刚写的文件：重试几次，删不掉只提示，不算测试失败
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
+      .catch(error => console.warn(`[acp.test] 临时目录没删掉：${dir}（${error instanceof Error ? error.message : String(error)}）`))
+  }
+})
+
+async function waitFor<T>(check: () => T | null | undefined | false, timeout = 5000, describe?: () => string): Promise<T> {
+  const started = Date.now()
+  const deadline = started + timeout
   while (Date.now() < deadline) {
     const val = check()
     if (val) return val
     await new Promise(r => setTimeout(r, 25))
   }
-  throw new Error('等待超时')
+  throw new Error(`等待超时（${Date.now() - started} ms）${describe ? `：${describe()}` : ''}`)
 }
 
 test('自动探测本地 agy 与自定义路径解析', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'fd-acp-detect-'))
-  t.after(() => rm(root, { recursive: true, force: true }))
+  const root = await tempDir('fd-acp-detect-')
   const localAppData = join(root, 'LocalAppData')
   const agyBin = join(localAppData, 'agy', 'bin', 'agy.exe')
   await mkdir(join(localAppData, 'agy', 'bin'), { recursive: true })
@@ -215,8 +235,7 @@ test('toAcpMcpServers 正确转换 MCP 配置并按 ACP 席位覆盖 FLYINGDRAWS
 })
 
 test('AgentService 切到 ACP 后端：握手、选模型/思考深度、带图对话、审批记忆、规划执行、取消与持久恢复', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-service-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-service-')
   const fakeScript = await createFakeAcpScript(home)
 
   const service = new AgentService({
@@ -337,8 +356,7 @@ test('AgentService 切到 ACP 后端：握手、选模型/思考深度、带图�
 })
 
 test('Claude / OpenCode 风格仅返回 configOptions(model) 与 modes 时也能选模型和切模式，且按预设记席位', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-config-model-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-config-model-')
   const scriptPath = join(home, 'fake-claude-acp.mjs')
   await writeFile(scriptPath, `
 import readline from 'node:readline'
@@ -637,16 +655,26 @@ const lastRun = (service: AgentService) => {
   const snap = service.snapshot()
   return snap.items.find(item => item.id === snap.activeItemId)?.runs.at(-1)
 }
+/** 等待超时时说明服务当时停在哪：连接、busy、最后一轮的状态、审批和工具 */
+const serviceState = (service: AgentService) => {
+  const snap = service.snapshot()
+  const run = lastRun(service)
+  return [
+    `connection=${snap.connection}`, `busy=${snap.busy}`, `run=${run?.goal ?? '-'}/${run?.status ?? '-'}`,
+    `approvals=[${run?.approvals.map(a => `${a.name}:${a.answered ? 'answered' : 'pending'}`).join(', ') ?? ''}]`,
+    `tools=[${run?.tools.map(tool => `${tool.id}:${tool.status}`).join(', ') ?? ''}]`,
+    `error=${snap.error ?? ''}`
+  ].join(' ')
+}
 const settle = (service: AgentService) => waitFor(() => {
   const run = lastRun(service)
   return !service.snapshot().busy && run && run.status !== 'running' ? run : null
-})
+}, undefined, () => `本轮没有结束 ${serviceState(service)}`)
 const pendingApproval = (service: AgentService, skip: string[] = []) =>
-  waitFor(() => lastRun(service)?.approvals.find(a => !a.answered && !skip.includes(a.requestId)))
+  waitFor(() => lastRun(service)?.approvals.find(a => !a.answered && !skip.includes(a.requestId)), undefined, () => `没等到新的审批 ${serviceState(service)}`)
 
 test('ACP 审批：两种允许都只选「允许一次」；本任务规则按完整参数匹配，清空或另开任务后重新询问；只给永久授权时单次允许选不中它', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-perm-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-perm-')
   const big = 'x'.repeat(9000)
   const write = (id: string, tail: string): ScriptStep => ({ perm: { toolCallId: id, title: 'write_file', kind: 'edit', rawInput: { path: 'a.txt', content: big + tail } } })
   const permanentOnly: ScriptStep = { perm: {
@@ -730,8 +758,7 @@ test('ACP 审批：两种允许都只选「允许一次」；本任务规则按�
 })
 
 test('ACP 规划：configOptions 和 modes 两种表示都走通「拟计划 → 确认执行」，执行前恢复进入规划前的模式', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-plan-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-plan-')
   const variants = [
     { name: 'config', cfg: { modeConfig: ['default', 'plan'], mode: 'default' }, method: 'session/set_config_option', original: 'default' },
     { name: 'modes', cfg: { modes: [{ id: 'code', name: 'Code' }, { id: 'plan', name: 'Plan' }], mode: 'code' }, method: 'session/set_mode', original: 'code' }
@@ -764,8 +791,7 @@ test('ACP 规划：configOptions 和 modes 两种表示都走通「拟计划 →
 })
 
 test('ACP 规划：生成计划后用户改选的模式在确认执行时生效；代理自己退出规划后不被切回规划前的模式', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-plan-mode-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-plan-mode-')
   const fake = await scriptedAcp(join(home, 'fake'), {
     modeConfig: ['fast', 'manual', 'plan'],
     mode: 'fast',
@@ -799,8 +825,7 @@ test('ACP 规划：生成计划后用户改选的模式在确认执行时生效�
 })
 
 test('ACP 规划：代理用空列表撤回全部步骤后，旧步骤不再显示、也不能凭旧步骤确认执行', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-plan-clear-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-plan-clear-')
   const fake = await scriptedAcp(join(home, 'fake'), {
     modeConfig: ['default', 'plan'],
     cases: {
@@ -840,8 +865,7 @@ test('ACP 规划：代理用空列表撤回全部步骤后，旧步骤不再显�
 })
 
 test('ACP 停止：代理回应取消前又来的审批一律答 cancelled，YOLO 也不放行；其他会话的审批同样不放行', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-cancel-perm-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-cancel-perm-')
   const fake = await scriptedAcp(join(home, 'fake'), {
     permOnCancel: { toolCallId: 'late', title: 'run', kind: 'execute', rawInput: { cmd: 'rm -rf build' } },
     cases: {
@@ -874,8 +898,7 @@ test('ACP 停止：代理回应取消前又来的审批一律答 cancelled，YOL
 })
 
 test('ACP 审批：工具身份和参数分开发送时按各自身份匹配许可；身份不明时只能单次允许', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-perm-split-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-perm-split-')
   const same = { path: 'notes.txt' }
   const fake = await scriptedAcp(join(home, 'fake'), {
     cases: {
@@ -924,8 +947,7 @@ test('ACP 审批：工具身份和参数分开发送时按各自身份匹配许�
 })
 
 test('ACP 历史任务：工作目录移走后主动打开仍显示原记录，只读，不能接着发', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-missing-cwd-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-missing-cwd-')
   const project = join(home, 'project')
   await mkdir(project, { recursive: true })
   const fake = await scriptedAcp(join(home, 'fake'), { caps: { loadSession: true } })
@@ -959,8 +981,7 @@ test('ACP 历史任务：工作目录移走后主动打开仍显示原记录，�
 })
 
 test('ACP 中途退出：已收到的回复保留并落盘，本轮改动快照照常结算，结算完才放开下一轮', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-crash-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-crash-')
   const project = join(home, 'project')
   await mkdir(project, { recursive: true })
   await writeFile(join(project, 'keep.txt'), 'old\n')
@@ -1006,8 +1027,7 @@ test('ACP 中途退出：已收到的回复保留并落盘，本轮改动快照�
 })
 
 test('ACP 历史任务：代理启动不了时也能选中并查看本机记录；工作目录不在的任务直接只读，不必连接代理', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-offline-history-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-offline-history-')
   const kept = join(home, 'kept')
   const moved = join(home, 'moved')
   await mkdir(kept, { recursive: true })
@@ -1044,8 +1064,7 @@ test('ACP 历史任务：代理启动不了时也能选中并查看本机记录�
 })
 
 test('ACP 强停失败：旧进程还活着时不自动重连、也不启动新代理；它退出后才能重新连接', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-stuck-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-stuck-')
   const fake = await scriptedAcp(join(home, 'fake'), { cases: { STUCK_IT: [{ say: '开始' }, { hang: true }] } })
   const service = makeService(join(home, 'app'), process.execPath, { grace: 150 })
   t.after(() => service.close().catch(() => undefined))
@@ -1087,8 +1106,7 @@ test('ACP 强停失败：旧进程还活着时不自动重连、也不启动新�
 })
 
 test('ACP 收尾期间连接断开：收尾认领这一轮、按代理的结果结束，结算完才放开任务，不会清掉下一轮', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-finish-race-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-finish-race-')
   const fake = await scriptedAcp(join(home, 'fake'), { cases: { DONE_THEN_EXIT: [{ say: '做完了' }, { exitAfterTurn: true }] } })
   const service = makeService(join(home, 'app'), process.execPath)
   t.after(() => service.close().catch(() => undefined))
@@ -1125,8 +1143,7 @@ test('ACP 收尾期间连接断开：收尾认领这一轮、按代理的结果�
 })
 
 test('ACP 规划（Claude 式交计划）：代理用 ExitPlanMode 一类审批交计划时，YOLO 也不放行；宿主收下计划、替用户选继续规划，确认后才切回原模式执行', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-claude-plan-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-claude-plan-')
   const project = join(home, 'project')
   await mkdir(project, { recursive: true })
   const planText = '## 计划\n1. 读画布结构\n2. 在 a.txt 里补上说明'
@@ -1179,8 +1196,7 @@ test('ACP 规划（Claude 式交计划）：代理用 ExitPlanMode 一类审批�
 })
 
 test('ACP 规划：没有规划能力时不能拟计划；切入或切回规划失败时这一轮的 session/prompt 一次都不发，并说明原因', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-plan-fail-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-plan-fail-')
 
   const none = await scriptedAcp(join(home, 'none'), { modes: [{ id: 'default', name: 'Default' }] })
   const s1 = makeService(join(home, 'a1'), process.execPath)
@@ -1213,8 +1229,7 @@ test('ACP 规划：没有规划能力时不能拟计划；切入或切回规划�
 })
 
 test('ACP 图片：只有代理明确声明 promptCapabilities.image === true 时才附画布截图', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-image-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-image-')
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64')
   const scene = JSON.stringify({ elements: [{ id: 'box1', type: 'rectangle', x: 0, y: 0, width: 120, height: 60, angle: 0, isDeleted: false }] })
   const variants = [
@@ -1241,8 +1256,7 @@ test('ACP 图片：只有代理明确声明 promptCapabilities.image === true �
 })
 
 test('ACP 收尾：分清 end_turn / cancelled / refusal / max_tokens / max_turn_requests，保留部分回复，没完成的工具不算成功，没有计划正文不给执行', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-stop-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-stop-')
   const fake = await scriptedAcp(join(home, 'fake'), {
     modeConfig: ['default', 'plan'],
     cases: {
@@ -1298,8 +1312,7 @@ test('ACP 收尾：分清 end_turn / cancelled / refusal / max_tokens / max_turn
 })
 
 test('ACP 会话恢复：加载失败时保留原任务和会话 ID，重试仍提交原 ID，恢复后接着旧会话；新任务是独立工作项', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-resume-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-resume-')
   const fake = await scriptedAcp(join(home, 'fake'), { caps: { loadSession: true }, loadFailTimes: 1 })
   const service = makeService(join(home, 'app'), process.execPath)
   t.after(() => service.close().catch(() => undefined))
@@ -1354,8 +1367,7 @@ test('ACP 会话恢复：加载失败时保留原任务和会话 ID，重试仍�
 })
 
 test('ACP 长时间待审批：跨过原来的 30 分钟时限仍可回答；停止后远端收到取消，代理不响应就结束连接，迟到事件不进下一轮', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-long-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-long-')
   const fake = await scriptedAcp(join(home, 'fake'), {
     caps: { loadSession: true },
     ignoreCancel: true,
@@ -1420,8 +1432,7 @@ test('ACP 长时间待审批：跨过原来的 30 分钟时限仍可回答；停
 })
 
 test('Windows 批处理启动器：带空格和中文的目录里的 .cmd 能完成握手，程序路径和每个参数的边界不变', { skip: process.platform !== 'win32' }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'fd-acp-cmd-'))
-  t.after(() => rm(root, { recursive: true, force: true }))
+  const root = await tempDir('fd-acp-cmd-')
   const fake = await scriptedAcp(join(root, '带 空格 的目录 & 更多'), {})
   const cmd = join(fake.dir, 'start acp.cmd')
   await writeFile(cmd, `@"${process.execPath}" "%~dp0scripted-acp.mjs" "%~dp0fake.json" %*\r\n`, 'utf8')
@@ -1445,8 +1456,7 @@ test('windowsBatchLaunch 交给 cmd.exe 时整条命令行原样传递', () => {
 })
 
 test('ACP 设置：参数按数组保存，含空格的路径是一项；每个预设各自保存命令和参数，重启后都能恢复；旧版单配置能沿用', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-profiles-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-profiles-')
   const fake = await scriptedAcp(join(home, 'script dir with space'), {})
   const claudeArgs = [fake.script, fake.cfgPath, '--profile', 'claude 一号']
   const codexArgs = [fake.script, fake.cfgPath, '--profile', 'codex 二号']
@@ -1492,8 +1502,7 @@ test('ACP 设置：参数按数组保存，含空格的路径是一项；每个�
 })
 
 test('ACP 启动确认：内置默认预设直接连；首次自定义程序、改参数各确认一次，只改席位或重连不再问；取消时原连接和配置不变；旧版自定义配置首次使用确认后沿用', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-trust-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-trust-')
   const fake = await scriptedAcp(join(home, 'fake'), {})
   const runner = await fakeLauncher(fake)
   const reviews: AcpLaunchReview[] = []
@@ -1547,8 +1556,7 @@ test('ACP 启动确认：内置默认预设直接连；首次自定义程序、�
 })
 
 test('ACP 登录报错：内置预设给出各自的登录命令，自定义代理显示它自己的认证说明', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'fd-acp-login-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  const home = await tempDir('fd-acp-login-')
   const fake = await scriptedAcp(join(home, 'fake'), {
     authRequired: true,
     authMessage: 'Please sign in',
