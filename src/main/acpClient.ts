@@ -458,7 +458,7 @@ export class AcpClient extends EventEmitter {
       const result = await this.request('initialize', {
         protocolVersion: 1,
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-        clientInfo: { name: 'Flying draws', version: '0.1.0' }
+        clientInfo: { name: 'Flying draws', version: '0.1.1' }
       }, 30_000) as AcpInitializeResult
       this.initResult = result
       return result

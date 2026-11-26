@@ -41,7 +41,7 @@ function readPackageVersion(): string {
     const raw = JSON.parse(readFileSync(join(APP_ROOT, 'package.json'), 'utf8')) as { version?: unknown }
     if (typeof raw.version === 'string' && raw.version.trim()) return raw.version.trim()
   } catch {}
-  return '0.1.0'
+  return '0.1.1'
 }
 
 const PKG_VERSION = readPackageVersion()

@@ -1,6 +1,6 @@
 {
   "name": "flying-draws",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local interactive canvas & visual workbench for coding agents (built-in Fuxi runtime + MCP)",
   "author": "Bofei Jian",
   "license": "Apache-2.0",
