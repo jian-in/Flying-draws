@@ -1,11 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AcpClient, detectAcpPresetBinary, detectAllAcpPresets, detectAntigravityBinary, resolveAcpCommand, toAcpMcpServers, windowsBatchLaunch } from '../src/main/acpClient.ts'
 import { AgentService, type AcpLaunchReview } from '../src/main/agent.ts'
-import { acpPlanTarget, type AcpPresetId, type AgentWorkItem } from '../src/shared/agent.ts'
+import { acpPlanTarget, type AcpPresetId, type AgentState, type AgentWorkItem } from '../src/shared/agent.ts'
 
 async function createFakeAcpScript(dir: string): Promise<string> {
   const scriptPath = join(dir, 'fake-acp.mjs')
@@ -173,6 +174,10 @@ test('自动探测本地 agy 与自定义路径解析', async t => {
     assert.equal(resolveAcpCommand(join('agy', 'bin', 'agy.exe'), { PATH: '' }, root, 'win32'), agyBin)
     process.chdir(root)
     assert.throws(() => resolveAcpCommand(join('agy', 'bin', 'agy.exe'), { PATH: '' }, root, 'win32'), /找不到配置的 ACP/, '换个目录，同一串相对路径不再指向原文件')
+    // PATH 里的相对目录不算：同一串相对目录随启动目录指向不同位置
+    process.chdir(localAppData)
+    assert.throws(() => resolveAcpCommand('agy.exe', { PATH: join('agy', 'bin') }, root, 'win32'), /在 PATH 中找不到/)
+    assert.equal(resolveAcpCommand('agy.exe', { PATH: join(localAppData, 'agy', 'bin') }, root, 'win32'), agyBin)
   } finally {
     process.chdir(cwd)
   }
@@ -404,7 +409,14 @@ interface ScriptStep {
   echo?: boolean
   plan?: string[]
   tool?: { toolCallId: string; title?: string; kind?: string; rawInput?: unknown }
-  perm?: { toolCallId: string; title?: string; kind?: string; rawInput?: unknown; sessionId?: string; options?: { optionId: string; name: string; kind: string }[] }
+  /** sessionId：换成别的会话；null 表示审批请求里不带 sessionId */
+  perm?: { toolCallId: string; title?: string; kind?: string; rawInput?: unknown; sessionId?: string | null; options?: { optionId: string; name: string; kind: string }[] }
+  /** 在会话的工作目录里写文件（模拟代理改项目） */
+  write?: { path: string; content: string }
+  /** 进程直接退出（模拟代理崩溃） */
+  exit?: boolean
+  /** 正常回应这一轮之后马上退出 */
+  exitAfterTurn?: boolean
   /** 代理自己切模式，并发 current_mode_update / config_option_update */
   setMode?: string
   hang?: boolean
@@ -435,7 +447,8 @@ interface FakeLogEntry {
 
 const SCRIPTED_ACP = `
 import readline from 'node:readline'
-import { appendFileSync, readFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 const cfg = JSON.parse(readFileSync(process.argv[2], 'utf8'))
 const log = entry => appendFileSync(cfg.log, JSON.stringify(entry) + '\\n')
 log({ argv: process.argv.slice(3) })
@@ -448,6 +461,7 @@ let loads = 0
 let permSeq = 0
 let active = null
 const waiters = new Map()
+const cwds = new Map()
 const modeOptions = () => cfg.modeConfig ? [{ id: 'mode', name: 'Mode', category: 'mode', type: 'select', currentValue: mode, options: cfg.modeConfig.map(v => ({ value: v, name: v })) }] : undefined
 const session = sessionId => ({
   sessionId,
@@ -466,7 +480,9 @@ async function runPrompt(msg) {
   const name = Object.keys(cfg.cases || {}).find(k => text.includes(k))
   const steps = name ? cfg.cases[name] : [{ echo: true }]
   let stop = 'end_turn'
+  let exitAfter = false
   for (const step of steps) {
+    if (step.exitAfterTurn) exitAfter = true
     if (step.say) update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: step.say } })
     if (step.echo) update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'mode=' + mode + ';images=' + blocks.filter(b => b.type === 'image').length } })
     if (step.plan) update(sid, { sessionUpdate: 'plan', entries: step.plan.map(content => ({ content, status: 'pending', priority: 'medium' })) })
@@ -482,7 +498,7 @@ async function runPrompt(msg) {
       const rpcId = 'perm-' + (++permSeq)
       const result = await new Promise(resolve => {
         waiters.set(rpcId, resolve)
-        send({ id: rpcId, method: 'session/request_permission', params: { sessionId: permSid || sid, toolCall, options: options || DEFAULT_OPTIONS } })
+        send({ id: rpcId, method: 'session/request_permission', params: { ...(permSid === null ? {} : { sessionId: permSid || sid }), toolCall, options: options || DEFAULT_OPTIONS } })
       })
       const outcome = (result && result.outcome) || {}
       log({ permission: toolCall.toolCallId, result: outcome })
@@ -490,10 +506,13 @@ async function runPrompt(msg) {
       const allowed = outcome.outcome === 'selected' && outcome.optionId !== 'no'
       update(sid, { sessionUpdate: 'tool_call_update', toolCallId: toolCall.toolCallId, status: allowed ? 'completed' : 'failed', rawOutput: allowed ? 'done' : 'rejected' })
     }
+    if (step.write) writeFileSync(join(cwds.get(sid) || process.cwd(), step.write.path), step.write.content)
+    if (step.exit) { setTimeout(() => process.exit(3), 100); return }
     if (step.hang) { active = msg.id; return }
     if (step.stop) stop = step.stop
   }
   send({ id: msg.id, result: { stopReason: stop } })
+  if (exitAfter) setTimeout(() => process.exit(4), 50)
 }
 readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
   if (!line.trim()) return
@@ -509,9 +528,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
   switch (msg.method) {
     case 'initialize':
       return reply({ protocolVersion: 1, agentInfo: { name: 'Fake ACP', version: '0.0.1' }, agentCapabilities: cfg.caps || {}, authMethods: cfg.authMethods || [] })
-    case 'session/new':
+    case 'session/new': {
       if (cfg.authRequired) return send({ id: msg.id, error: { code: -32000, message: cfg.authMessage || 'Authentication required' } })
-      return reply(session('s-' + (++seq)))
+      const sid = 's-' + (++seq)
+      cwds.set(sid, msg.params.cwd)
+      return reply(session(sid))
+    }
     case 'session/load':
     case 'session/resume':
       loads++
@@ -791,9 +813,11 @@ test('ACP 规划：代理用空列表撤回全部步骤后，旧步骤不再显�
 
   await ask(service, 'WITHDRAW_SAY', 'plan')
   const said = await settle(service)
-  assert.equal(said.status, 'planned')
-  assert.doesNotMatch(said.plan ?? '', /a\.txt/, '撤回的步骤不再出现在计划里')
-  assert.match(said.plan ?? '', /不需要改动/)
+  assert.equal(said.status, 'failed', '撤回了全部步骤，回复只是说明，不能当计划确认执行')
+  assert.equal(said.plan, undefined, '撤回的步骤不再出现在计划里')
+  assert.match(said.reply, /不需要改动/, '回复照常保留')
+  assert.match(said.error ?? '', /撤回了全部计划步骤/)
+  await assert.rejects(service.execute(''), /没有等待确认的计划/)
 
   await ask(service, 'REPLACE', 'plan')
   const replaced = await settle(service)
@@ -807,7 +831,8 @@ test('ACP 停止：代理回应取消前又来的审批一律答 cancelled，YOL
     permOnCancel: { toolCallId: 'late', title: 'run', kind: 'execute', rawInput: { cmd: 'rm -rf build' } },
     cases: {
       HANG_IT: [{ say: '处理中' }, { hang: true }],
-      OTHER_SESSION: [{ perm: { toolCallId: 'x1', title: 'run', kind: 'execute', rawInput: { cmd: 'ls' }, sessionId: 'someone-else' } }, { say: 'ok' }]
+      OTHER_SESSION: [{ perm: { toolCallId: 'x1', title: 'run', kind: 'execute', rawInput: { cmd: 'ls' }, sessionId: 'someone-else' } }, { say: 'ok' }],
+      NO_SESSION: [{ perm: { toolCallId: 'x2', title: 'run', kind: 'execute', rawInput: { cmd: 'ls' }, sessionId: null } }, { say: 'ok' }]
     }
   })
   const service = makeService(join(home, 'app'), process.execPath)
@@ -827,6 +852,10 @@ test('ACP 停止：代理回应取消前又来的审批一律答 cancelled，YOL
   await ask(service, 'OTHER_SESSION')
   await settle(service)
   assert.deepEqual((await fake.choices()).at(-1), { outcome: 'cancelled' }, '不是当前会话的审批不放行')
+
+  await ask(service, 'NO_SESSION')
+  await settle(service)
+  assert.deepEqual((await fake.choices()).at(-1), { outcome: 'cancelled' }, '没带 sessionId 的审批不放行')
 })
 
 test('ACP 审批：工具身份和参数分开发送时按各自身份匹配许可；身份不明时只能单次允许', async t => {
@@ -842,7 +871,8 @@ test('ACP 审批：工具身份和参数分开发送时按各自身份匹配许�
         { perm: { toolCallId: 'a2', rawInput: same } },
         { say: 'ok' }
       ],
-      ANON: [{ perm: { toolCallId: 'z1', rawInput: same } }, { say: 'ok' }]
+      ANON: [{ perm: { toolCallId: 'z1', rawInput: same } }, { say: 'ok' }],
+      KIND_ONLY: [{ perm: { toolCallId: 'k1', kind: 'execute', rawInput: same } }, { say: 'ok' }]
     }
   })
   const service = makeService(join(home, 'app'), process.execPath)
@@ -868,6 +898,14 @@ test('ACP 审批：工具身份和参数分开发送时按各自身份匹配许�
   await settle(service)
   const once = { outcome: 'selected', optionId: 'once' }
   assert.deepEqual(await fake.choices(), [once, { outcome: 'selected', optionId: 'no' }, once])
+
+  // 只有工具类别、没有工具标题：类别不是身份，同样只能单次允许
+  await ask(service, 'KIND_ONLY')
+  const kindOnly = await pendingApproval(service)
+  assert.equal(kindOnly.ruleKey, undefined)
+  await assert.rejects(service.approve(kindOnly.requestId, true, true), /没法记住/)
+  await service.approve(kindOnly.requestId, true)
+  await settle(service)
 })
 
 test('ACP 历史任务：工作目录移走后主动打开仍显示原记录，只读，不能接着发', async t => {
@@ -903,6 +941,172 @@ test('ACP 历史任务：工作目录移走后主动打开仍显示原记录，�
   assert.equal(service.snapshot().readOnlyTask, undefined)
   await ask(service, '新的一项')
   assert.equal((await settle(service)).status, 'completed')
+})
+
+test('ACP 中途退出：已收到的回复保留并落盘，本轮改动快照照常结算，结算完才放开下一轮', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-crash-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const project = join(home, 'project')
+  await mkdir(project, { recursive: true })
+  await writeFile(join(project, 'keep.txt'), 'old\n')
+  const fake = await scriptedAcp(join(home, 'fake'), {
+    caps: { loadSession: true },
+    cases: { CRASH_IT: [{ write: { path: 'crash.txt', content: '中断前写入\n' } }, { say: '已写入中断前的文件' }, { exit: true }] }
+  })
+  const appHome = join(home, 'app')
+  const service = makeService(appHome, process.execPath)
+  t.after(() => service.close().catch(() => undefined))
+  await connectFake(service, fake)
+  await service.setWorkspace('default', project)
+  // 第一次收到 busy=false 的状态通知时，磁盘上的记录必须已经是最终结果
+  const recordsPath = join(appHome, 'agent', 'work-items.json')
+  let sawBusy = false
+  let diskAtRelease: AgentWorkItem[] | null = null
+  service.on('state', (snap: AgentState) => {
+    if (snap.busy) sawBusy = true
+    else if (sawBusy && !diskAtRelease) diskAtRelease = JSON.parse(readFileSync(recordsPath, 'utf8')).items as AgentWorkItem[]
+  })
+
+  await ask(service, 'CRASH_IT')
+  const run = await settle(service)
+  assert.equal(run.status, 'interrupted')
+  assert.match(run.reply, /已写入中断前的文件/, '已收到的回复并入正文')
+  assert.ok(run.roundChanges, '本轮改动快照已结算')
+  assert.deepEqual(run.roundChanges!.files.map(file => file.path), ['crash.txt'])
+  assert.match(await service.roundDiff(run.id), /中断前写入/)
+  assert.equal(service.snapshot().connection, 'offline')
+
+  // 放开任务那一刻，磁盘上的记录里已经有这句回复和改动（重新打开记录、应用异常退出都不会丢）
+  assert.ok(diskAtRelease, '收到了放开任务的状态通知')
+  const savedRun = diskAtRelease!.flatMap(item => item.runs).find(r => r.id === run.id)!
+  assert.equal(savedRun.status, 'interrupted')
+  assert.match(savedRun.reply, /已写入中断前的文件/)
+  assert.ok(savedRun.roundChanges)
+
+  // 重新连接后接着原任务：选中的仍是这项任务
+  await ask(service, '接着做')
+  const next = await settle(service)
+  assert.equal(next.status, 'completed')
+  assert.equal(service.snapshot().items.find(item => item.runs.some(r => r.id === run.id))?.runs.length, 2, '重连后接着用户选中的原任务')
+})
+
+test('ACP 历史任务：代理启动不了时也能选中并查看本机记录；工作目录不在的任务直接只读，不必连接代理', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-offline-history-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const kept = join(home, 'kept')
+  const moved = join(home, 'moved')
+  await mkdir(kept, { recursive: true })
+  await mkdir(moved, { recursive: true })
+  const fake = await scriptedAcp(join(home, 'fake'), { caps: { loadSession: true } })
+  const appHome = join(home, 'app')
+  const first = makeService(appHome, process.execPath)
+  await connectFake(first, fake)
+  await first.setWorkspace('default', kept)
+  await ask(first, '第一项')
+  await settle(first)
+  await first.setWorkspace('default', moved)
+  await ask(first, '第二项')
+  await settle(first)
+  const [keptItem, movedItem] = first.snapshot().items
+  await first.close()
+  await rm(moved, { recursive: true, force: true })
+
+  // 代理程序已经卸载：启动必然失败
+  const second = makeService(appHome, join(home, 'uninstalled', 'agent.exe'))
+  t.after(() => second.close().catch(() => undefined))
+  await assert.rejects(second.openTask(keptItem.id))
+  let snap = second.snapshot()
+  assert.equal(snap.activeItemId, keptItem.id, '连不上代理也选中了这项任务')
+  assert.match(snap.items.find(item => item.id === keptItem.id)?.runs[0].reply ?? '', /mode=/, '本机记录照常可看')
+  assert.notEqual(snap.connection, 'ready')
+
+  await second.openTask(movedItem.id)
+  snap = second.snapshot()
+  assert.equal(snap.activeItemId, movedItem.id)
+  assert.equal(snap.readOnlyTask?.itemId, movedItem.id, '工作目录不在：直接只读查看')
+  assert.equal(snap.connection, 'offline', '没有为只读查看启动代理')
+  await assert.rejects(ask(second, '接着做'), /只能查看/)
+})
+
+test('ACP 强停失败：旧进程还活着时不自动重连、也不启动新代理；它退出后才能重新连接', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-stuck-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const fake = await scriptedAcp(join(home, 'fake'), { cases: { STUCK_IT: [{ say: '开始' }, { hang: true }] } })
+  const service = makeService(join(home, 'app'), process.execPath, { grace: 150 })
+  t.after(() => service.close().catch(() => undefined))
+  await connectFake(service, fake)
+
+  await ask(service, 'STUCK_IT')
+  await waitFor(() => lastRun(service)?.draft)
+  // 让这次强停“失败”：进程照样活着
+  const live = service as unknown as { acpClient: AcpClient }
+  const old = live.acpClient
+  const realStop = old.stop.bind(old)
+  old.stop = async () => false
+  t.after(() => realStop().catch(() => undefined))
+  // 代理不回应取消：假代理在这一轮里不理会 session/cancel
+  ;(old as unknown as { cancelSession: (sid: string) => void }).cancelSession = () => undefined
+  await service.cancel()
+  const stopped = await settle(service)
+  assert.equal(stopped.status, 'cancelled')
+  assert.match(stopped.error ?? '', /强制结束也没有成功/)
+  assert.equal(service.snapshot().connection, 'error')
+  await new Promise(resolve => setTimeout(resolve, 200))
+  assert.equal((await fake.received('initialize')).length, 1, '没有自动启动新代理')
+  await assert.rejects(ask(service, '下一轮'), /还在运行/)
+  assert.equal((await fake.received('initialize')).length, 1)
+  // 从设置里保存同一份配置重连：同样拦住，不启动第二个代理
+  await assert.rejects(
+    service.setAcpConfig({ preset: 'custom', command: process.execPath, args: [fake.script, fake.cfgPath], seat: 'Fake', label: 'Fake' }, 'default'),
+    /还在运行/
+  )
+  assert.equal((await fake.received('initialize')).length, 1, '保存设置后重连也没有启动第二个代理')
+  assert.equal(old.alive, true)
+
+  // 旧进程退出后可以重新连接
+  assert.equal(await realStop(), true)
+  await waitFor(() => !old.alive)
+  await ask(service, '下一轮')
+  assert.equal((await settle(service)).status, 'completed')
+  assert.equal((await fake.received('initialize')).length, 2)
+})
+
+test('ACP 收尾期间连接断开：收尾认领这一轮、按代理的结果结束，结算完才放开任务，不会清掉下一轮', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-finish-race-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const fake = await scriptedAcp(join(home, 'fake'), { cases: { DONE_THEN_EXIT: [{ say: '做完了' }, { exitAfterTurn: true }] } })
+  const service = makeService(join(home, 'app'), process.execPath)
+  t.after(() => service.close().catch(() => undefined))
+  await connectFake(service, fake)
+
+  // 卡住第一轮的快照结算：代理在这期间退出
+  const live = service as unknown as { finishBaseline(run: unknown): Promise<void> }
+  const realFinish = live.finishBaseline.bind(service)
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let gated = 0
+  // 只卡住第一轮收尾自己的那次结算；别处再发起的结算照常进行（复现断线处理抢先放开任务）
+  live.finishBaseline = async run => { gated++; if (gated === 1) await gate; return realFinish(run) }
+  await ask(service, 'DONE_THEN_EXIT')
+  await waitFor(() => gated > 0)
+  await waitFor(() => service.snapshot().connection === 'offline')
+  assert.equal(lastRun(service)?.status, 'running', '断线处理没有把正在收尾的这一轮标成中断')
+  // 留足时间：断线处理若另起结算，这时早该放开任务了
+  await new Promise(resolve => setTimeout(resolve, 1500))
+  assert.equal(service.snapshot().busy, true, '收尾还没完，断线处理没有替它放开任务')
+  await assert.rejects(ask(service, '下一轮'), /请先等待/)
+
+  release()
+  const first = await settle(service)
+  assert.equal(first.status, 'completed', '代理已经结束了这一轮，按它的结果收尾，不标成中断')
+  assert.match(first.reply, /做完了/)
+  live.finishBaseline = realFinish
+
+  await ask(service, '下一轮')
+  const second = await settle(service)
+  assert.equal(second.status, 'completed')
+  assert.equal(service.snapshot().busy, false)
+  assert.equal(service.snapshot().items.flatMap(item => item.runs).find(run => run.id === first.id)?.status, 'completed')
 })
 
 test('ACP 规划：没有规划能力时不能拟计划；切入或切回规划失败时这一轮的 session/prompt 一次都不发，并说明原因', async t => {

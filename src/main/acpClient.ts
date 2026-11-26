@@ -56,7 +56,8 @@ function killTree(child: ChildProcessWithoutNullStreams): Promise<void> {
 function findInPath(command: string, env: NodeJS.ProcessEnv = process.env): string | null {
   const pathEnv = env['PATH'] ?? env['Path'] ?? ''
   if (!pathEnv) return null
-  const dirs = pathEnv.split(delimiter).map(d => d.trim()).filter(Boolean)
+  // 只认绝对路径的目录：PATH 里的相对目录（如 . 或 bin）随启动目录指向不同位置，查到的程序不可信
+  const dirs = pathEnv.split(delimiter).map(d => d.trim().replace(/^"(.*)"$/, '$1')).filter(d => d && isAbsolute(d))
   const isWin = process.platform === 'win32'
   const exts = isWin
     ? (env['PATHEXT'] ?? '.EXE;.CMD;.BAT;.COM').split(';').map(e => e.trim().toLowerCase()).filter(Boolean)
@@ -666,18 +667,34 @@ export class AcpClient extends EventEmitter {
     return this.request('session/close', { sessionId }, 2_000).catch(() => undefined)
   }
 
-  async stop(activeSessionId?: string): Promise<void> {
+  /** 子进程 PID；进程已退出或还没启动时为 undefined。 */
+  get pid(): number | undefined {
+    return this.child?.pid
+  }
+
+  /**
+   * 结束子进程：先关输入等它自己退出，4 秒没退就强停整棵进程树。
+   * 返回进程是否确实已经退出；强停命令也失败、进程还在时返回 false，调用方不能当作已结束。
+   */
+  async stop(activeSessionId?: string): Promise<boolean> {
     const child = this.child
-    if (!child) return
+    if (!child) return true
     if (activeSessionId) await this.closeSession(activeSessionId)
     try { child.stdin.end() } catch {}
-    if (child.exitCode !== null || child.signalCode !== null) return
-    await new Promise<void>(resolve => {
-      const timer = setTimeout(() => {
-        if (child.exitCode !== null || child.signalCode !== null) { resolve(); return }
-        void killTree(child).then(resolve)
-      }, 4_000)
-      child.once('close', () => { clearTimeout(timer); resolve() })
+    const exited = () => child.exitCode !== null || child.signalCode !== null
+    const waitClose = (ms: number) => new Promise<boolean>(resolve => {
+      if (exited()) { resolve(true); return }
+      const timer = setTimeout(() => { child.off('close', onClose); resolve(exited()) }, ms)
+      const onClose = () => { clearTimeout(timer); resolve(true) }
+      child.once('close', onClose)
     })
+    if (await waitClose(4_000)) return true
+    await killTree(child)
+    if (await waitClose(3_000)) return true
+    if (process.platform !== 'win32') {
+      try { child.kill('SIGKILL') } catch {}
+      if (await waitClose(2_000)) return true
+    }
+    return false
   }
 }

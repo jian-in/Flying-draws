@@ -987,7 +987,8 @@ export function AgentPanel({
             {state.workspaceWarning ? <p className="fd-agent-small" role="status">{state.workspaceWarning}</p> : null}
             {state.toolStorage?.mode === 'host' ? <p className="fd-agent-small" title={state.toolStorage.artifactsDir}>截图和运行日志存在应用数据目录，不写进项目。只读命令、本轮自己起的服务的预览和关闭不再逐次确认。</p> : null}
             {items.length ? <div className="fd-agent-history-row">
-              <select className="fd-agent-history" aria-label="任务历史" value={active?.id ?? ''} disabled={disabled} onChange={e => {
+              {/* 历史记录在本机：代理或内核没连上时也能选中查看，发送和执行仍受连接状态约束 */}
+              <select className="fd-agent-history" aria-label="任务历史" value={active?.id ?? ''} disabled={working || state.busy} onChange={e => {
                 if (e.target.value) void act(() => api.openTask(e.target.value))
                 else void act(() => api.newTask(board))
               }}>
@@ -1189,6 +1190,7 @@ export function AgentPanel({
           {resumeFailure || readOnlyTask ? <div className="fd-agent-alert fd-agent-resume" role="alert">
             <p>{readOnlyTask?.message ?? resumeFailure?.message}</p>
             <div>
+              {readOnlyTask ? <button type="button" disabled={working || state.busy} title="项目目录放回原处后，重新打开这项任务接着做" onClick={() => void act(() => api.openTask(readOnlyTask.itemId))}>重新检查</button> : null}
               {!readOnlyTask && resumeFailure?.reason === 'error' ? <button type="button" disabled={working || state.busy} title="再次向代理提交原会话 ID" onClick={() => void act(() => api.openTask(resumeFailure.itemId))}>重试恢复</button> : null}
               <button type="button" className="fd-agent-primary" disabled={working || state.busy} title="原任务记录保留，新消息会进入一项独立的新任务" onClick={() => void act(() => api.newTask(board))}>开始新任务</button>
             </div>

@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -259,6 +260,12 @@ test('Fuxi 历史任务：工作目录移走后主动打开仍显示原记录，
   await writeFile(join(home, 'agent', 'work-items.json'), JSON.stringify({ version: 1, items: [item] }))
   const service = new AgentService({ home, executable: () => { throw new Error('不应启动真实内核') }, mcpServers: {} })
   t.after(() => service.close().catch(() => undefined))
+  // 内核还没启动（或启动不了）：照样选中并只读显示，不为它启动内核
+  await service.openTask('w1')
+  assert.equal(service.snapshot().activeItemId, 'w1')
+  assert.equal(service.snapshot().readOnlyTask?.itemId, 'w1')
+  assert.equal(service.snapshot().connection, 'offline')
+
   const opens: Record<string, unknown>[] = []
   const live = service as unknown as { client: unknown }
   live.client = {
@@ -283,6 +290,9 @@ test('Fuxi 历史任务：工作目录移走后主动打开仍显示原记录，
   assert.equal(snap.items[0].sessionId, 's1', '原会话 ID 没被换掉')
   await assert.rejects(service.submit({ board: 'b1', goal: '接着做', mode: 'direct', capture }), /只能查看/)
   assert.equal(service.snapshot().items[0].runs.length, 1)
+  // 只读查看期间内核换了会话：不改这项任务原来的会话 ID
+  ;(service as unknown as { handleEvent(event: unknown): void }).handleEvent({ event: 'session_reset', data: { session_id: 'kernel-other' } })
+  assert.equal(service.snapshot().items[0].sessionId, 's1')
 
   // 目录放回原处后再点这项任务：照常打开原会话
   await mkdir(gone, { recursive: true })
@@ -299,6 +309,44 @@ test('Fuxi 历史任务：工作目录移走后主动打开仍显示原记录，
   assert.equal(snap.readOnlyTask, undefined)
   assert.equal(opens.at(-1)?.new_session, true)
   assert.notEqual(opens.at(-1)?.cwd, gone)
+})
+
+test('Fuxi 内核意外断开：已显示的半句回复并入正文，先落盘再放开任务', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-fuxi-disconnect-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const service = new AgentService({ home, executable: () => { throw new Error('不应启动真实内核') }, mcpServers: {} })
+  t.after(() => service.close().catch(() => undefined))
+  const fake = {
+    alive: true,
+    stop: async () => undefined,
+    request: async (method: string) => {
+      if (method === 'workspace.open') return { session_id: 's1', provider: 'p', model: 'm', setup_needed: false, vision: false, choices: [] }
+      return {}
+    }
+  }
+  const live = service as unknown as { client: unknown; onEvent(e: unknown): void; onFuxiDisconnected(client: unknown, error: Error): void }
+  live.client = fake
+  await service.submit({ board: 'default', goal: '写一段说明', mode: 'direct', capture: { sceneJson: '{"elements":[]}', selectedIds: [], pngBase64: null } })
+  const runId = service.snapshot().items[0].runs[0].id
+  live.onEvent({ type: 'event', seq: 1, run_id: runId, req: 1, event: 'text_delta', data: { text: '已经显示的半句回复' } })
+  assert.equal(service.snapshot().busy, true)
+
+  const records = join(home, 'agent', 'work-items.json')
+  let diskAtRelease: AgentWorkItem[] | null = null
+  service.on('state', (snap: { busy: boolean }) => {
+    if (!snap.busy && !diskAtRelease) diskAtRelease = JSON.parse(readFileSync(records, 'utf8')).items as AgentWorkItem[]
+  })
+  live.onFuxiDisconnected(fake, new Error('内核进程已退出'))
+  const deadline = Date.now() + 5000
+  while (service.snapshot().busy && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+  const run = service.snapshot().items[0].runs[0]
+  assert.equal(run.status, 'interrupted')
+  assert.match(run.reply, /已经显示的半句回复/, '已显示的回复并入正文')
+  assert.equal(run.draft, '')
+  assert.ok(diskAtRelease, '收到了放开任务的状态通知')
+  const saved = diskAtRelease!.flatMap(item => item.runs).find(r => r.id === runId)!
+  assert.equal(saved.status, 'interrupted', '放开任务时磁盘上已经是最终记录')
+  assert.match(saved.reply, /已经显示的半句回复/)
 })
 
 test('冷启动 submit 保留上一轮 reviewContext；session_reset 同步活动任务 sessionId；离线自动审批不抛错；close 等待 deferredEvents 落盘', async t => {
