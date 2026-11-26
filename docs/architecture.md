@@ -1,12 +1,12 @@
 # Flying draws 架构与核心工程设计
 
-本文档面向深入理解 **Flying draws** 底层机制的开发者与架构审阅者，结合仓库真实源码拆解项目的整体拓扑与五大核心工程设计。
+本文档面向深入理解 **Flying draws** 底层机制的开发者与架构审阅者，结合仓库真实源码拆解项目的整体拓扑与六大核心工程设计。
 
 ---
 
 ## 全局系统拓扑
 
-Flying draws 同时支撑两条工作流：**外部编码 Agent 的零配置 MCP 空间外设**（Claude Code、Codex、Cursor、Antigravity 等通过 `out/bridge/index.js` 接入），以及**内置 Fuxi 内核的一体化视觉工作台**。两条路径在主进程汇聚到同一套画板会话、乐观并发控制与语义排版引擎上。
+Flying draws 同时支撑两条工作流：**外部编码 Agent 的零配置 MCP 空间外设**（Claude Code、Codex、Cursor、Antigravity 等通过 `out/bridge/index.js` 接入），以及**内置 Fuxi 内核的一体化视觉工作台**。两条路径在主进程汇聚到同一套画板会话、乐观并发控制与语义排版引擎上。内置面板的执行后端还可以从 Fuxi 内核切到任意标准 ACP 代理（见第六章），任务记录、圈选上下文与画布席位两种引擎共用。
 
 ```mermaid
 flowchart LR
@@ -35,11 +35,14 @@ flowchart LR
 
   subgraph Host["独立宿主进程"]
     FX["Fuxi Rust Kernel (NDJSON Host)"]
+    ACPX["标准 ACP 代理 (Antigravity / Claude Code / Codex / OpenCode / 自定义)"]
   end
 
   BR <-->|"127.0.0.1 + Token"| DM
   AG <-->|"stdio NDJSON (agentClient.ts)"| FX
+  AG <-->|"stdio JSON-RPC (acpClient.ts)"| ACPX
   FX <-->|"ELECTRON_RUN_AS_NODE Bridge"| BR
+  ACPX <-->|"session/new 注入的 MCP Bridge"| BR
 ```
 
 ### 核心模块速查表
@@ -54,7 +57,8 @@ flowchart LR
 | `src/main/lineage.ts` | `shouldAutoPlaceResultImage` 画布自拍防递归过滤、`planImageLineage` 多轮 `v1 → v2 → v3` 演进墙横向落位与绑定连线规划 | 纯函数，零外部依赖 |
 | `src/main/dock.ts` & `dockGeometry.ts` | `koffi` Win32/DWM FFI、`SetWinEventHook` 跨进程窗口跟随、`DWMWA_EXTENDED_FRAME_BOUNDS` 跨 DPI 隐形边框二次校准 | 主进程（Windows 原生 API） |
 | `src/main/daemon.ts` & `atomicWrite.ts` | `127.0.0.1` 防重绑定 HTTP 服务、常量时间 Token 鉴权、单文件路径串行队列原子写 | Node.js 标准库 |
-| `src/main/agentClient.ts` & `agent.ts` | 内置 Fuxi 子进程 NDJSON 协议栈、双阶段请求结算、执行与审批通道分离、会话/血缘持久化 | Node.js 标准库 |
+| `src/main/agentClient.ts` & `agent.ts` | 内置 Fuxi 子进程 NDJSON 协议栈、双阶段请求结算、执行与审批通道分离、会话/血缘持久化、Fuxi / ACP 双引擎调度 | Node.js 标准库 |
+| `src/main/acpClient.ts` | 标准 ACP stdio JSON-RPC 客户端、预设 CLI 探测与 `resolveAcpCommand` 命令解析、Windows `.cmd/.bat` 逐字转义启动、会话恢复能力协商 | Node.js 标准库 |
 
 ---
 
@@ -214,3 +218,100 @@ flowchart TD
    - **最小权限渲染沙箱**：`BrowserWindow` 强制开启 `contextIsolation: true` 与 `sandbox: true`，`src/preload/index.ts` 仅映射类型受控的画板与任务业务方法，渲染层无任何 Node.js、任意文件读写或 Shell 执行权限；外部链接统一由 `setWindowOpenHandler` 拦截。
    - **NDJSON 宿主生命周期与双通道控制**：内置 Fuxi 内核以独立无界面子进程（`fuxi --host --host-data ~/.flyingdraws/agent`）运行，`stderr` 流实时排空不落盘以防日志泄露环境凭据，`stdout` 实施单行 `10 MiB` 熔断上限。任务执行请求采用 `accepted + done` 双阶段异步结算，而任务取消（`cancel`）与高风险工具逐次审批（`approve`）走独立 JSON-RPC 请求序号直达内核，执行阻塞期仍可毫秒级中断。
    - **崩溃安全恢复**：应用退出时经 `before-quit` 发起 `shutdown` 握手，超时 12 秒自动升级为 `taskkill.exe /PID <pid> /T /F` 清理整棵工具子进程树；下次启动读取 `work-items.json` 时，所有遗留的 `running` / `planned` 状态一律降级为 `interrupted` 并作废未决审批，绝不在用户不知情时静默重放未完成动作。
+
+---
+
+## 六、标准 ACP 代理接入（Agent Client Protocol Backends）
+
+**涉及源码**：`src/main/acpClient.ts`、`src/main/agent.ts`、`src/shared/agent.ts`、`src/main/agentIpc.ts`
+
+内置面板的执行后端除了 Fuxi 内核，还可以切到任何实现了标准 ACP 的本地代理：内置 Antigravity、Claude Code、Codex、OpenCode 四个预设，另可填写自定义代理。两种引擎共用任务记录、圈选上下文、改动快照与画布席位；ACP 一侧要额外解决的，是安全地启动一个不归应用管的外部程序，并在协议能力参差不齐的代理之间守住三条约束：**不悄悄换会话、不替用户留下永久授权、停止后旧轮不混进下一轮**。
+
+```mermaid
+sequenceDiagram
+  participant S as AgentService (agent.ts)
+  participant C as AcpClient (acpClient.ts)
+  participant P as ACP 代理子进程
+  participant U as 用户 (AgentPanel)
+
+  S->>S: resolveAcpCommand() + reviewAcpLaunch()（非默认启动首次弹确认）
+  S->>C: start()
+  C->>P: initialize（fs / terminal 能力均声明为 false）
+  S->>P: session/resume → session/load，或 session/new（注入 flying_draws MCP）
+  U->>S: 拟计划 / 直接执行
+  S->>P: set_config_option 或 set_mode → plan（仅规划轮）
+  S->>P: session/prompt（不设总时限）
+  P-->>S: session/update（回复 / 思考 / plan / tool_call / 用量）
+  P->>S: session/request_permission
+  S-->>U: 审批卡（或按 YOLO / 任务规则直接答 allow_once）
+  U->>S: 停止
+  S->>P: 挂起审批全部答 cancelled，再发 session/cancel
+  alt 宽限期内结束本轮
+    P-->>S: session/prompt 返回 stopReason
+  else 宽限期超时（默认 8 秒）
+    S->>C: abandonAcpRun()：断开 → 等旧进程退出 → 结算快照 → 后台重连
+  end
+```
+
+### 1. 进程与连接：stdio JSON-RPC 与启动信任
+
+- **协议栈（`AcpClient`）**：代理以无窗口子进程运行，`stdin/stdout` 上按行收发 JSON-RPC 2.0 帧，单帧沿用 `10 MiB` 熔断；`initialize` 完成前的非 JSON 行视为 CLI 启动日志忽略，完成后再出现即判定协议错误并结束进程。`stderr` 只保留末尾 1200 字符供启动诊断。`initialize` 把 `fs.readTextFile / writeTextFile` 与 `terminal` 都声明为 `false`：宿主不代理文件和终端，代理用自己的工具直接读写工作区，所以本轮改动只能靠工作区快照结算（见第 5 节）。代理发来的反向请求只接 `session/request_permission`，其余一律回 `-32601`。代理返回 `-32000`（需要认证）时，内置预设提示对应 CLI 的登录命令，自定义代理改为展示它自己在 `authMethods` 里给的认证说明。
+- **预设探测与命令解析（`detectAcpPresetBinary` / `resolveAcpCommand`）**：
+
+  | 预设 | 自动探测的命令 | 默认参数 | 默认席位 | 认证报错时的提示 |
+  |---|---|---|---|---|
+  | Antigravity | `agy`（可用环境变量 `FLYINGDRAWS_ACP_BIN` 覆盖） | `acp` | Antigravity | `agy acp --login` |
+  | Claude Code | `claude-agent-acp`、`claude-code-acp` | 无 | Claude | `claude login` |
+  | Codex | `codex-acp` | 无 | Codex | `codex login` |
+  | OpenCode | `opencode` | `acp` | OpenCode | `opencode auth login` |
+  | 自定义 | 不探测，必须填写 | 用户填写 | ACP | 代理自己的 `authMethods` |
+
+  命令留空时按预设在 PATH、npm 全局目录、`~/.local/bin` 等标准用户安装位置查找，不写死任何用户名路径。填了命令时：裸命令名只在 PATH 里找，且只认 PATH 中的绝对路径目录（`.`、`bin` 这类相对目录随启动目录指向不同位置，跳过）；带路径分隔符的一律先 `resolve()` 成绝对路径并要求文件存在——确认框、信任指纹和实际 `spawn` 用的是同一个绝对路径，同一串相对路径换个启动目录指向别的程序时，指纹随之不同，会重新确认。
+- **首次启动确认与信任指纹（`reviewAcpLaunch` / `acpLaunchFingerprint`）**：内置预设、命令留空自动探测、参数与默认值逐项一致，这种启动由应用自己决定，直接放行。其余情况（自定义程序、改过参数、旧版留下或手改设置文件得到的命令）以 `sha256(JSON.stringify([绝对路径, ...args]))` 为指纹；指纹不在信任列表里时，由主进程原生对话框（`agentIpc.ts` 的 `confirmAcpLaunch`）逐行列出实际程序和每个参数，默认按钮是「取消」；没有注入确认回调时一律不启动。确认后指纹写入 `host-settings.json` 的 `acpTrusted`（最多保留 50 条，读取时只认 64 位十六进制串）。席位名不参与指纹，只改席位或重连不会再问。切换引擎、修改 ACP 配置、打开属于另一预设的历史任务时都先做这一步预检，用户取消则原连接和配置原样保留。
+- **Windows 批处理启动（`windowsBatchLaunch`）**：npm 全局安装的代理多是 `.cmd` 垫片，不能直接 `spawn`。宿主自己拼整条命令行交给 `ComSpec`（`cmd.exe /d /s /c "<line>"`），并开启 `windowsVerbatimArguments` 关掉 Node 的二次加引号：程序路径按 cmd 元字符加 `^`；每个参数先按 MSVC 规则加引号（引号前的反斜杠成对），再转义 cmd 元字符，规则与 cross-spawn 一致。路径和参数里的空格、引号、`&`、`%` 保持原样，参数边界不会被 cmd 拆开或合并。
+- **画布工具注入与看图能力**：`toAcpMcpServers()` 把应用的 MCP 配置转成 `session/new` 要求的数组格式，并把 `flying_draws` 桥接的 `FLYINGDRAWS_SEAT` 覆盖为当前 ACP 配置的席位名（默认取预设席位，可在设置里改），代理在画布上画的内容按自己的席位署名。只有代理在 `promptCapabilities.image` 里明确声明 `true` 时才附画布截图，缺省只发文字（目标、选区和画布结构已写在文字里）。
+- **结束进程（`stop`）**：有活动会话且代理声明了 `session/close` 能力时先关会话（2 秒上限），再关闭 `stdin`；4 秒内仍未退出则结束整棵进程树（Windows 上为 `taskkill /T /F`，其他平台先 `SIGTERM` 再 `SIGKILL`），每一步之后都确认进程是否真的退出。`stop()` 返回进程是否已经退出，强停命令也失败时返回 `false`，调用方不能当作已结束（见第 5 节）。
+
+### 2. 会话：恢复优先、失败不换会话、只读查看
+
+- **任务与预设绑定**：每项任务记录 `engine` 与 `acpPreset`，会话 ID 只在同一预设下续接，不会把一个代理的会话 ID 交给另一个代理。打开另一预设（或另一引擎）的历史任务时，先换回那个预设保存的配置（未确认过的命令照样先问），再连接。
+- **恢复顺序（`resumeOrLoadSession`）**：有原会话 ID 时，按代理在 `initialize` 里声明的能力依次尝试 `session/resume`、`session/load`。`load` 会先把历史对话作为 `session/update` 回放，此时没有进行中的轮次，宿主直接丢弃这些通知。两条都走不通时区分两种失败：两项能力都没声明为 `unsupported`，声明了但请求报错为 `error`。没有原会话时走 `session/new`；切到新会话后，旧会话在代理支持时 `session/close`。
+- **恢复失败（`acpResume`）**：不悄悄换成新会话，也不改写原任务的会话 ID。`markAcpDetached()` 让面板照常显示这项任务的记录，同时置 `acpResume = { itemId, reason, message }`，发送与确认执行都被 `requireWritableTask()` 拦下：`error` 提示重试恢复或开始新任务（再点一次这项任务即用原会话 ID 重试），`unsupported` 提示只能查看、请开始新任务。唯一例外是应用自动连接（不是用户主动打开）时遇到 `unsupported`：直接开新会话并给出提示，旧任务留在列表里，免得每次启动都卡在一项注定无法恢复的任务上。
+- **打开历史任务先选中**：任务记录在本机，`openTask()` 先把它设为当前任务再连接；代理或内核启动失败、连接报错时，面板照样显示这项任务的记录，只是不能发送（任务下拉框在未连接时也可操作，发送和执行仍受连接状态约束），重连后接着这项任务（重连时优先用当前选中的任务，没有才取这块画板最近的一项）。
+- **只读历史任务（`readOnlyTask`，两种引擎共用）**：用户主动打开或正选着的历史任务，工作目录已不存在或无法访问时，不在别的目录里接着它的会话：`markReadOnly()` 按引擎走 `markFuxiReadOnly()`（不打开工作区）或 `markAcpDetached()`（不恢复会话），统一置 `readOnlyTask`，记录可看、不能接着发。`openTask()` 发现目录不在时直接只读显示，不为它启动或连接代理，代理没在运行时连接状态如实显示为未连接。目录放回原处后点「重新检查」（或再点这项任务）即重试。若不是用户的任务（例如应用自动连接时最近一项任务的目录没了），则改用应用专用工作目录开新会话，并提示原记录已保留。只读期间内核发来的 `session_reset` 不改这项任务的会话 ID。
+- **会话切换使计划失效**：每次切换会话或打开工作区失败，所有 `planned` 轮次都降为 `interrupted`，计划要在新会话里重新拟定。连接意外断开时，进行中和待确认的轮次同样降为 `interrupted`（尚未确认的工具结果保持未知），挂起的审批一律作废；已经收到的回复和思考先并入正文，进行中的轮次照常结算改动快照并落盘，结算完才放开下一轮（见第 5 节）。
+
+### 3. 规划与执行：借用代理自己的规划模式
+
+ACP 没有「先拟计划、确认后执行」的协议原语，宿主借代理声明的规划模式实现这一流程：
+
+- **规划入口（`acpPlanTarget`）**：`configOptions` 里的 `mode` 选项含 `plan` 值时优先用 `session/set_config_option` 切换，其次是 session modes 里的 `plan`（`session/set_mode`）；两者都没有就直接报「不能先拟计划，请直接执行」，本轮不发送。
+- **切换时机（`prepareAcpMode`）**：规划轮先切进 `plan`，切成功才发 `session/prompt`，并记下切换前的模式 `acpPrePlanMode`（记不到时用 `acpFallbackMode` 兜底：有 `default` 用 `default`，否则取第一个非规划模式）。确认执行或规划后直接发新任务时，只在代理仍停在 `plan`（或没报告当前模式）时才切回规划前的模式；代理已经自己退出规划、或用户之后改过模式，都以当前模式为准。用户在面板上明确选过模式会清掉 `acpPrePlanMode`：之后直接发的新任务停在用户选的模式（哪怕选的就是 `plan`），确认执行时代理若仍在 `plan` 则用兜底模式退出规划；新会话的初始模式由代理决定，同样清掉。任何一次切换失败都抛出具体原因，本轮不发送。
+- **计划内容（`plan` 更新，仅规划轮采用）**：协议要求代理每次都发完整的计划列表、由客户端整体替换。宿主照此把条目渲染为勾选清单覆盖 `run.plan`；空列表即代理撤回了全部步骤，计划随之清空。规划轮以 `end_turn` 结束时，有计划才进入 `planned` 等待确认，否则标为失败并提示补充说明：本轮发过结构化计划的，只认结构化步骤，撤回成空列表后回复只是说明，不能当计划确认执行（回复照常保留）；从没发过结构化计划的代理，回复正文就是计划。
+- **确认执行**：在同一会话里追加一轮「已确认上述计划，请按计划开始执行」（可附补充说明），并像普通执行轮一样先拍工作区快照。
+
+### 4. 审批：只选「允许一次」，记忆规则留在宿主
+
+- **只选 `allow_once`（`acpAllowOnceOption`）**：「本次允许」与「本任务内都允许」都只向代理回 `allow_once`（选项缺 `kind` 时按名称排除 always / 永久 / reject 一类）；YOLO 模式和任务规则自动放行时也一样。代理只提供永久授权时，宿主不替用户选，必须由用户明确点「始终允许」。拒绝只选 `reject_once`，代理没有单次拒绝选项就回 `cancelled`，不在代理那边留下长期规则。
+- **任务内记忆的匹配键（`acpRuleKey`）**：「本任务内都允许」记在任务的 `allowedCommands` 里，匹配键为 `acp:` + `sha256(JSON([kind, title]) + 完整参数的键排序 JSON)`。审批卡上最多 8000 字符的参数预览只给人看，不参与判断：两次写文件前 8000 字符相同、末尾不同，必须重新询问。代理可能先在 `tool_call` 里发标题、后在 `tool_call_update` 里补参数，宿主按 `toolCallId` 逐项合并，审批请求缺哪一项就用它补上。没有工具标题（`kind` 只是读、改、执行这类工具类别，不算身份）、没有参数或参数无法序列化时不给匹配键，这条调用只能单次允许；没有匹配键的旧 ACP 规则不再自动放行。
+- **停止后与跨会话的审批**：已点停止（代理尚未回应取消）、没有进行中的轮次、请求没带 `sessionId` 或不是当前会话，或请求来自已被放弃的旧连接，一律答 `cancelled`，不按 YOLO 或任务规则放行，也不弹卡。
+
+### 5. 停止与收尾
+
+- **取消与宽限期**：点停止时，宿主按协议先把挂起的审批全部答成 `cancelled`，再发 `session/cancel` 通知，并启动宽限计时（默认 8 秒，构造选项 `acpCancelGraceMs` 可调）。`session/prompt` 本身不设总时限（一轮可能要等用户审批很久），停止完全依赖这条路径。
+- **放弃旧连接（`abandonAcpRun`）**：宽限期内代理没结束本轮时，宿主先断开：清空当前连接与会话 ID，旧连接迟到的 `session/update` 被忽略、迟到的审批答 `cancelled`，已流式收到的回复并入正文。`busy` 与取消标记则一直保持到旧进程真正退出，这期间面板不会自动重连、也发不了下一轮，新连接不可能和仍在写文件的旧进程同时接手同一个会话。旧进程退出后，先等结果图写盘、结算本轮改动快照，再把本轮标为 `cancelled`（附「代理没有响应停止请求」说明），最后在后台重连，有恢复能力的代理会接回同一个会话。强停也失败、旧进程可能还活着时，本轮同样标为 `cancelled` 并说明原因，但不自动重连：宿主记下这个进程（`acpStuck`），它退出之前任何连接请求（普通重连、保存设置后重连、切预设）都不启动新代理，提示用户先结束它。`stopBackends()` 每次都会再试着结束这些进程，仍没确认退出的继续记着，当前代理的 `stop()` 返回 `false` 时也一并记下；应用退出时同样再试一次。
+- **收尾状态（`stopReason`，缺省按 `end_turn` 处理）**：
+
+  | 结束方式 | 本轮状态 |
+  |---|---|
+  | 已点停止，或 `stopReason = cancelled` | `cancelled` |
+  | `end_turn`（规划轮） | 有计划 → `planned`；没有 → `failed` |
+  | `end_turn`（执行轮） | 视觉任务（带圈选截图发出）拍到改后截图 → `needs_review`，改了文件却没截图 → `unverified`；其余 → `completed` |
+  | `refusal` / `max_tokens` / `max_turn_requests` / 其他原因 | `failed` 并说明原因；已收到的回复与工具结果保留，规划轮不给「确认并执行」 |
+  | `session/prompt` 请求报错（非停止） | `failed` |
+  | 宽限期超时被放弃 | `cancelled`（附说明） |
+  | 代理进程意外退出 | `interrupted`（已收到的回复保留） |
+
+  `session/prompt` 返回、请求报错、超时放弃、进程意外退出这四条路径，都先等结果图写盘、结算本轮改动快照，**把最终记录写入磁盘之后**才放开下一轮（请求报错、进程退出时代理也可能已经改过文件）；面板第一次看到空闲状态时，磁盘上已经是这一轮的最终记录。Fuxi 内核意外断开时同样把已显示的回复并入正文、先结算落盘再放开。
+
+  `session/prompt` 返回（或报错）之后，这一轮由收尾路径认领（`acpFinishingRunId`）：收尾期间连接断了，断线处理不把它标成中断、也不替它放开任务，按代理给出的结果结束；点停止和宽限期超时放弃也不再插手。这样旧轮收尾时不可能清掉已经开始的新一轮的状态。没收到完成事件的工具保持「未完成」，不按成功计。
