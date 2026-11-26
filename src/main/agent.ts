@@ -291,6 +291,16 @@ function acpRejectOutcome(options: readonly AcpOption[]): AcpOutcome {
   return once ? { outcome: 'selected', optionId: once.id } : { outcome: 'cancelled' }
 }
 
+/**
+ * 代理在交计划：切换模式（`switch_mode`）的审批请求、参数里带计划正文，例如 Claude Code 的 ExitPlanMode
+ * （「Approve Plan」，允许即退出规划模式、当场开始改文件）。返回计划正文，不是就返回 undefined。
+ */
+export function acpPresentedPlan(kind: string | undefined, rawInput: unknown): string | undefined {
+  if (kind?.trim() !== 'switch_mode' || !rawInput || typeof rawInput !== 'object') return undefined
+  const plan = (rawInput as { plan?: unknown }).plan
+  return typeof plan === 'string' && plan.trim() ? plan.trim() : undefined
+}
+
 /** 去掉首尾空白后非空的字符串；其他类型和空串都当没给。 */
 function nonEmptyText(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
@@ -636,6 +646,10 @@ export class AgentService extends EventEmitter {
   private acpFinishingRunId: string | null = null
   /** 本轮规划里代理发过结构化计划（哪怕后来撤回成空列表）：收尾时只认结构化步骤，不拿回复顶替 */
   private acpPlanSeen = false
+  /** 本轮规划里代理已经交了计划（替用户答了「继续规划」）：代理随后以 cancelled 结束这一轮，也按交了计划收尾 */
+  private acpPlanPresented = false
+  /** 本轮交计划用的工具调用：宿主替用户答了「继续规划」，代理随后报的失败不是出错，显示为已处理 */
+  private acpPresentedTools = new Set<string>()
   /** 停止时强停失败、可能还活着的旧代理进程：它退出之前不启动新代理，免得两个进程同时改同一个项目 */
   private acpStuck: AcpClient[] = []
   private acpCancelTimer: ReturnType<typeof setTimeout> | null = null
@@ -1842,6 +1856,8 @@ export class AgentService extends EventEmitter {
     this.activeAcpRunId = run.id
     this.acpCancelRequested = false
     this.acpPlanSeen = false
+    this.acpPlanPresented = false
+    this.acpPresentedTools.clear()
     this.acpToolInputs.clear()
     void this.runAcpPrompt(acp, this.sessionId, run, blocks)
   }
@@ -1994,7 +2010,9 @@ export class AgentService extends EventEmitter {
             : (typeof u.inputTokens === 'number' ? u.inputTokens : 0) + (typeof u.outputTokens === 'number' ? u.outputTokens : 0)
           if (spent > 0 || this.state.telemetry) this.syncFinishedUsage(run, spent > 0 ? spent : undefined)
         }
-        const stopReason = typeof result?.stopReason === 'string' && result.stopReason ? result.stopReason : 'end_turn'
+        const rawStop = typeof result?.stopReason === 'string' && result.stopReason ? result.stopReason : 'end_turn'
+        // 交了计划后代理自己以 cancelled 结束（Claude 收到「继续规划」会中断这一轮）：不是用户停的，按规划完成收尾
+        const stopReason = rawStop === 'cancelled' && this.acpPlanPresented && !this.acpCancelRequested ? 'end_turn' : rawStop
         if (this.acpCancelRequested || stopReason === 'cancelled') {
           run.status = 'cancelled'
           run.error = undefined
@@ -2004,7 +2022,7 @@ export class AgentService extends EventEmitter {
           run.error = acpStopReasonText(stopReason)
         } else if (run.mode === 'plan') {
           // 代理发过结构化计划就只认步骤：撤回成空列表时，回复只是说明，不能当计划确认执行
-          const planText = (this.acpPlanSeen ? run.plan ?? '' : run.plan || run.reply).trim()
+          const planText = (this.acpPlanPresented || this.acpPlanSeen ? run.plan ?? '' : run.plan || run.reply).trim()
           if (planText) {
             run.plan = run.plan || run.reply
             run.status = 'planned'
@@ -2162,13 +2180,14 @@ export class AgentService extends EventEmitter {
         break
       }
       case 'plan': {
-        if (Array.isArray(update.entries) && run.mode === 'plan') {
+        if (Array.isArray(update.entries) && run.mode === 'plan' && !this.acpPlanPresented) {
           // 协议要求每次都发完整列表、客户端整体替换：空列表就是代理撤回了全部步骤
           const lines = update.entries
             .filter((e): e is Record<string, unknown> => Boolean(e && typeof e === 'object'))
             .map(e => String(e.content ?? '').trim() ? `- [${e.status === 'completed' ? 'x' : ' '}] ${String(e.content).trim()}` : '')
             .filter(Boolean)
-          this.acpPlanSeen = true
+          // 发过非空步骤才算「有结构化计划」：一开始就发空列表只是清空，不算撤回
+          if (lines.length) this.acpPlanSeen = true
           if (lines.length) run.plan = lines.join('\n')
           else delete run.plan
           this.changed()
@@ -2200,6 +2219,7 @@ export class AgentService extends EventEmitter {
         }
         const resultText = (extractAcpText(update.rawOutput) || extractAcpText(update.content)).slice(0, 16_000)
         let tool = [...run.tools].reverse().find(t => t.id === toolId)
+        const handedIn = this.acpPresentedTools.has(toolId)
         if (!tool) {
           const autoApproved = this.autoApproved.get(toolId)
           this.autoApproved.delete(toolId)
@@ -2208,9 +2228,9 @@ export class AgentService extends EventEmitter {
         } else {
           if (typeof update.title === 'string' && update.title.trim()) tool.name = update.title.trim()
           if (inputText && !tool.input) tool.input = inputText
-          if (rawStatus) tool.status = mappedStatus
+          if (rawStatus) tool.status = handedIn ? 'completed' : mappedStatus
         }
-        if (resultText) tool.result = resultText
+        if (resultText && !handedIn) tool.result = resultText
         if (mappedStatus === 'completed') {
           const changed = extractChangedFiles(run.tools, this.state.toolLabels)
           if (changed.length) run.changedFiles = changed
@@ -2248,6 +2268,24 @@ export class AgentService extends EventEmitter {
     const requestId = `acp:${String(req.rpcId)}`
     const options: AcpOption[] = req.options.map(o => ({ id: o.optionId, name: o.name, ...(o.kind ? { kind: o.kind } : {}) }))
     // 宿主自动放行时也只选「允许一次」；代理只给永久授权时交给用户自己决定
+    // 规划轮里代理交计划：记下计划正文，替用户选「继续规划」，不在规划轮里退出规划模式动手；
+    // YOLO 和任务规则都不放行它。用户在面板上确认后，确认执行这一轮照常切回原模式、先拍快照再执行
+    const presented = run.mode === 'plan' ? acpPresentedPlan(kind, rawInput) : undefined
+    if (presented !== undefined) {
+      req.respond(acpRejectOutcome(options))
+      run.plan = presented
+      this.acpPlanPresented = true
+      if (toolId) {
+        this.acpPresentedTools.add(toolId)
+        const tool = [...run.tools].reverse().find(t => t.id === toolId)
+        if (tool) {
+          tool.status = 'completed'
+          tool.result = '计划已收下，等你在面板上确认执行；规划这一轮不会动手改文件。'
+        }
+      }
+      this.changed()
+      return
+    }
     const once = acpAllowOnceOption(options)
     const markTool = (reason: string) => {
       if (!toolId) return

@@ -410,7 +410,13 @@ interface ScriptStep {
   plan?: string[]
   tool?: { toolCallId: string; title?: string; kind?: string; rawInput?: unknown }
   /** sessionId：换成别的会话；null 表示审批请求里不带 sessionId */
-  perm?: { toolCallId: string; title?: string; kind?: string; rawInput?: unknown; sessionId?: string | null; options?: { optionId: string; name: string; kind: string }[] }
+  perm?: {
+    toolCallId: string; title?: string; kind?: string; rawInput?: unknown; sessionId?: string | null; options?: { optionId: string; name: string; kind: string }[]
+    /** 被拒绝时就此结束这一轮，用这个 stopReason（模拟 Claude 收到「继续规划」后中断） */
+    stopOnReject?: string
+    /** 被允许时代理自己切到这个模式（模拟 Claude 批准计划后退出规划模式） */
+    setModeOnAllow?: string
+  }
   /** 在会话的工作目录里写文件（模拟代理改项目） */
   write?: { path: string; content: string }
   /** 进程直接退出（模拟代理崩溃） */
@@ -493,7 +499,7 @@ async function runPrompt(msg) {
       if (cfg.modeConfig) update(sid, { sessionUpdate: 'config_option_update', configOptions: modeOptions() })
     }
     if (step.perm) {
-      const { options, sessionId: permSid, ...toolCall } = step.perm
+      const { options, sessionId: permSid, stopOnReject, setModeOnAllow, ...toolCall } = step.perm
       update(sid, { sessionUpdate: 'tool_call', status: 'pending', ...toolCall })
       const rpcId = 'perm-' + (++permSeq)
       const result = await new Promise(resolve => {
@@ -505,6 +511,8 @@ async function runPrompt(msg) {
       if (outcome.outcome === 'cancelled') { stop = 'cancelled'; break }
       const allowed = outcome.outcome === 'selected' && outcome.optionId !== 'no'
       update(sid, { sessionUpdate: 'tool_call_update', toolCallId: toolCall.toolCallId, status: allowed ? 'completed' : 'failed', rawOutput: allowed ? 'done' : 'rejected' })
+      if (allowed && setModeOnAllow) { mode = setModeOnAllow; update(sid, { sessionUpdate: 'current_mode_update', currentModeId: mode }) }
+      if (!allowed && stopOnReject) { stop = stopOnReject; break }
     }
     if (step.write) writeFileSync(join(cwds.get(sid) || process.cwd(), step.write.path), step.write.content)
     if (step.exit) { setTimeout(() => process.exit(3), 100); return }
@@ -798,7 +806,8 @@ test('ACP 规划：代理用空列表撤回全部步骤后，旧步骤不再显�
     cases: {
       WITHDRAW_SILENT: [{ plan: ['改掉 a.txt'] }, { plan: [] }],
       WITHDRAW_SAY: [{ plan: ['改掉 a.txt'] }, { plan: [] }, { say: '看过了，不需要改动。' }],
-      REPLACE: [{ plan: ['旧步骤'] }, { plan: ['新步骤一', '新步骤二'] }]
+      REPLACE: [{ plan: ['旧步骤'] }, { plan: ['新步骤一', '新步骤二'] }],
+      RESET_FIRST: [{ plan: [] }, { say: '整理成三步：读、改、验。' }]
     }
   })
   const service = makeService(join(home, 'app'), process.execPath)
@@ -822,6 +831,12 @@ test('ACP 规划：代理用空列表撤回全部步骤后，旧步骤不再显�
   await ask(service, 'REPLACE', 'plan')
   const replaced = await settle(service)
   assert.equal(replaced.plan, '- [ ] 新步骤一\n- [ ] 新步骤二', '每次更新整体替换')
+
+  // 一开始就发空列表只是清空，不算撤回：回复正文照常当计划
+  await ask(service, 'RESET_FIRST', 'plan')
+  const reset = await settle(service)
+  assert.equal(reset.status, 'planned')
+  assert.match(reset.plan ?? '', /整理成三步/)
 })
 
 test('ACP 停止：代理回应取消前又来的审批一律答 cancelled，YOLO 也不放行；其他会话的审批同样不放行', async t => {
@@ -1107,6 +1122,60 @@ test('ACP 收尾期间连接断开：收尾认领这一轮、按代理的结果�
   assert.equal(second.status, 'completed')
   assert.equal(service.snapshot().busy, false)
   assert.equal(service.snapshot().items.flatMap(item => item.runs).find(run => run.id === first.id)?.status, 'completed')
+})
+
+test('ACP 规划（Claude 式交计划）：代理用 ExitPlanMode 一类审批交计划时，YOLO 也不放行；宿主收下计划、替用户选继续规划，确认后才切回原模式执行', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'fd-acp-claude-plan-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const project = join(home, 'project')
+  await mkdir(project, { recursive: true })
+  const planText = '## 计划\n1. 读画布结构\n2. 在 a.txt 里补上说明'
+  // 选项照抄 Claude Code 适配器的 ExitPlanMode：几个「始终允许」、一个「允许一次」、拒绝即继续规划
+  const exitPlanOptions = [
+    { optionId: 'acceptEdits', name: 'Yes, auto-accept edits', kind: 'allow_always' },
+    { optionId: 'default', name: 'Yes, manually approve edits', kind: 'allow_once' },
+    { optionId: 'no', name: 'No, keep planning', kind: 'reject_once' }
+  ]
+  const fake = await scriptedAcp(join(home, 'fake'), {
+    modes: [{ id: 'default', name: 'Default' }, { id: 'acceptEdits', name: 'Accept Edits' }, { id: 'plan', name: 'Plan' }],
+    mode: 'acceptEdits',
+    cases: {
+      PLAN_CLAUDE: [
+        { say: '我先看了画布。' },
+        { tool: { toolCallId: 'ep1', title: 'Approve Plan', kind: 'switch_mode', rawInput: { plan: planText } } },
+        // 审批请求里不带 kind（和 Claude 一样），身份靠前面的 tool_call 补上；拒绝时 Claude 中断这一轮、以 cancelled 结束
+        { perm: { toolCallId: 'ep1', title: 'Approve Plan', rawInput: { plan: planText }, options: exitPlanOptions, stopOnReject: 'cancelled', setModeOnAllow: 'default' } },
+        // 只有被放行时才会走到这里：在规划轮里直接改文件
+        { write: { path: 'edited-in-plan.txt', content: '不该出现\n' } },
+        { say: '开始改了' }
+      ],
+      '已确认上述计划': [{ echo: true }]
+    }
+  })
+  const service = makeService(join(home, 'app'), process.execPath)
+  t.after(() => service.close().catch(() => undefined))
+  await connectFake(service, fake)
+  await service.setWorkspace('default', project)
+  await service.setApprovalMode('full-access')
+
+  await ask(service, 'PLAN_CLAUDE', 'plan')
+  const planned = await settle(service)
+  assert.equal(planned.status, 'planned', '交了计划、代理随后自己以 cancelled 结束：按规划完成收尾')
+  assert.equal(planned.plan, planText, '计划正文取自交计划的审批')
+  assert.deepEqual((await fake.choices()).at(-1), { outcome: 'selected', optionId: 'no' }, '替用户选了「继续规划」，YOLO 没有放行')
+  assert.equal(planned.approvals.length, 0, '不弹审批卡')
+  const handIn = planned.tools.find(tool => tool.id === 'ep1')
+  assert.equal(handIn?.status, 'completed', '交计划的调用显示为已处理，不显示失败')
+  assert.match(handIn?.result ?? '', /计划已收下/)
+  await assert.rejects(readFile(join(project, 'edited-in-plan.txt'), 'utf8'), '规划轮里没有动手改文件')
+  assert.equal(service.snapshot().acp?.currentModeId, 'plan', '代理仍停在规划模式')
+
+  await service.execute('')
+  const executed = await settle(service)
+  assert.equal(executed.status, 'completed')
+  assert.match(executed.reply, /mode=acceptEdits;/, '确认执行前切回规划前的模式')
+  const modes = (await fake.received('session/set_mode')).map(m => m.params?.modeId)
+  assert.deepEqual(modes, ['plan', 'acceptEdits'])
 })
 
 test('ACP 规划：没有规划能力时不能拟计划；切入或切回规划失败时这一轮的 session/prompt 一次都不发，并说明原因', async t => {
